@@ -1,0 +1,21 @@
+experiment: arcterx
+input:
+  # Edit this path or copy this file to microsvp_preprocessing.local.yml.
+  directory: ../../data/source/ARCTERX/Data/Quality Controlled/MicroSVP
+  pattern: "*.mat"
+output:
+  zarr: ../../data/ARCTERX_MicroSVP_QC.zarr
+  inventory: ../../data/microsvp_inventory.parquet
+  chunks:
+    trajectory: 1
+    obs: 4096
+processing:
+  missing_value: -999
+  drogue_buffer_hours: 24
+  # Optional CSV; no entry means use the source estimate, or unknown if missing.
+  drogue_review_table: null
+validation:
+  nominal_interval_seconds: 300
+  interval_tolerance_seconds: 1
+  large_gap_seconds: 1800
+  residual_jump_speed_m_s: 3.0

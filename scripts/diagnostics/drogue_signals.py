@@ -1,0 +1,575 @@
+"""Characterize raw ARCTERX drogue-related signals and show automatic change dates."""
+
+from __future__ import annotations
+
+import argparse
+from collections import Counter
+from dataclasses import asdict, dataclass
+import json
+from pathlib import Path
+from typing import Any
+from uuid import uuid4
+
+import numpy as np
+import pandas as pd
+import yaml
+
+from drifterlab.experiments.arcterx.raw_drogue import RawDrogueSignals, read_raw_drogue_signals
+from drifterlab.qc.drogue import (
+    DrogueDetection, DrogueDetectionConfig, detect_drogue_loss,
+)
+
+
+SPECIAL_TTFF_VALUE = 4095.0
+DEFAULT_THRESHOLDS = (20.0, 40.0, 60.0, 120.0, 300.0, 1000.0)
+RAW_VARIABLES = {
+    "time": {"source_field": "dataset.drifter_<ID>.ObsTimestamp", "units": "UTC campaign time"},
+    "ttff": {"source_field": "dataset.drifter_<ID>.GpsTTFF", "units": None,
+             "note": "Raw units and the meaning of special values are not documented in this repository."},
+    "strain": {"source_field": "dataset.drifter_<ID>.Drogue", "units": None,
+               "note": "Treated as an uncalibrated strain-like value for this diagnostic."},
+    "hull_temperature": {"source_field": "dataset.drifter_<ID>.HullTemperature", "units": None,
+                         "note": "Raw units are not asserted by this diagnostic."},
+}
+
+
+@dataclass(frozen=True)
+class DiagnosticSettings:
+    rolling_window: str = "24h"
+    strain_pre_window: str = "24h"
+    strain_post_window: str = "24h"
+    temperature_background_window: str = "24h"
+    temperature_variability_window: str = "24h"
+    minimum_observations: int = 12
+    ttff_thresholds: tuple[float, ...] = DEFAULT_THRESHOLDS
+
+    def __post_init__(self) -> None:
+        for name in ("rolling_window", "strain_pre_window", "strain_post_window",
+                     "temperature_background_window", "temperature_variability_window"):
+            try:
+                duration = pd.Timedelta(getattr(self, name))
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"{name} must be a valid duration") from exc
+            if duration <= pd.Timedelta(0):
+                raise ValueError(f"{name} must be positive")
+        if (isinstance(self.minimum_observations, bool)
+                or not isinstance(self.minimum_observations, (int, np.integer))
+                or self.minimum_observations < 1):
+            raise ValueError("minimum_observations must be a positive integer")
+        if not self.ttff_thresholds:
+            raise ValueError("At least one TTFF diagnostic threshold is required")
+        if any(not np.isfinite(value) for value in self.ttff_thresholds):
+            raise ValueError("TTFF diagnostic thresholds must be finite")
+        if len(set(self.ttff_thresholds)) != len(self.ttff_thresholds):
+            raise ValueError("TTFF diagnostic thresholds must be unique")
+
+    def serializable(self) -> dict[str, Any]:
+        result = asdict(self)
+        result["ttff_thresholds"] = list(self.ttff_thresholds)
+        return result
+
+
+def _label(value: float) -> str:
+    return f"{value:g}".replace("-", "minus").replace(".", "p")
+
+
+def _mad(values: np.ndarray) -> float:
+    values = np.asarray(values, dtype=float)
+    values = values[np.isfinite(values)]
+    if not len(values):
+        return np.nan
+    center = np.median(values)
+    return float(np.median(np.abs(values - center)))
+
+
+def _forward_median(series: pd.Series, window: str, minimum: int) -> pd.Series:
+    time_ns = series.index.to_numpy(dtype="datetime64[ns]").astype(np.int64)
+    mirrored = pd.Timestamp("2000-01-01") + pd.to_timedelta(time_ns[-1] - time_ns[::-1], unit="ns")
+    reversed_series = pd.Series(series.to_numpy()[::-1], index=mirrored)
+    result = reversed_series.rolling(pd.Timedelta(window), min_periods=minimum).median()
+    return result.iloc[::-1].set_axis(series.index)
+
+
+def rolling_diagnostics(signals: RawDrogueSignals,
+                        settings: DiagnosticSettings = DiagnosticSettings()) -> pd.DataFrame:
+    """Return independent, time-based diagnostics without classifying an event."""
+    time = pd.to_datetime(signals.time, errors="coerce", utc=True)
+    frame = pd.DataFrame({
+        "time": time,
+        "ttff": np.asarray(signals.ttff, dtype=float),
+        "strain": (np.nan if signals.strain is None
+                   else np.asarray(signals.strain, dtype=float)),
+        "hull_temperature": (np.nan if signals.hull_temperature is None
+                             else np.asarray(signals.hull_temperature, dtype=float)),
+    })
+    frame = frame[frame.time.notna()].sort_values("time", kind="stable").reset_index(drop=True)
+    if frame.empty:
+        raise ValueError(f"{signals.platform_code}: no valid timestamps")
+    index = pd.DatetimeIndex(frame.time)
+    minimum = settings.minimum_observations
+    window = pd.Timedelta(settings.rolling_window)
+    ttff = pd.Series(frame.ttff.to_numpy(), index=index)
+    ttff_rolling = ttff.rolling(window, min_periods=minimum)
+    frame["rolling_median_ttff"] = ttff_rolling.median().to_numpy()
+    frame["rolling_q90_ttff"] = ttff_rolling.quantile(.90).to_numpy()
+    frame["rolling_q95_ttff"] = ttff_rolling.quantile(.95).to_numpy()
+    frame["rolling_max_ttff"] = ttff_rolling.max().to_numpy()
+    valid_count = ttff_rolling.count()
+    for threshold in settings.ttff_thresholds:
+        label = _label(threshold)
+        indicator = pd.Series(np.where(ttff.notna(), (ttff > threshold).astype(float), np.nan), index=index)
+        count = indicator.rolling(window, min_periods=minimum).sum()
+        frame[f"rolling_count_ttff_gt_{label}"] = count.to_numpy()
+        frame[f"rolling_fraction_ttff_gt_{label}"] = (count / valid_count).to_numpy()
+    exact = pd.Series(np.where(ttff.notna(), (ttff == SPECIAL_TTFF_VALUE).astype(float), np.nan),
+                      index=index)
+    exact_count = exact.rolling(window, min_periods=minimum).sum()
+    frame["rolling_count_ttff_4095"] = exact_count.to_numpy()
+    frame["rolling_fraction_ttff_4095"] = (exact_count / valid_count).to_numpy()
+
+    strain = pd.Series(frame.strain.to_numpy(), index=index)
+    strain_rolling = strain.rolling(window, min_periods=minimum)
+    frame["rolling_median_strain"] = strain_rolling.median().to_numpy()
+    frame["rolling_q25_strain"] = strain_rolling.quantile(.25).to_numpy()
+    frame["rolling_q75_strain"] = strain_rolling.quantile(.75).to_numpy()
+    frame["rolling_mad_strain"] = strain_rolling.apply(_mad, raw=True).to_numpy()
+    before = strain.rolling(pd.Timedelta(settings.strain_pre_window),
+                            min_periods=minimum, closed="left").median()
+    after = _forward_median(strain, settings.strain_post_window, minimum)
+    frame["strain_delta"] = (after - before).to_numpy()
+
+    temperature = pd.Series(frame.hull_temperature.to_numpy(), index=index)
+    background = temperature.rolling(
+        pd.Timedelta(settings.temperature_background_window),
+        min_periods=minimum, center=True,
+    ).median()
+    anomaly = temperature - background
+    temperature_mad = anomaly.rolling(
+        pd.Timedelta(settings.temperature_variability_window),
+        min_periods=minimum, center=True,
+    ).apply(_mad, raw=True)
+    frame["rolling_temperature_background"] = background.to_numpy()
+    frame["temperature_anomaly"] = anomaly.to_numpy()
+    frame["rolling_temperature_mad"] = temperature_mad.to_numpy()
+    return frame
+
+
+def _quantile(values: np.ndarray, probability: float) -> float:
+    values = np.asarray(values, dtype=float)
+    values = values[np.isfinite(values)]
+    return float(np.quantile(values, probability)) if len(values) else np.nan
+
+
+def summarize_drifter(signals: RawDrogueSignals, diagnostics: pd.DataFrame,
+                      settings: DiagnosticSettings) -> dict[str, Any]:
+    ttff = np.asarray(signals.ttff, dtype=float)
+    valid_ttff = ttff[np.isfinite(ttff)]
+    strain = np.array([], dtype=float) if signals.strain is None else np.asarray(signals.strain, dtype=float)
+    valid_strain = strain[np.isfinite(strain)]
+    temperature = (np.array([], dtype=float) if signals.hull_temperature is None
+                   else np.asarray(signals.hull_temperature, dtype=float))
+    valid_temperature = temperature[np.isfinite(temperature)]
+    row: dict[str, Any] = {
+        "platform_code": signals.platform_code,
+        "source_filename": signals.source_path.name,
+        "source_path": str(signals.source_path),
+        "source_sha256": signals.source_sha256,
+        "n_observations": len(signals.time),
+        "n_valid_ttff": len(valid_ttff),
+        "ttff_min": _quantile(valid_ttff, 0),
+        "ttff_median": _quantile(valid_ttff, .5),
+        "ttff_q75": _quantile(valid_ttff, .75),
+        "ttff_q90": _quantile(valid_ttff, .90),
+        "ttff_q95": _quantile(valid_ttff, .95),
+        "ttff_q99": _quantile(valid_ttff, .99),
+        "ttff_max": _quantile(valid_ttff, 1),
+        "count_ttff_4095": int((valid_ttff == SPECIAL_TTFF_VALUE).sum()),
+        "fraction_ttff_4095": (float((valid_ttff == SPECIAL_TTFF_VALUE).mean())
+                               if len(valid_ttff) else np.nan),
+        "strain_missing": not len(valid_strain),
+        "n_valid_strain": len(valid_strain),
+        "strain_min": _quantile(valid_strain, 0),
+        "strain_median": _quantile(valid_strain, .5),
+        "strain_q05": _quantile(valid_strain, .05),
+        "strain_q25": _quantile(valid_strain, .25),
+        "strain_q75": _quantile(valid_strain, .75),
+        "strain_q95": _quantile(valid_strain, .95),
+        "strain_max": _quantile(valid_strain, 1),
+        "strain_delta_min": _quantile(diagnostics.strain_delta.to_numpy(), 0),
+        "strain_delta_q05": _quantile(diagnostics.strain_delta.to_numpy(), .05),
+        "hull_temperature_missing": not len(valid_temperature),
+        "n_valid_hull_temperature": len(valid_temperature),
+    }
+    for threshold in settings.ttff_thresholds:
+        label = _label(threshold)
+        count = int((valid_ttff > threshold).sum())
+        row[f"count_ttff_gt_{label}"] = count
+        row[f"fraction_ttff_gt_{label}"] = count / len(valid_ttff) if len(valid_ttff) else np.nan
+    return row
+
+
+def _distribution(values: pd.Series) -> dict[str, float | int | None]:
+    values = pd.to_numeric(values, errors="coerce").dropna()
+    if values.empty:
+        return {"count": 0, "min": None, "q25": None, "median": None, "q75": None, "max": None}
+    return {
+        "count": len(values), "min": float(values.min()), "q25": float(values.quantile(.25)),
+        "median": float(values.median()), "q75": float(values.quantile(.75)),
+        "max": float(values.max()),
+    }
+
+
+def population_report(table: pd.DataFrame, exact_values: Counter,
+                      settings: DiagnosticSettings) -> dict[str, Any]:
+    valid_total = int(table.n_valid_ttff.sum())
+    columns = ["ttff_min", "ttff_median", "ttff_q75", "ttff_q90", "ttff_q95",
+               "ttff_q99", "ttff_max", "fraction_ttff_4095", "strain_min",
+               "strain_median", "strain_q05", "strain_q95", "strain_max",
+               "strain_delta_min"]
+    columns += [f"fraction_ttff_gt_{_label(value)}" for value in settings.ttff_thresholds]
+    frequent = []
+    for value, count in exact_values.most_common(20):
+        display = int(value) if float(value).is_integer() else float(value)
+        frequent.append({"value": display, "count": count,
+                         "fraction_of_valid_ttff": count / valid_total if valid_total else None})
+    return {
+        "raw_variable_metadata": RAW_VARIABLES,
+        "settings": settings.serializable(),
+        "number_of_drifters": len(table),
+        "total_observations": int(table.n_observations.sum()),
+        "total_valid_ttff": valid_total,
+        "count_ttff_4095": int(table.count_ttff_4095.sum()),
+        "fraction_ttff_4095": (float(table.count_ttff_4095.sum() / valid_total)
+                               if valid_total else None),
+        "missing_variable_counts": {
+            "strain": int(table.strain_missing.sum()),
+            "hull_temperature": int(table.hull_temperature_missing.sum()),
+        },
+        "across_drifter_distributions": {name: _distribution(table[name]) for name in columns},
+        "most_frequent_exact_ttff_values": frequent,
+    }
+
+
+def plot_drifter(signals: RawDrogueSignals, data: pd.DataFrame, settings: DiagnosticSettings,
+                 output: Path, detection: DrogueDetection | None = None) -> None:
+    import matplotlib.pyplot as plt
+
+    if detection is None:
+        detection = detect_drogue_loss(
+            signals.platform_code, signals.time, signals.ttff,
+            strain=signals.strain, hull_temperature=signals.hull_temperature,
+        )
+    return _plot_distribution_drifter(signals, data, output, detection, plt)
+
+
+def _plot_distribution_drifter(signals: RawDrogueSignals, data: pd.DataFrame,
+                               output: Path, detection: DrogueDetection, plt) -> None:
+    result = detection.result
+    figure, axes = plt.subplots(7, 1, figsize=(15, 18), sharex=True,
+                               constrained_layout=True)
+    time = data.time
+    axes[0].plot(time, data.ttff, ".", color=".35", ms=2, alpha=.65)
+    axes[0].set_yscale("symlog", linthresh=20)
+    axes[0].set_ylabel("Raw GpsTTFF\n(unit unknown)")
+    axes[0].set_title(f"Raw drogue-related signals - platform {signals.platform_code}")
+
+    histograms = detection.ttff_histograms
+    fractions = np.stack(histograms.fractions.to_numpy()).T
+    x_edges = [*histograms.time_start, histograms.time_end.iloc[-1]]
+    axes[1].pcolormesh(x_edges, np.arange(fractions.shape[0] + 1), fractions,
+                       shading="flat", cmap="viridis", vmin=0)
+    axes[1].set_yticks(np.arange(len(detection.ttff_bins.labels)) + .5)
+    axes[1].set_yticklabels(detection.ttff_bins.labels, fontsize=6)
+    axes[1].set_ylabel("TTFF value bins")
+    lower_policy = (
+        "lower-than-first bin included"
+        if detection.ttff_bins.include_lower_than_first_bin
+        else "values below first edge excluded"
+    )
+    axes[1].set_title(
+        f"Normalized TTFF occupancy; {lower_policy}; open upper bin included"
+    )
+
+    ttff_metrics = detection.ttff_candidates
+    if not ttff_metrics.empty:
+        axes[2].plot(ttff_metrics.time, ttff_metrics.d_down, color="tab:purple",
+                     label="D_down")
+        axes[2].plot(ttff_metrics.time, ttff_metrics.d_up, color="tab:orange",
+                     label="D_up")
+        tail_axis = axes[2].twinx()
+        tail_axis.plot(ttff_metrics.time, ttff_metrics.tail_area_drop,
+                       color="tab:green", lw=.9, alpha=.8, label="Tail-area decrease")
+        tail_axis.set_ylabel("Tail-area decrease", color="tab:green")
+        handles, labels = axes[2].get_legend_handles_labels()
+        extra_handles, extra_labels = tail_axis.get_legend_handles_labels()
+        axes[2].legend(handles + extra_handles, labels + extra_labels,
+                       loc="upper right", fontsize=8)
+    axes[2].axhline(0, color="black", lw=.6)
+    axes[2].set_ylabel("TTFF directional\ndistance")
+    axes[2].set_title(f"TTFF distribution change: {result.ttff_change_status}")
+    if detection.ttff_detail:
+        inset = axes[2].inset_axes([.02, .48, .27, .48])
+        inset.plot(detection.ttff_detail["survival_x"],
+                   detection.ttff_detail["survival_before"], label="Before", lw=1)
+        inset.plot(detection.ttff_detail["survival_x"],
+                   detection.ttff_detail["survival_after"], label="After", lw=1)
+        inset.set_xscale("log")
+        inset.set_title("Selected TTFF survival", fontsize=7)
+        inset.tick_params(labelsize=6)
+        inset.legend(fontsize=6)
+
+    detector_data = detection.diagnostics
+    detector_time = detector_data.time
+    axes[3].plot(time, data.strain, ".", color=".6", ms=2, alpha=.6,
+                 label="Raw strain")
+    axes[3].plot(detector_time, detector_data.rolling_median_strain, color="tab:blue",
+                 label="Rolling median")
+    axes[3].fill_between(
+                         detector_time, detector_data.rolling_q25_strain,
+                         detector_data.rolling_q75_strain,
+                         color="tab:blue", alpha=.18, label="Rolling q25-q75")
+    axes[3].set_ylabel("Strain\n(unit unknown)")
+    axes[3].legend(loc="upper right", fontsize=8)
+
+    strain_metrics = detection.strain_candidates
+    if not strain_metrics.empty:
+        axes[4].plot(
+            strain_metrics.time, strain_metrics.drop_absolute, color="tab:green",
+            label="Absolute drop",
+        )
+        normalized_axis = axes[4].twinx()
+        normalized_axis.plot(
+            strain_metrics.time, strain_metrics.normalized_drop,
+            color="tab:purple", lw=.9, label="Normalized drop",
+        )
+        normalized_axis.set_ylabel("Normalized drop", color="tab:purple")
+        handles, labels = axes[4].get_legend_handles_labels()
+        extra_handles, extra_labels = normalized_axis.get_legend_handles_labels()
+        axes[4].legend(
+            handles + extra_handles, labels + extra_labels,
+            loc="upper right", fontsize=8,
+        )
+    axes[4].axhline(0, color="black", lw=.6)
+    axes[4].set_ylabel("Strain level drop")
+    axes[4].set_title(
+        f"Persistent rolling-median strain step: {result.strain_change_status}"
+    )
+
+    axes[5].plot(time, data.hull_temperature, color=".55", lw=.6,
+                 label="Raw hull temperature")
+    axes[5].plot(time, data.rolling_temperature_background, color="tab:orange",
+                 label="Rolling median background")
+    axes[5].set_ylabel("Hull temperature\n(unit unknown)")
+    axes[5].legend(loc="upper right", fontsize=8)
+    axes[6].plot(time, data.rolling_temperature_mad, color="tab:purple", lw=.8)
+    axes[6].set_ylabel("Temperature\nanomaly MAD")
+    axes[6].set_xlabel("UTC time")
+
+    change_lines = (
+        (result.ttff_change_time, "TTFF change", "tab:purple", "--", 1.4),
+        (result.strain_change_time, "Strain change", "tab:green", "-.", 1.4),
+        (result.auto_drogue_loss_time, "Automatic drogue loss", "tab:red", "-", 1.8),
+    )
+    for axis in axes:
+        drawn = set()
+        for value, label, color, style, width in change_lines:
+            if np.isnat(value):
+                continue
+            timestamp = pd.Timestamp(value)
+            key = int(timestamp.value)
+            if key in drawn:
+                continue
+            drawn.add(key)
+            same = [item[1] for item in change_lines
+                    if not np.isnat(item[0]) and int(pd.Timestamp(item[0]).value) == key]
+            axis.axvline(timestamp, label=" / ".join(same), color=color,
+                         ls=style, lw=width)
+        axis.grid(alpha=.2)
+    date_handles, date_labels = axes[0].get_legend_handles_labels()
+    axes[0].legend(date_handles, date_labels, loc="upper right", fontsize=8)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    figure.savefig(output, dpi=180)
+    plt.close(figure)
+
+
+def plot_population(table: pd.DataFrame, ttff_values: np.ndarray,
+                    settings: DiagnosticSettings, output: Path) -> None:
+    import matplotlib.pyplot as plt
+
+    figure, axes = plt.subplots(2, 2, figsize=(11, 8), constrained_layout=True)
+    finite = ttff_values[np.isfinite(ttff_values)]
+    if len(finite):
+        upper = np.quantile(finite, .99)
+        axes[0, 0].hist(finite[finite <= upper], bins=80, color="steelblue")
+        axes[0, 0].set_title(f"Raw TTFF through population q99 ({upper:g})")
+        axes[0, 0].set_yscale("log")
+    axes[0, 1].hist(table.fraction_ttff_4095.dropna(), bins=30, color=".4")
+    axes[0, 1].set_title("Across-drifter fraction TTFF == 4095")
+    threshold = 60.0 if 60.0 in settings.ttff_thresholds else settings.ttff_thresholds[0]
+    axes[1, 0].hist(table[f"fraction_ttff_gt_{_label(threshold)}"].dropna(),
+                    bins=30, color="tab:orange")
+    axes[1, 0].set_title(f"Across-drifter fraction TTFF > {threshold:g}")
+    axes[1, 1].hist(table.strain_delta_min.dropna(), bins=40, color="tab:red")
+    axes[1, 1].set_title("Minimum local strain median change per drifter")
+    for axis in axes.reshape(-1):
+        axis.grid(alpha=.2)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    figure.savefig(output, dpi=180)
+    plt.close(figure)
+
+
+def _atomic_text(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
+    try:
+        temporary.write_text(text, encoding="utf-8")
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _input_config(path: Path) -> tuple[Path, str, float, DrogueDetectionConfig]:
+    path = path.resolve()
+    with path.open(encoding="utf-8-sig") as stream:
+        config = yaml.safe_load(stream)
+    try:
+        directory_value = config["input"]["directory"]
+    except (TypeError, KeyError) as exc:
+        raise ValueError("Configuration requires input.directory") from exc
+    directory = Path(directory_value).expanduser()
+    if not directory.is_absolute():
+        directory = (path.parent / directory).resolve()
+    pattern = config.get("input", {}).get("pattern", "*.mat")
+    missing = config.get("processing", {}).get("missing_value", -999)
+    if not isinstance(pattern, str) or not pattern:
+        raise ValueError("input.pattern must be a nonempty string")
+    if isinstance(missing, bool) or not isinstance(missing, (int, float)) or not np.isfinite(missing):
+        raise ValueError("processing.missing_value must be finite")
+    detection = config.get("detection", {})
+    if not isinstance(detection, dict):
+        raise ValueError("detection must be a mapping")
+    try:
+        detection_config = DrogueDetectionConfig.from_dict(detection)
+    except TypeError as exc:
+        raise ValueError(f"Invalid detection configuration: {exc}") from exc
+    return directory, pattern, float(missing), detection_config
+
+
+def _select_files(files: list[Path], platforms: list[str], missing_value: float) -> list[Path]:
+    if not platforms:
+        return files
+    requested = set(map(str, platforms))
+    selected = {path.stem: path for path in files if path.stem in requested}
+    unresolved = requested - set(selected)
+    if unresolved:
+        for path in files:
+            if path in selected.values():
+                continue
+            signals = read_raw_drogue_signals(path, missing_value=missing_value)
+            if signals.platform_code in unresolved:
+                selected[signals.platform_code] = path
+                unresolved.remove(signals.platform_code)
+                if not unresolved:
+                    break
+    if unresolved:
+        raise ValueError(f"Requested platforms not found: {sorted(unresolved)}")
+    return [selected[platform] for platform in platforms]
+
+
+def run(config_path: Path, output: Path, *, platforms: list[str] | None = None,
+        all_figures: bool = False, population_figures: bool = True,
+        settings: DiagnosticSettings = DiagnosticSettings()) -> pd.DataFrame:
+    input_directory, pattern, missing_value, detection_config = _input_config(config_path)
+    if not input_directory.is_dir():
+        raise ValueError(f"Input directory does not exist: {input_directory}")
+    output = output.resolve()
+    if output == input_directory or input_directory in output.parents:
+        raise ValueError("Diagnostic output must be outside the raw input directory")
+    files = sorted(path for path in input_directory.glob(pattern) if path.is_file())
+    if not files:
+        raise ValueError(f"No input files match {pattern!r} in {input_directory}")
+    platforms = list(dict.fromkeys(platforms or []))
+    if platforms and all_figures:
+        raise ValueError("Use either --platform or --all, not both")
+    files = _select_files(files, platforms, missing_value)
+    make_drifter_figures = bool(platforms) or all_figures
+    print(json.dumps(RAW_VARIABLES, indent=2))
+    rows, exact_values, ttff_chunks = [], Counter(), []
+    seen: set[str] = set()
+    for index, path in enumerate(files, start=1):
+        signals = read_raw_drogue_signals(path, missing_value=missing_value)
+        if signals.platform_code in seen:
+            raise ValueError(f"Duplicate raw platform ID: {signals.platform_code}")
+        seen.add(signals.platform_code)
+        diagnostics = rolling_diagnostics(signals, settings)
+        rows.append(summarize_drifter(signals, diagnostics, settings))
+        valid_ttff = np.asarray(signals.ttff, dtype=float)
+        valid_ttff = valid_ttff[np.isfinite(valid_ttff)]
+        exact_values.update(map(float, valid_ttff))
+        ttff_chunks.append(valid_ttff)
+        if make_drifter_figures:
+            detection = detect_drogue_loss(
+                signals.platform_code, signals.time, signals.ttff,
+                strain=signals.strain, hull_temperature=signals.hull_temperature,
+                config=detection_config,
+            )
+            plot_drifter(
+                signals, diagnostics, settings,
+                output / "figures" / f"drogue_signals_{signals.platform_code}.png",
+                detection,
+            )
+        print(f"Diagnosed {index}/{len(files)}: {signals.platform_code}", flush=True)
+    table = pd.DataFrame(rows).sort_values("platform_code", kind="stable").reset_index(drop=True)
+    output.mkdir(parents=True, exist_ok=True)
+    table.to_parquet(output / "ttff_population_summary.parquet", engine="pyarrow", index=False)
+    table.to_csv(output / "ttff_population_summary.csv", index=False)
+    report = population_report(table, exact_values, settings)
+    _atomic_text(output / "population_summary.json", json.dumps(report, indent=2) + "\n")
+    _atomic_text(output / "raw_variable_metadata.json",
+                 json.dumps(RAW_VARIABLES, indent=2) + "\n")
+    if population_figures and len(table) > 1:
+        values = np.concatenate(ttff_chunks) if ttff_chunks else np.array([])
+        plot_population(table, values, settings, output / "population_distributions.png")
+    return table
+
+
+def parser() -> argparse.ArgumentParser:
+    result = argparse.ArgumentParser(description=__doc__)
+    result.add_argument("config", type=Path, help="ARCTERX drogue YAML; only raw input and missing value are read")
+    result.add_argument("--output", type=Path, default=Path("data/diagnostics/drogue_signals"))
+    result.add_argument("--platform", action="append", default=[], help="platform ID to diagnose and plot; repeatable")
+    result.add_argument("--all", action="store_true", help="explicitly generate a figure for every input drifter")
+    result.add_argument("--window", default="24h", help="time window for rolling TTFF/strain diagnostics")
+    result.add_argument("--strain-pre-window", default="24h")
+    result.add_argument("--strain-post-window", default="24h")
+    result.add_argument("--temperature-background-window", default="24h")
+    result.add_argument("--temperature-variability-window", default="24h")
+    result.add_argument("--minimum-observations", type=int, default=12)
+    result.add_argument("--ttff-thresholds", type=float, nargs="+", default=list(DEFAULT_THRESHOLDS))
+    result.add_argument("--no-population-figures", action="store_true")
+    return result
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parser().parse_args(argv)
+    try:
+        settings = DiagnosticSettings(
+            rolling_window=args.window,
+            strain_pre_window=args.strain_pre_window,
+            strain_post_window=args.strain_post_window,
+            temperature_background_window=args.temperature_background_window,
+            temperature_variability_window=args.temperature_variability_window,
+            minimum_observations=args.minimum_observations,
+            ttff_thresholds=tuple(args.ttff_thresholds),
+        )
+        table = run(args.config, args.output, platforms=args.platform, all_figures=args.all,
+                    population_figures=not args.no_population_figures, settings=settings)
+    except (ValueError, OSError, TypeError, KeyError) as exc:
+        parser().exit(1, f"Drogue signal diagnostic: {exc}\n")
+    print(f"Summary rows: {len(table)}")
+    print(f"Output: {args.output.resolve()}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

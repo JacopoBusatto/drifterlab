@@ -1,0 +1,58 @@
+experiment: arcterx
+input:
+  # Edit this path or copy this file to drogue_detection.local.yml.
+  directory: ../../data/source/ARCTERX/Data/Raw/MicroSVP
+  pattern: "*.mat"
+output:
+  automatic: ../../data/qc/drogue/auto_drogue_loss.parquet
+  review: ../../data/review/drogue/drogue_review.csv
+processing:
+  missing_value: -999
+  analysis_cutoff_margin_hours: 24
+detection:
+  # One histogram/CDF method, configured for logarithmic TTFF values.
+  ttff:
+    binning:
+      scale: log
+      first_edge: 10
+      factor: 1.5
+      width: null
+      last_edge: 1000
+      time_bin_hours: 12
+      include_lower_than_first_bin: true
+    comparison:
+      pre_window_hours: 48
+      post_window_hours: 48
+      persistence_hours: 72
+      min_valid_samples: 24
+      min_coverage_fraction: 0.75
+      min_down_distance: 0.35
+      min_downward_fraction: 0.75
+      max_reactivation_fraction: 0.20
+      peak_separation_hours: 48
+      comparable_strength_fraction: 0.80
+    tail:
+      lower_edge: 50
+      upper_edge: 1000
+
+  # Rolling-median persistent downward-step detector for strain.
+  strain:
+    window: 12h
+    pre_window: 48h
+    post_window: 48h
+    persistence_window: 48h
+    minimum_drop_absolute: 2.0
+    minimum_drop_relative: 0.10
+    minimum_normalized_drop: 1.5
+    weak_drop_absolute: 1.0
+    weak_drop_relative: 0.05
+    weak_normalized_drop: 0.75
+    relative_floor: 1.0
+    variability_floor: 1.0
+    persistence_tolerance: 1.0
+
+  # Supporting context only; temperature never changes the automatic decision.
+  temperature_background_window: 24h
+  temperature_variability_window: 6h
+review:
+  zoom_window: 3D

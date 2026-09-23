@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "drifterlab"
+version = "0.1.0"
+description = "Reusable drifter ingestion and non-destructive trajectory auditing"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.24", "scipy>=1.10", "pandas>=2.0", "xarray>=2025.1",
+    "zarr>=2.18,<3", "pyarrow>=14", "PyYAML>=6",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8"]
+diagnostics = ["matplotlib>=3.8"]
+
+[project.scripts]
+drifterlab-preprocess-arcterx-microsvp = "drifterlab.cli.preprocess_arcterx_microsvp:main"
+drifterlab-review-arcterx-positions = "drifterlab.cli.review_arcterx_positions:main"
+drifterlab-detect-arcterx-drogue = "drifterlab.cli.detect_arcterx_drogue:main"
+drifterlab-review-arcterx-drogue = "drifterlab.cli.review_arcterx_drogue:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
