@@ -71,7 +71,7 @@ def test_drifter_figure_marks_all_detected_dates_on_all_panels(tmp_path, monkeyp
     matplotlib.use("Agg", force=True)
     from matplotlib.axes import Axes
 
-    n, ttff_event, strain_event = 420, 96, 132
+    n, ttff_event, strain_event = 700, 240, 300
     before = np.resize(np.array([10., 30., 80., 150., 400.]), ttff_event)
     after = np.resize(np.array([2., 4., 6., 8.]), n - ttff_event)
     source = signals(

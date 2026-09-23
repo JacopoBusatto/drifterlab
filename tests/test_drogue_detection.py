@@ -5,342 +5,332 @@ import pandas as pd
 import pytest
 
 from drifterlab.qc.drogue import (
-    DistributionComparisonConfig,
     DrogueDetectionConfig,
-    SignalDistributionConfig,
     StrainStepConfig,
-    TailSupportConfig,
+    TTFFCessationComparisonConfig,
+    TTFFCessationConfig,
     ValueBinningConfig,
     analysis_cutoff_time,
-    bounded_tail_area,
-    detect_distribution_change,
     detect_drogue_loss,
     detect_strain_step,
-    directional_wasserstein,
+    detect_ttff_cessation,
     histogram_counts,
     make_value_bins,
-    temporal_histograms,
+    temporal_event_counts,
 )
 
 
-def repeated(values, length):
-    return np.resize(np.asarray(values, dtype=float), length)
-
-
-def hourly(length):
+def hourly(length: int) -> pd.DatetimeIndex:
     return pd.date_range("2025-01-01", periods=length, freq="h", tz="UTC")
 
 
-def test_log_and_linear_bins_include_zero_underflow_overflow_and_missing_values():
+def ttff_config(**comparison_changes) -> TTFFCessationConfig:
+    comparison = replace(
+        TTFFCessationComparisonConfig(),
+        **comparison_changes,
+    )
+    return TTFFCessationConfig(
+        ValueBinningConfig(
+            "linear", 100, None, 50, 300, 12,
+            include_lower_than_first_bin=False,
+        ),
+        comparison,
+    )
+
+
+BIN_VALUES = (120.0, 170.0, 220.0, 270.0, 350.0)
+
+
+def binned_track(
+    length: int,
+    drop_hours: list[int | None],
+    *,
+    cadence_hours: int = 1,
+    extra_events: list[tuple[int, int]] | None = None,
+) -> tuple[pd.DatetimeIndex, np.ndarray]:
+    """Build all-valid TTFF telemetry with per-bin event cessation times."""
+    times: list[pd.Timestamp] = []
+    values: list[float] = []
+    start = pd.Timestamp("2025-01-01", tz="UTC")
+    for hour in range(0, length, cadence_hours):
+        stamp = start + pd.Timedelta(hours=hour)
+        times.append(stamp)
+        values.append(20.0)  # valid availability below the excluded first edge
+        for bin_index, drop_hour in enumerate(drop_hours):
+            if drop_hour is None or hour < drop_hour:
+                times.append(stamp)
+                values.append(BIN_VALUES[bin_index])
+    for hour, bin_index in extra_events or []:
+        times.append(start + pd.Timedelta(hours=hour))
+        values.append(BIN_VALUES[bin_index])
+    order = np.argsort(pd.DatetimeIndex(times).asi8, kind="stable")
+    return pd.DatetimeIndex(np.asarray(times)[order]), np.asarray(values)[order]
+
+
+def test_linear_and_log_bins_cover_excluded_lower_values_and_open_overflow():
     log_bins = make_value_bins(ValueBinningConfig("log", 10, 2, None, 100, 12))
     assert log_bins.physical_edges.tolist() == [0, 10, 20, 40, 80, 100]
     counts, n_valid = histogram_counts(
-        [-2, 0, 9.9, 10, 100, 1e9, np.nan, -999], log_bins,
+        [-2, 0, 9.9, 10, 100, 1e9, np.nan, -999],
+        log_bins,
         missing_values=(-999,),
     )
     assert n_valid == 6
-    assert counts[0] == 1
-    assert counts[1] == 2
-    assert counts[2] == 1
-    assert counts[-1] == 2
+    assert counts.tolist() == [1, 2, 1, 0, 0, 0, 2]
 
-    linear_bins = make_value_bins(ValueBinningConfig("linear", 0, None, 2, 6, 12))
-    assert linear_bins.physical_edges.tolist() == [0, 2, 4, 6]
-    assert linear_bins.labels == ("<0", "[0, 2)", "[2, 4)", "[4, 6)", ">=6")
-
-
-def test_lower_than_first_bin_can_be_excluded_from_counts_and_normalization():
-    config = ValueBinningConfig(
-        "log", 10, 2, None, 100, 12,
+    linear_bins = make_value_bins(ValueBinningConfig(
+        "linear", 100, None, 50, 300, 12,
         include_lower_than_first_bin=False,
-    )
-    bins = make_value_bins(config)
-    assert bins.physical_edges.tolist() == [10, 20, 40, 80, 100]
-    assert bins.labels == ("[10, 20)", "[20, 40)", "[40, 80)", "[80, 100)", ">=100")
+    ))
     counts, n_valid = histogram_counts(
-        [-2, 0, 9.9, 10, 100, 1e9, np.nan, -999], bins,
+        [0, 99, 100, 149, 300, 1e9, np.nan, -999],
+        linear_bins,
         missing_values=(-999,),
     )
-    assert n_valid == 3
-    assert counts.sum() == 3
-    assert counts[0] == 1
-    assert counts[-1] == 2
+    assert n_valid == 4
+    assert counts.tolist() == [2, 0, 0, 0, 2]
+    assert linear_bins.labels[-1] == ">=300"
 
 
-def test_excluded_lower_values_do_not_contribute_temporal_coverage():
-    time = pd.date_range("2025-01-01", periods=3, freq="h", tz="UTC")
-    config = ValueBinningConfig(
-        "linear", 10, None, 2, 20, 12,
-        include_lower_than_first_bin=False,
+def test_temporal_counts_are_raw_integers_and_n_valid_uses_every_valid_value():
+    time = hourly(24)
+    values = np.zeros(24)
+    values[[1, 2, 13]] = [120, 170, 350]
+    values[5] = np.nan
+    values[6] = -999
+    table, _ = temporal_event_counts(
+        time, values, ttff_config(), missing_values=(-999,),
     )
-    table, _ = temporal_histograms(time, [1, 5, 12], config)
-    first = table.iloc[0]
-    assert first.n_valid == 1
-    assert first.bin_counts.sum() == 1
-    assert first.fractions.sum() == pytest.approx(1)
-    assert first.coverage_fraction == pytest.approx(1 / 12)
-    assert np.isnan(first.underflow_fraction)
+    assert table.iloc[0].n_valid == 10
+    assert table.iloc[1].n_valid == 12
+    assert np.issubdtype(np.asarray(table.iloc[0].bin_counts).dtype, np.integer)
+    assert table.iloc[0].bin_counts.tolist() == [1, 1, 0, 0, 0]
+    assert table.iloc[1].bin_counts.tolist() == [0, 0, 0, 0, 1]
 
 
-def test_time_histograms_record_counts_probabilities_and_irregular_coverage():
-    time = pd.to_datetime([
-        "2025-01-01T00:00Z", "2025-01-01T01:00Z", "2025-01-01T11:00Z",
-        "2025-01-01T13:00Z",
-    ])
-    values = [0, 2, 8, np.nan]
-    config = ValueBinningConfig("linear", 0, None, 2, 6, 12)
-    table, _ = temporal_histograms(time, values, config)
-    first = table.iloc[0]
-    assert first.n_valid == 3
-    assert first.bin_counts.sum() == 3
-    assert first.fractions.sum() == pytest.approx(1)
-    assert 0 < first.coverage_fraction < .8
-    assert table.iloc[1].n_valid == 0
+def test_shared_multibin_cessation_is_clear_despite_dominant_excluded_values():
+    time, values = binned_track(600, [240] * len(BIN_VALUES))
+    detection = detect_ttff_cessation(time, values, ttff_config())
+    assert detection.status == "clear"
+    assert detection.selected.time == time[0] + pd.Timedelta(hours=240)
+    assert detection.selected.agreeing_bin_count == len(BIN_VALUES)
+    assert (detection.bin_results.status == "stable_drop").all()
+    assert detection.temporal_counts.n_valid.sum() == len(values)
 
 
-def test_directional_wasserstein_identical_downward_upward_and_identity():
-    bins = make_value_bins(ValueBinningConfig("linear", 0, None, 1, 10, 12))
-    low, _ = histogram_counts(np.full(20, 2.), bins)
-    high, _ = histogram_counts(np.full(20, 8.), bins)
-    identical = directional_wasserstein(high, high, bins)
-    downward = directional_wasserstein(high, low, bins)
-    upward = directional_wasserstein(low, high, bins)
-    assert identical.w1 == pytest.approx(0)
-    assert np.isnan(identical.downward_fraction)
-    assert downward.d_down > 0 and downward.d_up == pytest.approx(0)
-    assert upward.d_up > 0 and upward.d_down == pytest.approx(0)
-    for result in (downward, upward):
-        assert result.w1 == pytest.approx(result.d_down + result.d_up)
-
-    no_lower = make_value_bins(
+def test_logarithmic_value_bins_use_the_same_raw_cessation_rule():
+    config = TTFFCessationConfig(
         ValueBinningConfig(
-            "linear", 0, None, 1, 10, 12,
+            "log", 100, 2, None, 800, 12,
             include_lower_than_first_bin=False,
-        )
+        ),
+        TTFFCessationComparisonConfig(),
     )
-    low, _ = histogram_counts(np.full(20, 2.), no_lower)
-    high, _ = histogram_counts(np.full(20, 8.), no_lower)
-    assert directional_wasserstein(high, low, no_lower).d_down > 0
+    time, values = binned_track(600, [240] * len(BIN_VALUES))
+    detection = detect_ttff_cessation(time, values, config)
+    assert detection.status == "clear"
+    assert detection.selected.time == time[0] + pd.Timedelta(hours=240)
+    assert detection.selected.agreeing_bin_count == 2
 
 
-def test_ttff_extremes_are_capped_but_open_bin_and_tail_depletion_remain_visible():
-    config = ValueBinningConfig("log", 10, 1.5, None, 1000, 12)
-    bins = make_value_bins(config)
-    before_a, _ = histogram_counts([80, 150, 300, 1e9], bins)
-    before_b, _ = histogram_counts([80, 150, 300, 1e15], bins)
-    after, _ = histogram_counts([5, 10, 20, 1e9], bins)
-    shift_a = directional_wasserstein(before_a, after, bins)
-    shift_b = directional_wasserstein(before_b, after, bins)
-    assert shift_a == shift_b
-    assert before_a[-1] == 1
-    tail = TailSupportConfig(50, 1000)
-    assert bounded_tail_area(before_a, bins, tail) > bounded_tail_area(after, bins, tail)
+def test_last_drop_is_selected_after_an_early_lull_and_reactivation():
+    time, values = binned_track(900, [None] * len(BIN_VALUES))
+    hours = ((time - time[0]) / pd.Timedelta(hours=1)).astype(int)
+    analyzed = values >= 100
+    keep = ~(analyzed & (hours >= 240) & (hours < 400))
+    keep &= ~(analyzed & (hours >= 648))
+    detection = detect_ttff_cessation(time[keep], values[keep], ttff_config())
+    assert detection.status == "clear"
+    assert detection.selected.time == time[0] + pd.Timedelta(hours=648)
 
 
-def test_temporary_ttff_quiet_period_with_reactivation_is_not_clear():
-    ttff = np.r_[
-        repeated([10, 30, 80, 150, 400], 120),
-        repeated([2, 4, 6, 8], 90),
-        repeated([10, 30, 80, 150, 400], 190),
+def test_one_isolated_late_event_per_window_is_tolerated():
+    extras = [(400, bin_index) for bin_index in range(len(BIN_VALUES))]
+    time, values = binned_track(650, [240] * len(BIN_VALUES), extra_events=extras)
+    detection = detect_ttff_cessation(time, values, ttff_config())
+    assert detection.status == "clear"
+    assert detection.selected.time == time[0] + pd.Timedelta(hours=240)
+    assert detection.selected.confirmed_until == time[0] + pd.Timedelta(hours=648)
+
+
+def test_two_late_events_reactivate_when_the_rate_threshold_also_fails():
+    config = ttff_config(quiet_fraction_of_pre_rate=.01)
+    extras = [
+        (400, bin_index)
+        for bin_index in range(len(BIN_VALUES))
+    ] + [
+        (412, bin_index)
+        for bin_index in range(len(BIN_VALUES))
     ]
-    result = detect_drogue_loss("001", hourly(len(ttff)), ttff).result
-    assert result.ttff_change_status != "clear"
-    assert np.isnat(result.auto_drogue_loss_time)
+    time, values = binned_track(650, [240] * len(BIN_VALUES), extra_events=extras)
+    detection = detect_ttff_cessation(time, values, config)
+    assert detection.status == "none"
+    assert (detection.bin_results.status == "reactivated").all()
 
 
-def test_persistent_ttff_cloud_loss_survives_one_late_extreme_spike():
-    ttff = np.r_[
-        repeated([10, 30, 80, 150, 400], 120),
-        repeated([2, 4, 6, 8], 280),
-    ]
-    ttff[270] = 1e12
-    result = detect_drogue_loss("001", hourly(len(ttff)), ttff).result
-    assert result.ttff_change_status == "clear"
-    assert result.ttff_d_down > result.ttff_d_up
-    assert result.ttff_tail_area_drop > 0
-    assert result.auto_status == "detected_ttff_provisional"
+def test_active_and_never_eligible_bins_do_not_block_an_agreeing_group():
+    time, values = binned_track(650, [None, 240, 240, 240, 2])
+    detection = detect_ttff_cessation(time, values, ttff_config())
+    assert detection.status == "clear"
+    assert detection.selected.agreeing_bin_count == 3
+    statuses = detection.bin_results.set_index("bin_index").status
+    assert statuses[0] == "no_stable_drop"
+    assert statuses[4] == "insufficient_pre_activity"
 
 
-def test_persistent_rolling_median_strain_step_has_correct_date_and_metrics():
-    n, event = 360, 120
-    strain = np.r_[np.full(event, 20.), np.full(n - event, 10.)]
-    result = detect_drogue_loss(
-        "001", hourly(n), np.full(n, 10.), strain=strain
-    ).result
-    assert result.strain_change_status == "clear"
-    assert result.strain_change_time == hourly(n)[event].to_datetime64()
-    assert result.strain_drop_absolute == pytest.approx(10)
-    assert result.strain_drop_relative == pytest.approx(.5)
-    assert result.strain_normalized_drop == pytest.approx(10)
-    assert result.auto_drogue_loss_time == result.strain_change_time
-    assert result.auto_status == "detected_strain_primary"
+def test_short_followup_and_telemetry_outage_do_not_produce_clear_detection():
+    time, values = binned_track(330, [240] * len(BIN_VALUES))
+    short = detect_ttff_cessation(time, values, ttff_config())
+    assert short.status == "insufficient_followup"
+
+    time, values = binned_track(650, [None] * len(BIN_VALUES))
+    hours = ((time - time[0]) / pd.Timedelta(hours=1)).astype(int)
+    outage = (hours < 240) | (hours >= 500)
+    detection = detect_ttff_cessation(time[outage], values[outage], ttff_config())
+    assert detection.status != "clear"
+
+
+def test_irregular_two_hour_cadence_can_detect_a_stable_drop():
+    time, values = binned_track(
+        700, [240] * len(BIN_VALUES), cadence_hours=2,
+    )
+    detection = detect_ttff_cessation(time, values, ttff_config())
+    assert detection.status == "clear"
+    assert detection.selected.time == time[0] + pd.Timedelta(hours=240)
+
+
+def test_consensus_keeps_a_singleton_outlier_visible_without_invalidating_clear():
+    time, values = binned_track(850, [240, 264, 264, 420, 240])
+    detection = detect_ttff_cessation(time, values, ttff_config())
+    assert detection.status == "clear"
+    assert detection.selected.agreeing_bin_count == 4
+    assert detection.selected.consensus_span_hours == 24
+    assert detection.selected.time == time[0] + pd.Timedelta(hours=252)
+    assert not detection.bin_results.set_index("bin_index").loc[3, "in_consensus"]
+
+
+def test_disjoint_agreeing_groups_are_ambiguous():
+    time, values = binned_track(850, [240, 240, 420, 420, None])
+    detection = detect_ttff_cessation(time, values, ttff_config())
+    assert detection.status == "ambiguous"
+
+
+def test_rolling_median_strain_detector_regression_for_persistent_step():
+    time = hourly(420)
+    strain = np.r_[np.full(240, 20.0), np.full(180, 10.0)]
+    detection = detect_strain_step(time, strain, StrainStepConfig())
+    assert detection.status == "clear"
+    assert detection.selected.time == time[240]
+    assert detection.selected.drop_absolute == pytest.approx(10.0)
+    assert detection.selected.drop_relative == pytest.approx(.5)
+    assert detection.selected.normalized_drop == pytest.approx(10.0)
 
 
 def test_isolated_strain_spike_is_suppressed_by_rolling_median():
-    strain = np.full(360, 20.)
-    strain[120] = 2
-    detected = detect_strain_step(hourly(len(strain)), strain, StrainStepConfig())
-    assert detected.status == "none"
-    assert detected.selected is None
+    strain = np.full(360, 20.0)
+    strain[120] = 2.0
+    detection = detect_strain_step(hourly(len(strain)), strain, StrainStepConfig())
+    assert detection.status == "none"
+    assert detection.selected is None
 
 
 def test_temporary_strain_dip_that_recovers_is_not_a_loss_event():
-    strain = np.r_[np.full(120, 20.), np.full(36, 10.), np.full(204, 20.)]
-    detected = detect_strain_step(hourly(len(strain)), strain, StrainStepConfig())
-    assert detected.status == "none"
-    assert detected.selected is None
-    assert "transient" in set(detected.candidates.candidate_level)
+    strain = np.r_[np.full(120, 20.0), np.full(36, 10.0), np.full(204, 20.0)]
+    detection = detect_strain_step(hourly(len(strain)), strain, StrainStepConfig())
+    assert detection.status == "none"
+    assert detection.selected is None
+    assert "transient" in set(detection.candidates.candidate_level)
 
 
 def test_stable_strain_has_no_detectable_drop():
-    detected = detect_strain_step(hourly(360), np.full(360, 20.), StrainStepConfig())
-    assert detected.status == "none"
-    assert detected.selected is None
+    detection = detect_strain_step(
+        hourly(360), np.full(360, 20.0), StrainStepConfig(),
+    )
+    assert detection.status == "none"
+    assert detection.selected is None
 
 
 def test_strain_step_handles_irregular_times_missing_values_and_sentinel():
     removed = [3, 4, 8, 35, 121, 122, 180, 181, 250]
     time = hourly(360).delete(removed)
-    strain = np.delete(np.r_[np.full(120, 20.), np.full(240, 10.)], removed)
+    strain = np.delete(np.r_[np.full(120, 20.0), np.full(240, 10.0)], removed)
     strain[[5, 70, 160]] = [np.nan, -999, np.nan]
-    detected = detect_strain_step(
+    detection = detect_strain_step(
         time, strain, StrainStepConfig(), missing_values=(-999,),
     )
-    assert detected.status == "clear"
-    assert abs(detected.selected.time - hourly(360)[120]) <= pd.Timedelta("6h")
-    assert detected.selected.pre_n_valid > 0
-    assert detected.selected.post_n_valid > 0
+    assert detection.status == "clear"
+    assert abs(detection.selected.time - hourly(360)[120]) <= pd.Timedelta("6h")
+    assert detection.selected.pre_n_valid > 0
+    assert detection.selected.post_n_valid > 0
 
 
 def test_multiple_persistent_strain_steps_are_ambiguous():
-    strain = np.r_[np.full(120, 30.), np.full(180, 20.), np.full(250, 10.)]
-    detected = detect_strain_step(hourly(len(strain)), strain, StrainStepConfig())
-    assert detected.status == "ambiguous"
-    assert detected.selected is not None
+    strain = np.r_[np.full(120, 30.0), np.full(180, 20.0), np.full(250, 10.0)]
+    detection = detect_strain_step(hourly(len(strain)), strain, StrainStepConfig())
+    assert detection.status == "ambiguous"
+    assert detection.selected is not None
 
 
-@pytest.mark.parametrize("after", [([0, 40], "variance"), ([30, 40, 50], "upward")])
-def test_variance_increase_or_upward_shift_does_not_trigger(after):
-    values, _ = after
-    ttff = np.r_[np.full(120, 20.), repeated(values, 280)]
-    result = detect_drogue_loss("001", hourly(len(ttff)), ttff).result
-    assert result.ttff_change_status != "clear"
-    assert np.isnat(result.auto_drogue_loss_time)
+@pytest.mark.parametrize("start, stop", [(240, 246), (240, 264)])
+def test_rolling_median_strain_detector_rejects_transient_spikes(start, stop):
+    time = hourly(420)
+    strain = np.full(420, 20.0)
+    strain[start:stop] = 5.0
+    detection = detect_strain_step(time, strain, StrainStepConfig())
+    assert detection.status == "none"
 
 
-def test_no_transition_and_insufficient_followup_are_distinct():
-    stable = repeated([10, 30, 80, 150, 400], 360)
-    none = detect_drogue_loss("001", hourly(360), stable).result
-    assert none.ttff_change_status in {"none", "weak"}
-    assert np.isnat(none.auto_drogue_loss_time)
-
-    late = np.r_[repeated([10, 30, 80, 150, 400], 300), repeated([2, 4, 6, 8], 60)]
-    insufficient = detect_drogue_loss("001", hourly(360), late).result
-    assert insufficient.ttff_change_status == "insufficient_followup"
-    assert insufficient.auto_status == "insufficient_followup"
-    assert np.isnat(insufficient.auto_drogue_loss_time)
-
-
-def test_multiple_comparable_persistent_changes_are_ambiguous():
-    ttff = np.r_[
-        repeated([10, 30, 80, 150, 400], 100), repeated([2, 4, 6, 8], 140),
-        repeated([10, 30, 80, 150, 400], 100), repeated([2, 4, 6, 8], 260),
-    ]
-    result = detect_drogue_loss("001", hourly(len(ttff)), ttff).result
-    assert result.ttff_change_status == "ambiguous"
-    assert result.auto_status == "ambiguous_component_changes"
-    assert np.isnat(result.auto_drogue_loss_time)
-
-
-def test_clear_event_is_stable_to_modest_bin_and_window_changes():
-    n, event = 420, 144
-    ttff = np.r_[
-        repeated([10, 30, 80, 150, 400], event),
-        repeated([2, 4, 6, 8], n - event),
-    ]
-    base = DrogueDetectionConfig().ttff
-    alternative = replace(
-        base,
-        binning=replace(base.binning, factor=1.7),
-        comparison=replace(base.comparison, pre_window_hours=60, post_window_hours=60),
-    )
-    first = detect_distribution_change(hourly(n), ttff, base)
-    second = detect_distribution_change(hourly(n), ttff, alternative)
-    assert first.status == second.status == "clear"
-    assert abs(pd.Timestamp(first.selected.time) - pd.Timestamp(second.selected.time)) <= pd.Timedelta("12h")
-
-
-def test_strain_is_primary_and_earlier_sustained_ttff_corroborates_without_date_averaging():
-    n, ttff_event, strain_event = 420, 96, 132
-    ttff = np.r_[
-        repeated([10, 30, 80, 150, 400], ttff_event),
-        repeated([2, 4, 6, 8], n - ttff_event),
-    ]
-    strain = np.r_[
-        repeated([18, 20, 22, 24], strain_event),
-        repeated([8, 10, 12, 14], n - strain_event),
-    ]
-    result = detect_drogue_loss("001", hourly(n), ttff, strain=strain).result
-    assert result.ttff_change_status == result.strain_change_status == "clear"
-    assert result.ttff_change_time < result.strain_change_time
-    assert result.ttff_strain_relation == "corroborating"
+def test_strain_remains_primary_and_ttff_only_corroborates():
+    time, ttff = binned_track(700, [240] * len(BIN_VALUES))
+    hours = ((time - time[0]) / pd.Timedelta(hours=1)).astype(int)
+    strain = np.where(hours < 300, 20.0, 10.0)
+    result = detect_drogue_loss(
+        "test", time, ttff, strain=strain,
+        config=DrogueDetectionConfig(ttff=ttff_config()),
+    ).result
+    assert result.ttff_change_time == np.datetime64("2025-01-11T00:00:00")
+    assert result.strain_change_time == np.datetime64("2025-01-13T12:00:00")
     assert result.auto_drogue_loss_time == result.strain_change_time
     assert result.auto_status == "detected_strain_primary_corroborated"
+    assert result.ttff_strain_offset_hours == 60
 
 
-def test_missing_strain_uses_medium_confidence_ttff_fallback():
-    n, event = 360, 120
-    ttff = np.r_[
-        repeated([10, 30, 80, 150, 400], event),
-        repeated([2, 4, 6, 8], n - event),
-    ]
-    result = detect_drogue_loss("001", hourly(n), ttff, strain=None).result
-    assert result.strain_change_status == "unavailable"
-    assert result.auto_drogue_loss_time == result.ttff_change_time
-    assert result.auto_confidence == "medium"
-
-
-def test_strain_step_detector_does_not_change_ttff_component_result():
-    n, event = 360, 120
-    ttff = np.r_[
-        repeated([10, 30, 80, 150, 400], event),
-        repeated([2, 4, 6, 8], n - event),
-    ]
-    direct = detect_distribution_change(hourly(n), ttff, DrogueDetectionConfig().ttff)
-    combined = detect_drogue_loss(
-        "001", hourly(n), ttff, strain=np.r_[
-            np.full(event, 20.), np.full(n - event, 10.),
-        ],
+def test_ttff_is_provisional_when_strain_is_unavailable():
+    time, ttff = binned_track(650, [240] * len(BIN_VALUES))
+    result = detect_drogue_loss(
+        "test", time, ttff,
+        config=DrogueDetectionConfig(ttff=ttff_config()),
     ).result
-    assert combined.ttff_change_status == direct.status
-    assert combined.ttff_change_time == direct.selected.time.to_datetime64()
-    assert combined.ttff_d_down == pytest.approx(direct.selected.d_down)
-    assert combined.ttff_d_up == pytest.approx(direct.selected.d_up)
+    assert result.auto_status == "detected_ttff_provisional"
+    assert result.auto_drogue_loss_time == result.ttff_change_time
+    assert result.strain_change_status == "unavailable"
 
 
-def test_configuration_validation_rejects_inconsistent_shapes():
-    with pytest.raises(ValueError, match="factor"):
-        ValueBinningConfig("log", 10, 1, None, 1000, 12)
-    with pytest.raises(ValueError, match="width"):
-        ValueBinningConfig("linear", 0, None, None, 60, 12)
-    with pytest.raises(ValueError, match="include_lower_than_first_bin"):
-        ValueBinningConfig("linear", 0, None, 2, 60, 12, "false")
-    with pytest.raises(ValueError, match="downward_fraction"):
-        DistributionComparisonConfig(48, 48, 72, 24, .75, .3, .5, .2, 48, .8)
-    with pytest.raises(ValueError, match="minimum_drop_absolute"):
-        StrainStepConfig(minimum_drop_absolute=.5, weak_drop_absolute=1)
-    with pytest.raises(ValueError, match="persistence_window"):
-        StrainStepConfig(persistence_window="0h")
-    with pytest.raises(ValueError, match="tail.upper_edge"):
-        SignalDistributionConfig(
-            ValueBinningConfig("log", 10, 1.5, None, 100, 12),
-            DrogueDetectionConfig().ttff.comparison,
-            TailSupportConfig(50, 1000),
+def test_no_valid_ttff_is_unavailable_and_keeps_public_counts_zero():
+    time = hourly(400)
+    detection = detect_drogue_loss(
+        "test", time, np.full(400, -999.0), strain=np.full(400, 20.0),
+        config=DrogueDetectionConfig(ttff=ttff_config()),
+    )
+    assert detection.result.ttff_change_status == "unavailable"
+    assert detection.result.ttff_eligible_bin_count == 0
+    assert detection.result.ttff_stable_drop_bin_count == 0
+
+
+def test_ttff_configuration_validation_and_obsolete_sections():
+    with pytest.raises(ValueError, match="multiple"):
+        TTFFCessationConfig(
+            ValueBinningConfig("linear", 100, None, 50, 300, 10),
+            TTFFCessationComparisonConfig(),
         )
+    with pytest.raises(ValueError, match="Unknown detection.ttff keys"):
+        DrogueDetectionConfig.from_dict({"ttff": {"tail": {}}})
+    with pytest.raises(ValueError, match="Unknown detection.ttff.comparison"):
+        DrogueDetectionConfig.from_dict({
+            "ttff": {"comparison": {"wasserstein_threshold": .2}},
+        })
 
 
-def test_analysis_cutoff_is_separate_from_physical_event():
-    event = np.datetime64("2025-02-03T18:00:00", "ns")
-    cutoff = analysis_cutoff_time(event, 24)
-    assert event == np.datetime64("2025-02-03T18:00:00", "ns")
-    assert cutoff == np.datetime64("2025-02-02T18:00:00", "ns")
+def test_analysis_cutoff_remains_distinct_from_the_detected_event_time():
+    event = np.datetime64("2025-01-10T12:00:00")
+    assert analysis_cutoff_time(event, 24) == np.datetime64("2025-01-09T12:00:00")

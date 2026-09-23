@@ -25,9 +25,10 @@ class DrogueLossReviewer:
         required = {
             "platform_code", "source_path", "source_filename", "source_sha256",
             "auto_drogue_loss_time", "auto_status", "auto_confidence",
-            "ttff_change_time", "ttff_change_status", "ttff_change_strength",
-            "ttff_d_down", "ttff_d_up", "ttff_downward_fraction",
-            "ttff_tail_area_drop", "ttff_pre_coverage_fraction",
+            "ttff_change_time", "ttff_change_status", "ttff_eligible_bin_count",
+            "ttff_stable_drop_bin_count", "ttff_agreeing_bin_count",
+            "ttff_consensus_span_hours", "ttff_agreeing_pre_events",
+            "ttff_agreeing_post_events", "ttff_min_persistence_coverage_fraction",
             "strain_change_time", "strain_change_status", "strain_change_strength",
             "strain_drop_absolute", "strain_drop_relative", "strain_normalized_drop",
             "strain_pre_coverage_fraction", "ttff_strain_offset_hours",
@@ -56,7 +57,7 @@ class DrogueLossReviewer:
                                        hspace=.34, wspace=.25)
         self.full_ax = self.figure.add_subplot(grid[0, :])
         self.ttff_ax = self.figure.add_subplot(grid[1, 0])
-        self.ttff_fraction_ax = self.ttff_ax.twinx()
+        self.ttff_count_ax = self.ttff_ax.twinx()
         self.strain_ax = self.figure.add_subplot(grid[1, 1], sharex=self.ttff_ax)
         self.strain_metric_ax = self.strain_ax.twinx()
         self.temperature_ax = self.figure.add_subplot(grid[2, :], sharex=self.ttff_ax)
@@ -149,7 +150,7 @@ class DrogueLossReviewer:
         row = self._load()
         result = self.detection.result
         data = self.detection.diagnostics
-        for axis in (self.full_ax, self.ttff_ax, self.ttff_fraction_ax, self.strain_ax,
+        for axis in (self.full_ax, self.ttff_ax, self.ttff_count_ax, self.strain_ax,
                      self.strain_metric_ax,
                      self.temperature_ax, self.temperature_variability_ax):
             axis.clear()
@@ -158,22 +159,54 @@ class DrogueLossReviewer:
         self.full_ax.plot(time, data.ttff, ".", color=".45", ms=2, label="Raw TTFF")
         self.full_ax.set_ylabel("TTFF")
         self.full_ax.set_title("Full record")
-        self.ttff_ax.plot(time, data.ttff, ".", color=".7", ms=2, label="Raw TTFF")
-        self.ttff_ax.set_yscale("symlog", linthresh=20)
-        ttff_metrics = self.detection.ttff_candidates
-        self.ttff_fraction_ax.plot(
-            ttff_metrics.time, ttff_metrics.d_down, color="tab:purple", lw=1.1,
-            label="D_down",
+        count_table = self.detection.ttff_counts
+        raw_counts = np.stack(count_table.bin_counts.to_numpy()).T
+        x_edges = [*count_table.time_start, count_table.time_end.iloc[-1]]
+        self.ttff_ax.pcolormesh(
+            x_edges, np.arange(raw_counts.shape[0] + 1), raw_counts,
+            shading="flat", cmap="viridis", vmin=0,
         )
-        self.ttff_fraction_ax.plot(
-            ttff_metrics.time, ttff_metrics.d_up, color="tab:orange", lw=.8,
-            label="D_up",
+        self.ttff_ax.set_yticks(np.arange(len(self.detection.ttff_bins.labels)) + .5)
+        self.ttff_ax.set_yticklabels(self.detection.ttff_bins.labels, fontsize=6)
+        marker_label = True
+        for component in self.detection.ttff_bin_results.itertuples():
+            if pd.notna(component.drop_time):
+                self.ttff_ax.plot(
+                    component.drop_time, component.bin_index + .5,
+                    marker="v", ms=5, color="white", mec="black",
+                    label=("Per-bin stable drop" if marker_label else None),
+                )
+                marker_label = False
+        forward_counts = np.stack(count_table.forward_counts.to_numpy()).T
+        colors = self.plt.cm.viridis(
+            np.linspace(.05, .95, len(self.detection.ttff_bins.labels))
         )
-        self.ttff_fraction_ax.set_ylabel("Directional distance", color="tab:purple")
-        self.ttff_ax.set_ylabel("TTFF")
+        for bin_index, color in enumerate(colors):
+            self.ttff_count_ax.step(
+                count_table.time_start, forward_counts[bin_index], where="post",
+                color=color, lw=.65, alpha=.65,
+                label=("Per-bin forward 48 h counts" if bin_index == 0 else None),
+            )
+        self.ttff_count_ax.plot(
+            count_table.time_center, count_table.n_valid, color="tab:orange", lw=.9,
+            ls="--",
+            label="N_valid",
+        )
+        for availability in count_table[
+            ~count_table.forward_coverage_adequate
+        ].itertuples():
+            self.ttff_ax.axvspan(
+                availability.time_start, availability.time_end,
+                color="tab:red", alpha=.10,
+            )
+        self.ttff_count_ax.set_ylabel("Forward events / N_valid", color="tab:orange")
+        self.ttff_ax.set_ylabel("TTFF value bins")
+        status_counts = self.detection.ttff_bin_results.status.value_counts().to_dict()
         self.ttff_ax.set_title(
-            f"TTFF redistribution: {result.ttff_change_status} "
-            f"(D_down={result.ttff_d_down:.3g}, direction={result.ttff_downward_fraction:.0%})"
+            f"TTFF bin cessation: {result.ttff_change_status} "
+            f"(eligible={result.ttff_eligible_bin_count}, "
+            f"stable={result.ttff_stable_drop_bin_count}, "
+            f"agreeing={result.ttff_agreeing_bin_count}; {status_counts})"
         )
         self.strain_ax.plot(time, data.strain, ".", color=".6", ms=2, label="Raw strain")
         self.strain_ax.plot(time, data.rolling_median_strain, color="tab:green",
@@ -241,7 +274,7 @@ class DrogueLossReviewer:
                 axis.set_xlim(center - half, center + half)
         self.full_ax.legend(loc="upper right", fontsize=8)
         handles, labels = self.ttff_ax.get_legend_handles_labels()
-        extra_handles, extra_labels = self.ttff_fraction_ax.get_legend_handles_labels()
+        extra_handles, extra_labels = self.ttff_count_ax.get_legend_handles_labels()
         self.ttff_ax.legend(handles + extra_handles, labels + extra_labels,
                             loc="upper right", fontsize=8)
         strain_handles, strain_labels = self.strain_ax.get_legend_handles_labels()
@@ -259,8 +292,9 @@ class DrogueLossReviewer:
         self.figure.suptitle(
             f"{row.platform_code}  {self.cursor + 1}/{len(self.automatic)}  "
             f"status={row.auto_status} confidence={row.auto_confidence} review={decision_text}\n"
-            f"TTFF D_down/up={row.ttff_d_down:.3g}/{row.ttff_d_up:.3g}, "
-            f"tail depletion={row.ttff_tail_area_drop:.3g}; "
+            f"TTFF eligible/stable/agreeing="
+            f"{row.ttff_eligible_bin_count}/{row.ttff_stable_drop_bin_count}/"
+            f"{row.ttff_agreeing_bin_count}, span={row.ttff_consensus_span_hours:.2f} h; "
             f"strain drop abs/relative/normalized="
             f"{row.strain_drop_absolute:.3g}/{row.strain_drop_relative:.1%}/"
             f"{row.strain_normalized_drop:.3g}; "
@@ -299,7 +333,7 @@ class DrogueLossReviewer:
             self.plt.close(self.figure)
 
     def on_click(self, event) -> None:
-        if event.inaxes not in {self.full_ax, self.ttff_ax, self.ttff_fraction_ax, self.strain_ax,
+        if event.inaxes not in {self.full_ax, self.ttff_ax, self.ttff_count_ax, self.strain_ax,
                                 self.strain_metric_ax,
                                 self.temperature_ax, self.temperature_variability_ax}:
             return

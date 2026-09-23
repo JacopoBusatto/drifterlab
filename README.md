@@ -181,8 +181,8 @@ Reconstructed coordinate range flags and masks remain representation-specific.
 ## Standalone drogue-loss detection and review
 
 The drogue QC stage reads raw `ObsTimestamp`, `GpsTTFF`, optional `Drogue`
-strain, and optional `HullTemperature`. A histogram/CDF method detects persistent
-downward redistribution in log-binned TTFF, while a separate rolling-median
+strain, and optional `HullTemperature`. A raw per-value-bin count method detects
+the last persistent cessation of TTFF activity, while a separate rolling-median
 detector finds persistent downward strain steps. Strain supplies the preferred
 physical time; TTFF corroborates it or provides a provisional fallback. Hull
 temperature is context only. The automatic result supports a separate

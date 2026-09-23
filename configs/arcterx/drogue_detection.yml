@@ -10,7 +10,7 @@ processing:
   missing_value: -999
   analysis_cutoff_margin_hours: 24
 detection:
-  # One histogram/CDF method, configured for logarithmic TTFF values.
+  # Raw per-bin activity cessation, configured with logarithmic TTFF value bins.
   ttff:
     binning:
       scale: log
@@ -21,19 +21,17 @@ detection:
       time_bin_hours: 12
       include_lower_than_first_bin: true
     comparison:
-      pre_window_hours: 48
-      post_window_hours: 48
-      persistence_hours: 72
-      min_valid_samples: 24
+      rolling_count_window_hours: 48
+      pre_activity_window_hours: 168
+      min_pre_events: 12
+      min_pre_occupied_time_bins: 3
       min_coverage_fraction: 0.75
-      min_down_distance: 0.35
-      min_downward_fraction: 0.75
-      max_reactivation_fraction: 0.20
-      peak_separation_hours: 48
-      comparable_strength_fraction: 0.80
-    tail:
-      lower_edge: 50
-      upper_edge: 1000
+      quiet_fraction_of_pre_rate: 0.10
+      max_events_in_quiet_window: 1
+      persistence_hours: 120
+      reactivation_window_hours: 48
+      agreement_tolerance_hours: 48
+      min_agreeing_bins: 2
 
   # Rolling-median persistent downward-step detector for strain.
   strain:

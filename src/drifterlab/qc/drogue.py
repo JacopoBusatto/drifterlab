@@ -1,4 +1,4 @@
-"""TTFF-distribution and strain-step drogue detection plus analysis masks."""
+"""TTFF per-bin cessation and strain-step drogue detection plus analysis masks."""
 
 from __future__ import annotations
 
@@ -53,69 +53,77 @@ class ValueBinningConfig:
 
 
 @dataclass(frozen=True)
-class DistributionComparisonConfig:
-    """Coverage, direction, persistence, and ambiguity settings."""
+class TTFFCessationComparisonConfig:
+    """Activity, quiet-state, persistence, and cross-bin agreement settings."""
 
-    pre_window_hours: float
-    post_window_hours: float
-    persistence_hours: float
-    min_valid_samples: int
-    min_coverage_fraction: float
-    min_down_distance: float
-    min_downward_fraction: float
-    max_reactivation_fraction: float
-    peak_separation_hours: float
-    comparable_strength_fraction: float
+    rolling_count_window_hours: float = 48.0
+    pre_activity_window_hours: float = 168.0
+    min_pre_events: int = 12
+    min_pre_occupied_time_bins: int = 3
+    min_coverage_fraction: float = .75
+    quiet_fraction_of_pre_rate: float = .10
+    max_events_in_quiet_window: int = 1
+    persistence_hours: float = 120.0
+    reactivation_window_hours: float = 48.0
+    agreement_tolerance_hours: float = 48.0
+    min_agreeing_bins: int = 2
 
     def __post_init__(self) -> None:
-        positive = (
-            "pre_window_hours", "post_window_hours", "persistence_hours",
-            "min_down_distance", "peak_separation_hours",
+        durations = (
+            "rolling_count_window_hours", "pre_activity_window_hours",
+            "persistence_hours", "reactivation_window_hours",
+            "agreement_tolerance_hours",
         )
-        for name in positive:
+        for name in durations:
             value = getattr(self, name)
-            if isinstance(value, bool) or not np.isfinite(value) or value <= 0:
+            if (isinstance(value, (bool, np.bool_))
+                    or not isinstance(value, (int, float, np.number))
+                    or not np.isfinite(value) or value <= 0):
                 raise ValueError(f"comparison.{name} must be finite and positive")
-        fractions = (
-            "min_coverage_fraction", "min_downward_fraction",
-            "max_reactivation_fraction", "comparable_strength_fraction",
-        )
-        for name in fractions:
+        for name in (
+            "min_pre_events", "min_pre_occupied_time_bins",
+            "max_events_in_quiet_window", "min_agreeing_bins",
+        ):
             value = getattr(self, name)
-            if isinstance(value, bool) or not np.isfinite(value) or not 0 <= value <= 1:
-                raise ValueError(f"comparison.{name} must be in [0, 1]")
-        if self.min_coverage_fraction == 0:
-            raise ValueError("comparison.min_coverage_fraction must exceed zero")
-        if self.min_downward_fraction <= .5:
-            raise ValueError("comparison.min_downward_fraction must exceed 0.5")
-        if self.comparable_strength_fraction == 0:
-            raise ValueError("comparison.comparable_strength_fraction must exceed zero")
-        if (isinstance(self.min_valid_samples, bool)
-                or not isinstance(self.min_valid_samples, (int, np.integer))
-                or self.min_valid_samples < 2):
-            raise ValueError("comparison.min_valid_samples must be an integer of at least two")
+            lower = 0 if name == "max_events_in_quiet_window" else 1
+            if (isinstance(value, (bool, np.bool_))
+                    or not isinstance(value, (int, np.integer)) or value < lower):
+                raise ValueError(f"comparison.{name} must be an integer >= {lower}")
+        for name in ("min_coverage_fraction", "quiet_fraction_of_pre_rate"):
+            value = getattr(self, name)
+            if (isinstance(value, (bool, np.bool_))
+                    or not isinstance(value, (int, float, np.number))
+                    or not np.isfinite(value) or not 0 < value <= 1):
+                raise ValueError(f"comparison.{name} must be in (0, 1]")
+        if self.pre_activity_window_hours < self.rolling_count_window_hours:
+            raise ValueError(
+                "comparison.pre_activity_window_hours cannot be shorter than "
+                "rolling_count_window_hours"
+            )
+        if self.persistence_hours < self.rolling_count_window_hours:
+            raise ValueError(
+                "comparison.persistence_hours cannot be shorter than "
+                "rolling_count_window_hours"
+            )
 
 
 @dataclass(frozen=True)
-class TailSupportConfig:
-    lower_edge: float
-    upper_edge: float
-
-    def __post_init__(self) -> None:
-        if (not np.isfinite(self.lower_edge) or not np.isfinite(self.upper_edge)
-                or self.lower_edge < 0 or self.upper_edge <= self.lower_edge):
-            raise ValueError("tail edges must be finite, nonnegative, and increasing")
-
-
-@dataclass(frozen=True)
-class SignalDistributionConfig:
+class TTFFCessationConfig:
     binning: ValueBinningConfig
-    comparison: DistributionComparisonConfig
-    tail: TailSupportConfig | None = None
+    comparison: TTFFCessationComparisonConfig
 
     def __post_init__(self) -> None:
-        if self.tail is not None and self.tail.upper_edge > self.binning.last_edge:
-            raise ValueError("tail.upper_edge cannot exceed binning.last_edge")
+        cadence = self.binning.time_bin_hours
+        aligned = (
+            "rolling_count_window_hours", "pre_activity_window_hours",
+            "persistence_hours", "reactivation_window_hours",
+        )
+        for name in aligned:
+            value = getattr(self.comparison, name)
+            if not np.isclose(value / cadence, round(value / cadence)):
+                raise ValueError(
+                    f"comparison.{name} must be a multiple of binning.time_bin_hours"
+                )
 
 
 @dataclass(frozen=True)
@@ -171,21 +179,18 @@ class StrainStepConfig:
                 raise ValueError(f"strain.{minimum} cannot be less than strain.{weak}")
 
 
-def _default_ttff() -> SignalDistributionConfig:
-    return SignalDistributionConfig(
+def _default_ttff() -> TTFFCessationConfig:
+    return TTFFCessationConfig(
         ValueBinningConfig("log", 10.0, 1.5, None, 1000.0, 12.0),
-        DistributionComparisonConfig(
-            48.0, 48.0, 72.0, 24, .75, .35, .75, .20, 48.0, .80,
-        ),
-        TailSupportConfig(50.0, 1000.0),
+        TTFFCessationComparisonConfig(),
     )
 
 
 @dataclass(frozen=True)
 class DrogueDetectionConfig:
-    """Settings for TTFF distributions, strain steps, and contextual temperature."""
+    """Settings for TTFF-bin cessation, strain steps, and contextual temperature."""
 
-    ttff: SignalDistributionConfig = field(default_factory=_default_ttff)
+    ttff: TTFFCessationConfig = field(default_factory=_default_ttff)
     strain: StrainStepConfig = field(default_factory=StrainStepConfig)
     temperature_background_window: str = "24h"
     temperature_variability_window: str = "6h"
@@ -212,56 +217,41 @@ class DrogueDetectionConfig:
         if unknown:
             raise ValueError(f"Unknown detection keys: {sorted(unknown)}")
 
-        def signal(name: str, default: SignalDistributionConfig) -> SignalDistributionConfig:
-            raw = data.get(name)
-            if raw is None:
-                return default
-            if not isinstance(raw, dict):
-                raise ValueError(f"detection.{name} must be a mapping")
-            allowed_signal = {"binning", "comparison", "tail"}
-            unknown_signal = set(raw) - allowed_signal
-            if unknown_signal:
+        raw_ttff = data.get("ttff")
+        if raw_ttff is None:
+            ttff = _default_ttff()
+        else:
+            if not isinstance(raw_ttff, dict):
+                raise ValueError("detection.ttff must be a mapping")
+            unknown_ttff = set(raw_ttff) - {"binning", "comparison"}
+            if unknown_ttff:
                 raise ValueError(
-                    f"Unknown detection.{name} keys: {sorted(unknown_signal)}"
+                    f"Unknown detection.ttff keys: {sorted(unknown_ttff)}"
                 )
 
-            def nested(section: str, default_object: Any, object_type: type) -> Any:
-                values = raw.get(section)
+            def ttff_section(section: str, default_object: Any,
+                             object_type: type) -> Any:
+                values = raw_ttff.get(section)
                 if values is None:
                     return default_object
                 if not isinstance(values, dict):
-                    raise ValueError(f"detection.{name}.{section} must be a mapping")
+                    raise ValueError(f"detection.ttff.{section} must be a mapping")
                 valid = set(default_object.__dataclass_fields__)
                 unknown_nested = set(values) - valid
                 if unknown_nested:
                     raise ValueError(
-                        f"Unknown detection.{name}.{section} keys: {sorted(unknown_nested)}"
+                        f"Unknown detection.ttff.{section} keys: {sorted(unknown_nested)}"
                     )
-                merged = {**asdict(default_object), **values}
-                return object_type(**merged)
+                return object_type(**{**asdict(default_object), **values})
 
-            binning = nested("binning", default.binning, ValueBinningConfig)
-            comparison = nested(
-                "comparison", default.comparison, DistributionComparisonConfig
+            default_ttff = _default_ttff()
+            ttff = TTFFCessationConfig(
+                ttff_section("binning", default_ttff.binning, ValueBinningConfig),
+                ttff_section(
+                    "comparison", default_ttff.comparison,
+                    TTFFCessationComparisonConfig,
+                ),
             )
-            if "tail" in raw:
-                if raw["tail"] is None:
-                    tail = None
-                elif default.tail is None:
-                    values = raw["tail"]
-                    if not isinstance(values, dict):
-                        raise ValueError(f"detection.{name}.tail must be a mapping")
-                    unknown_tail = set(values) - {"lower_edge", "upper_edge"}
-                    if unknown_tail:
-                        raise ValueError(
-                            f"Unknown detection.{name}.tail keys: {sorted(unknown_tail)}"
-                        )
-                    tail = TailSupportConfig(**values)
-                else:
-                    tail = nested("tail", default.tail, TailSupportConfig)
-            else:
-                tail = default.tail
-            return SignalDistributionConfig(binning, comparison, tail)
 
         raw_strain = data.get("strain")
         if raw_strain is None:
@@ -280,7 +270,7 @@ class DrogueDetectionConfig:
             })
 
         return cls(
-            ttff=signal("ttff", _default_ttff()),
+            ttff=ttff,
             strain=strain,
             temperature_background_window=data.get(
                 "temperature_background_window", "24h"
@@ -294,29 +284,19 @@ class DrogueDetectionConfig:
 @dataclass(frozen=True)
 class ValueBins:
     physical_edges: np.ndarray
-    coordinate_edges: np.ndarray
     histogram_edges: np.ndarray
     labels: tuple[str, ...]
     scale: str
     include_lower_than_first_bin: bool
 
 
-@dataclass(frozen=True)
-class DistributionShift:
-    d_down: float
-    d_up: float
-    w1: float
-    downward_fraction: float
-
-
 @dataclass
-class SignalDistributionDetection:
+class TTFFCessationDetection:
     status: str
     selected: pd.Series | None
-    candidates: pd.DataFrame
-    temporal_histograms: pd.DataFrame
+    bin_results: pd.DataFrame
+    temporal_counts: pd.DataFrame
     bins: ValueBins
-    detail: dict[str, np.ndarray]
 
 
 @dataclass
@@ -334,23 +314,14 @@ class DrogueDetectionResult:
     auto_confidence: str
     ttff_strain_relation: str
     ttff_change_time: np.datetime64
-    ttff_change_strength: float
     ttff_change_status: str
-    ttff_d_down: float
-    ttff_d_up: float
-    ttff_w1: float
-    ttff_downward_fraction: float
-    ttff_tail_area_before: float
-    ttff_tail_area_after: float
-    ttff_tail_area_drop: float
-    ttff_tail_area_relative_drop: float
-    ttff_pre_coverage_fraction: float
-    ttff_post_coverage_fraction: float
-    ttff_followup_coverage_fraction: float
-    ttff_underflow_fraction_before: float
-    ttff_overflow_fraction_before: float
-    ttff_underflow_fraction_after: float
-    ttff_overflow_fraction_after: float
+    ttff_eligible_bin_count: int
+    ttff_stable_drop_bin_count: int
+    ttff_agreeing_bin_count: int
+    ttff_consensus_span_hours: float
+    ttff_agreeing_pre_events: int
+    ttff_agreeing_post_events: int
+    ttff_min_persistence_coverage_fraction: float
     strain_change_time: np.datetime64
     strain_change_strength: float
     strain_change_status: str
@@ -379,11 +350,10 @@ class DrogueDetectionResult:
 class DrogueDetection:
     result: DrogueDetectionResult
     diagnostics: pd.DataFrame
-    ttff_candidates: pd.DataFrame
+    ttff_bin_results: pd.DataFrame
     strain_candidates: pd.DataFrame
-    ttff_histograms: pd.DataFrame
+    ttff_counts: pd.DataFrame
     ttff_bins: ValueBins
-    ttff_detail: dict[str, np.ndarray]
 
 
 def make_value_bins(config: ValueBinningConfig) -> ValueBins:
@@ -407,7 +377,6 @@ def make_value_bins(config: ValueBinningConfig) -> ValueBins:
         physical = np.r_[generated, float(config.last_edge)].astype(float)
     if len(physical) < 2 or np.any(np.diff(physical) <= 0):
         raise ValueError("Configured binning did not produce increasing finite edges")
-    coordinate = np.log1p(physical) if config.scale == "log" else physical.copy()
     if config.include_lower_than_first_bin:
         histogram = np.r_[-np.inf, physical, np.inf]
         labels = [f"<{physical[0]:g}"]
@@ -419,7 +388,7 @@ def make_value_bins(config: ValueBinningConfig) -> ValueBins:
     )
     labels.append(f">={physical[-1]:g}")
     return ValueBins(
-        physical, coordinate, histogram, tuple(labels), config.scale,
+        physical, histogram, tuple(labels), config.scale,
         config.include_lower_than_first_bin,
     )
 
@@ -441,92 +410,6 @@ def histogram_counts(values: Any, bins: ValueBins, *,
         valid &= array >= bins.physical_edges[0]
     counts = np.histogram(array[valid], bins=bins.histogram_edges)[0].astype(np.int64)
     return counts, int(valid.sum())
-
-
-def _positive_linear_integral(left: float, right: float, width: float) -> float:
-    if left >= 0 and right >= 0:
-        return .5 * (left + right) * width
-    if left <= 0 and right <= 0:
-        return 0.0
-    if np.isclose(left, right):
-        return max(left, 0.0) * width
-    crossing = -left / (right - left)
-    if left > 0:
-        return .5 * left * width * crossing
-    return .5 * right * width * (1 - crossing)
-
-
-def directional_wasserstein(before_counts: Any, after_counts: Any,
-                            bins: ValueBins) -> DistributionShift:
-    """Integrate signed CDF separation with uniform mass inside finite bins.
-
-    Underflow and overflow mass are clipped to the first and last finite edges.
-    Thus open bins affect occupancy and direction but receive no arbitrary
-    midpoint or unbounded leverage.
-    """
-    before = np.asarray(before_counts, dtype=float)
-    after = np.asarray(after_counts, dtype=float)
-    offset = int(bins.include_lower_than_first_bin)
-    expected = len(bins.coordinate_edges) + offset
-    if before.shape != (expected,) or after.shape != (expected,):
-        raise ValueError(f"Histogram counts must each have length {expected}")
-    if before.sum() <= 0 or after.sum() <= 0:
-        return DistributionShift(np.nan, np.nan, np.nan, np.nan)
-    before /= before.sum()
-    after /= after.sum()
-    delta_left = after[0] - before[0] if offset else 0.0
-    down = up = 0.0
-    for index, width in enumerate(np.diff(bins.coordinate_edges)):
-        count_index = index + offset
-        delta_right = delta_left + after[count_index] - before[count_index]
-        down += _positive_linear_integral(delta_left, delta_right, float(width))
-        up += _positive_linear_integral(-delta_left, -delta_right, float(width))
-        delta_left = delta_right
-    total = down + up
-    fraction = down / total if total > np.finfo(float).eps else np.nan
-    return DistributionShift(float(down), float(up), float(total), float(fraction))
-
-
-def survival_curve(counts: Any, bins: ValueBins,
-                   physical_points: Any) -> np.ndarray:
-    """Histogram survival curve using uniform mass within finite bins."""
-    counts = np.asarray(counts, dtype=float)
-    if counts.sum() <= 0:
-        return np.full(np.asarray(physical_points).shape, np.nan, dtype=float)
-    probabilities = counts / counts.sum()
-    points = np.asarray(physical_points, dtype=float)
-    coordinates = np.log1p(np.clip(points, 0, None)) if bins.scale == "log" else points
-    output = np.empty(points.shape, dtype=float)
-    edges = bins.coordinate_edges
-    offset = int(bins.include_lower_than_first_bin)
-    for position, coordinate in np.ndenumerate(coordinates):
-        if coordinate < edges[0]:
-            cdf = 0.0
-        elif coordinate >= edges[-1]:
-            cdf = 1.0
-        else:
-            interval = int(np.searchsorted(edges, coordinate, side="right") - 1)
-            cdf = probabilities[0] if offset else 0.0
-            cdf += probabilities[offset:offset + interval].sum()
-            proportion = (coordinate - edges[interval]) / (edges[interval + 1] - edges[interval])
-            cdf += probabilities[offset + interval] * proportion
-        output[position] = max(0.0, min(1.0, 1.0 - cdf))
-    return output
-
-
-def bounded_tail_area(counts: Any, bins: ValueBins, tail: TailSupportConfig) -> float:
-    """Integrate survival in log1p space over configured physical bounds."""
-    if bins.scale != "log":
-        raise ValueError("Bounded tail area requires log-scale bins")
-    internal = bins.physical_edges[
-        (bins.physical_edges > tail.lower_edge) & (bins.physical_edges < tail.upper_edge)
-    ]
-    points = np.r_[tail.lower_edge, internal, tail.upper_edge]
-    curve = survival_curve(counts, bins, points)
-    if np.isnan(curve).all():
-        return np.nan
-    coordinate = np.log1p(points)
-    return float(np.sum(.5 * (curve[:-1] + curve[1:]) * np.diff(coordinate)))
 
 
 def _nominal_interval_ns(time_ns: np.ndarray, cadence_ns: int) -> int:
@@ -578,283 +461,332 @@ def _prepared(time: Any, values: Any, missing_values: Iterable[float]
     return parsed, array, valid_value
 
 
-def temporal_histograms(time: Any, values: Any, config: ValueBinningConfig, *,
-                        missing_values: Iterable[float] = ()) -> tuple[pd.DataFrame, ValueBins]:
-    """Normalized time-bin histograms with counts, samples, and coverage."""
-    index, array, valid_value = _prepared(time, values, missing_values)
+def temporal_event_counts(time: Any, values: Any, config: TTFFCessationConfig, *,
+                          missing_values: Iterable[float] = ()) -> tuple[pd.DataFrame, ValueBins]:
+    """Return raw per-bin TTFF counts and all-valid observation availability."""
+    index, array, valid_all = _prepared(time, values, missing_values)
     if not len(index):
         raise ValueError("time contains no valid timestamps")
-    bins = make_value_bins(config)
-    cadence_source = valid_value.copy()
-    if not bins.include_lower_than_first_bin:
-        valid_value &= array >= bins.physical_edges[0]
-    cadence_ns = int(round(config.time_bin_hours * 3_600_000_000_000))
+    bins = make_value_bins(config.binning)
+    cadence_ns = int(round(config.binning.time_bin_hours * 3_600_000_000_000))
+    rolling_ns = int(round(
+        config.comparison.rolling_count_window_hours * 3_600_000_000_000
+    ))
     time_ns = index.to_numpy(dtype="datetime64[ns]").astype(np.int64)
     start_ns = int(time_ns.min() // cadence_ns * cadence_ns)
     stop_ns = int(time_ns.max() // cadence_ns * cadence_ns + cadence_ns)
     starts = np.arange(start_ns, stop_ns, cadence_ns, dtype=np.int64)
-    nominal_ns = _nominal_interval_ns(time_ns[cadence_source], cadence_ns)
-    rows = []
+    nominal_ns = _nominal_interval_ns(time_ns[valid_all], cadence_ns)
+    rows: list[dict[str, Any]] = []
     for left in starts:
         right = int(left + cadence_ns)
-        selected = (time_ns >= left) & (time_ns < right) & valid_value
-        counts, count = histogram_counts(array[selected], bins)
-        fractions = counts / count if count else np.full(len(counts), np.nan)
+        selected = (time_ns >= left) & (time_ns < right) & valid_all
+        counts, _ = histogram_counts(array[selected], bins)
         coverage = _coverage_hours(time_ns[selected], int(left), right, nominal_ns)
         rows.append({
             "time_start": pd.Timestamp(left, unit="ns", tz="UTC"),
             "time_end": pd.Timestamp(right, unit="ns", tz="UTC"),
             "time_center": pd.Timestamp(left + cadence_ns // 2, unit="ns", tz="UTC"),
             "bin_counts": counts,
-            "fractions": fractions,
-            "n_valid": count,
+            "n_valid": int(selected.sum()),
             "coverage_hours": coverage,
-            "coverage_fraction": min(1.0, coverage / config.time_bin_hours),
-            "underflow_fraction": (
-                fractions[0] if count and bins.include_lower_than_first_bin else np.nan
+            "coverage_fraction": min(1.0, coverage / config.binning.time_bin_hours),
+            "coverage_adequate": (
+                coverage / config.binning.time_bin_hours
+                >= config.comparison.min_coverage_fraction
             ),
-            "overflow_fraction": fractions[-1] if count else np.nan,
         })
-    return pd.DataFrame(rows), bins
-
-
-def _window(time_ns: np.ndarray, values: np.ndarray, valid_value: np.ndarray,
-            start_ns: int, end_ns: int, bins: ValueBins,
-            nominal_ns: int) -> dict[str, Any]:
-    selected = (time_ns >= start_ns) & (time_ns < end_ns) & valid_value
-    subset = values[selected]
-    counts, count = histogram_counts(subset, bins)
-    duration_hours = (end_ns - start_ns) / 3_600_000_000_000
-    coverage = _coverage_hours(time_ns[selected], start_ns, end_ns, nominal_ns)
-    return {
-        "counts": counts,
-        "n_valid": count,
-        "coverage_hours": coverage,
-        "coverage_fraction": min(1.0, coverage / duration_hours),
-        "median": float(np.median(subset)) if count else np.nan,
-        "q25": float(np.quantile(subset, .25)) if count else np.nan,
-        "q75": float(np.quantile(subset, .75)) if count else np.nan,
-        "underflow_fraction": (
-            counts[0] / count
-            if count and bins.include_lower_than_first_bin else np.nan
-        ),
-        "overflow_fraction": counts[-1] / count if count else np.nan,
-    }
-
-
-def _adequate(window: dict[str, Any], config: DistributionComparisonConfig) -> bool:
-    return (window["n_valid"] >= config.min_valid_samples
-            and window["coverage_fraction"] >= config.min_coverage_fraction)
-
-
-def _peak_rows(rows: pd.DataFrame, config: SignalDistributionConfig) -> list[pd.Series]:
-    if rows.empty:
-        return []
-    cadence = pd.Timedelta(hours=config.binning.time_bin_hours)
-    working = rows.sort_values("time").copy()
-    working["_episode"] = working.time.diff().gt(cadence * 1.5).cumsum()
-    peaks: list[pd.Series] = []
-    for _, episode in working.groupby("_episode", sort=False):
-        maximum = episode.d_down.max()
-        maxima = episode[np.isclose(episode.d_down, maximum)]
-        peaks.append(maxima.iloc[len(maxima) // 2])
-    peaks.sort(key=lambda row: float(row.d_down), reverse=True)
-    separated: list[pd.Series] = []
-    separation = pd.Timedelta(hours=config.comparison.peak_separation_hours)
-    for peak in peaks:
-        if all(abs(peak.time - retained.time) >= separation for retained in separated):
-            separated.append(peak)
-    return separated
-
-
-def _candidate_detail(selected: pd.Series | None, bins: ValueBins,
-                      tail: TailSupportConfig | None) -> dict[str, np.ndarray]:
-    if selected is None:
-        return {}
-    detail = {
-        "physical_edges": bins.physical_edges.copy(),
-        "before_counts": np.asarray(selected.before_counts).copy(),
-        "after_counts": np.asarray(selected.after_counts).copy(),
-        "followup_counts": np.asarray(selected.followup_counts).copy(),
-    }
-    if tail is not None:
-        internal = bins.physical_edges[
-            (bins.physical_edges > tail.lower_edge) & (bins.physical_edges < tail.upper_edge)
-        ]
-        points = np.r_[tail.lower_edge, internal, tail.upper_edge]
-        detail.update({
-            "survival_x": points,
-            "survival_before": survival_curve(selected.before_counts, bins, points),
-            "survival_after": survival_curve(selected.after_counts, bins, points),
-        })
-    return detail
-
-
-def detect_distribution_change(time: Any, values: Any, config: SignalDistributionConfig, *,
-                               missing_values: Iterable[float] = ()) -> SignalDistributionDetection:
-    """Apply the shared pre/post histogram-CDF detector to one signal."""
-    index, array, valid_value = _prepared(time, values, missing_values)
-    histograms, bins = temporal_histograms(
-        index, array, config.binning, missing_values=missing_values
+    table = pd.DataFrame(rows)
+    record_end_ns = int(time_ns.max() + nominal_ns)
+    forward_counts, forward_coverage, forward_complete = [], [], []
+    for left in starts:
+        right = int(left + rolling_ns)
+        selected_rows = (starts >= left) & (starts < right)
+        counts = np.stack(table.loc[selected_rows, "bin_counts"].to_numpy()).sum(axis=0)
+        coverage = float(table.loc[selected_rows, "coverage_hours"].sum())
+        forward_counts.append(counts.astype(np.int64))
+        forward_coverage.append(min(
+            1.0, coverage / config.comparison.rolling_count_window_hours
+        ))
+        forward_complete.append(record_end_ns >= right)
+    table["forward_counts"] = forward_counts
+    table["forward_coverage_fraction"] = forward_coverage
+    table["forward_coverage_adequate"] = (
+        table.forward_coverage_fraction >= config.comparison.min_coverage_fraction
     )
-    cadence_source = valid_value.copy()
-    if not bins.include_lower_than_first_bin:
-        valid_value &= array >= bins.physical_edges[0]
-    if not valid_value.any():
-        return SignalDistributionDetection(
-            "unavailable", None, pd.DataFrame(), histograms, bins, {}
-        )
+    table["forward_complete"] = forward_complete
+    return table, bins
+
+
+def _count_window(table: pd.DataFrame, bin_index: int, start: pd.Timestamp,
+                  end: pd.Timestamp) -> dict[str, float | int]:
+    selected = (table.time_start >= start) & (table.time_start < end)
+    rows = table.loc[selected]
+    counts = np.array([
+        int(np.asarray(value)[bin_index]) for value in rows.bin_counts
+    ], dtype=np.int64)
+    duration_hours = (end - start) / pd.Timedelta(hours=1)
+    coverage_hours = float(rows.coverage_hours.sum())
+    return {
+        "events": int(counts.sum()),
+        "occupied_time_bins": int(np.count_nonzero(counts)),
+        "coverage_hours": coverage_hours,
+        "coverage_fraction": min(1.0, coverage_hours / float(duration_hours)),
+    }
+
+
+def _quiet_window(window: dict[str, float | int], pre_rate: float,
+                  config: TTFFCessationComparisonConfig) -> bool:
+    events = int(window["events"])
+    coverage_hours = float(window["coverage_hours"])
+    rate = events / coverage_hours if coverage_hours > 0 else np.inf
+    return (
+        events <= config.max_events_in_quiet_window
+        or rate <= config.quiet_fraction_of_pre_rate * pre_rate
+    )
+
+
+def _bin_boundaries(bins: ValueBins, index: int) -> tuple[float, float]:
+    return float(bins.histogram_edges[index]), float(bins.histogram_edges[index + 1])
+
+
+def _per_bin_last_stable_drop(table: pd.DataFrame, bins: ValueBins, bin_index: int,
+                              config: TTFFCessationConfig,
+                              record_end: pd.Timestamp) -> dict[str, Any]:
     comparison = config.comparison
+    cadence = pd.Timedelta(hours=config.binning.time_bin_hours)
+    rolling = pd.Timedelta(hours=comparison.rolling_count_window_hours)
+    pre_duration = pd.Timedelta(hours=comparison.pre_activity_window_hours)
+    persistence = pd.Timedelta(hours=comparison.persistence_hours)
+    reactivation = pd.Timedelta(hours=comparison.reactivation_window_hours)
+    starts = pd.DatetimeIndex(table.time_start)
+    ever_eligible = False
+    saw_incomplete = False
+    saw_reactivation = False
+    fallback: dict[str, Any] | None = None
+    selected: dict[str, Any] | None = None
+
+    for candidate in reversed(starts[1:]):
+        pre = _count_window(table, bin_index, candidate - pre_duration, candidate)
+        eligible = (
+            pre["events"] >= comparison.min_pre_events
+            and pre["occupied_time_bins"] >= comparison.min_pre_occupied_time_bins
+            and pre["coverage_fraction"] >= comparison.min_coverage_fraction
+        )
+        if not eligible:
+            continue
+        ever_eligible = True
+        pre_rate = float(pre["events"]) / float(pre["coverage_hours"])
+        previous = _count_window(
+            table, bin_index, candidate - cadence, candidate - cadence + rolling
+        )
+        post = _count_window(table, bin_index, candidate, candidate + rolling)
+        if (previous["coverage_fraction"] < comparison.min_coverage_fraction
+                or _quiet_window(previous, pre_rate, comparison)):
+            continue
+        if post["coverage_fraction"] < comparison.min_coverage_fraction:
+            if post["events"] <= comparison.max_events_in_quiet_window:
+                saw_incomplete = True
+                fallback = fallback or {"time": candidate, "pre": pre, "post": post}
+            continue
+        if not _quiet_window(post, pre_rate, comparison):
+            continue
+
+        evidence = {"time": candidate, "pre": pre, "post": post}
+        persistence_end = candidate + persistence
+        if record_end < persistence_end:
+            saw_incomplete = True
+            fallback = fallback or evidence
+            continue
+
+        persistence_coverages: list[float] = []
+        persistence_quiet = True
+        window_start = candidate
+        while window_start + rolling <= persistence_end:
+            window = _count_window(
+                table, bin_index, window_start, window_start + rolling
+            )
+            persistence_coverages.append(float(window["coverage_fraction"]))
+            if (window["coverage_fraction"] < comparison.min_coverage_fraction
+                    or not _quiet_window(window, pre_rate, comparison)):
+                persistence_quiet = False
+                break
+            window_start += cadence
+        if not persistence_quiet:
+            if (persistence_coverages
+                    and min(persistence_coverages) < comparison.min_coverage_fraction):
+                saw_incomplete = True
+                fallback = fallback or evidence
+            continue
+
+        reactivated = False
+        confirmed_until = persistence_end
+        window_start = persistence_end
+        while window_start + reactivation <= record_end:
+            window = _count_window(
+                table, bin_index, window_start, window_start + reactivation
+            )
+            if window["coverage_fraction"] >= comparison.min_coverage_fraction:
+                if not _quiet_window(window, pre_rate, comparison):
+                    reactivated = True
+                    break
+                confirmed_until = window_start + reactivation
+            window_start += cadence
+        if reactivated:
+            saw_reactivation = True
+            fallback = fallback or evidence
+            continue
+
+        selected = {
+            **evidence,
+            "persistence_min_coverage_fraction": min(persistence_coverages),
+            "confirmed_until": confirmed_until,
+        }
+        break
+
+    lower, upper = _bin_boundaries(bins, bin_index)
+    base = {
+        "bin_index": bin_index,
+        "bin_label": bins.labels[bin_index],
+        "lower_edge": lower,
+        "upper_edge": upper,
+        "eligible": ever_eligible,
+        "status": "insufficient_pre_activity",
+        "drop_time": pd.NaT,
+        "pre_events": np.nan,
+        "pre_occupied_time_bins": np.nan,
+        "post_events": np.nan,
+        "pre_rate": np.nan,
+        "pre_coverage_fraction": np.nan,
+        "post_coverage_fraction": np.nan,
+        "persistence_min_coverage_fraction": np.nan,
+        "late_reactivation": saw_reactivation,
+        "in_consensus": False,
+        "confirmed_until": pd.NaT,
+    }
+    evidence = selected or fallback
+    if evidence is not None:
+        pre, post = evidence["pre"], evidence["post"]
+        base.update({
+            "pre_events": int(pre["events"]),
+            "pre_occupied_time_bins": int(pre["occupied_time_bins"]),
+            "post_events": int(post["events"]),
+            "pre_rate": float(pre["events"]) / float(pre["coverage_hours"]),
+            "pre_coverage_fraction": float(pre["coverage_fraction"]),
+            "post_coverage_fraction": float(post["coverage_fraction"]),
+        })
+    if selected is not None:
+        base.update({
+            "status": "stable_drop",
+            "drop_time": selected["time"],
+            "persistence_min_coverage_fraction": selected[
+                "persistence_min_coverage_fraction"
+            ],
+            "confirmed_until": selected["confirmed_until"],
+        })
+    elif saw_incomplete:
+        base["status"] = "insufficient_followup"
+    elif saw_reactivation:
+        base["status"] = "reactivated"
+    elif ever_eligible:
+        base["status"] = "no_stable_drop"
+    return base
+
+
+def _maximal_date_groups(rows: pd.DataFrame, tolerance: pd.Timedelta) -> list[list[int]]:
+    ordered = rows.sort_values("drop_time")
+    indices = ordered.index.to_list()
+    times = pd.DatetimeIndex(ordered.drop_time)
+    groups: set[tuple[int, ...]] = set()
+    for left in range(len(times)):
+        right = left
+        while right + 1 < len(times) and times[right + 1] - times[left] <= tolerance:
+            right += 1
+        groups.add(tuple(indices[left:right + 1]))
+    maximal = [group for group in groups if not any(
+        set(group) < set(other) for other in groups
+    )]
+    return [list(group) for group in maximal]
+
+
+def detect_ttff_cessation(time: Any, values: Any, config: TTFFCessationConfig, *,
+                          missing_values: Iterable[float] = ()) -> TTFFCessationDetection:
+    """Detect the last stable loss of raw event activity in configurable TTFF bins."""
+    index, _, valid_all = _prepared(time, values, missing_values)
+    counts, bins = temporal_event_counts(
+        time, values, config, missing_values=missing_values
+    )
+    if not valid_all.any():
+        columns = (
+            "bin_index", "bin_label", "lower_edge", "upper_edge", "eligible",
+            "status", "drop_time", "pre_events", "pre_occupied_time_bins",
+            "post_events", "pre_rate", "pre_coverage_fraction",
+            "post_coverage_fraction", "persistence_min_coverage_fraction",
+            "late_reactivation", "in_consensus", "confirmed_until",
+        )
+        return TTFFCessationDetection(
+            "unavailable", None, pd.DataFrame(columns=columns), counts, bins
+        )
     time_ns = index.to_numpy(dtype="datetime64[ns]").astype(np.int64)
     cadence_ns = int(round(config.binning.time_bin_hours * 3_600_000_000_000))
-    nominal_ns = _nominal_interval_ns(time_ns[cadence_source], cadence_ns)
-    pre_ns = int(round(comparison.pre_window_hours * 3_600_000_000_000))
-    post_ns = int(round(comparison.post_window_hours * 3_600_000_000_000))
-    persistence_ns = int(round(comparison.persistence_hours * 3_600_000_000_000))
-    rows = []
-    for candidate in histograms.time_start.iloc[1:]:
-        candidate_ns = int(candidate.value)
-        before = _window(
-            time_ns, array, valid_value, candidate_ns - pre_ns, candidate_ns,
-            bins, nominal_ns,
-        )
-        after = _window(
-            time_ns, array, valid_value, candidate_ns, candidate_ns + post_ns,
-            bins, nominal_ns,
-        )
-        followup = _window(
-            time_ns, array, valid_value, candidate_ns + post_ns,
-            candidate_ns + post_ns + persistence_ns, bins, nominal_ns,
-        )
-        terminal_start = candidate_ns + post_ns + persistence_ns - cadence_ns
-        terminal = _window(
-            time_ns, array, valid_value, terminal_start,
-            candidate_ns + post_ns + persistence_ns, bins, nominal_ns,
-        )
-        shift = directional_wasserstein(before["counts"], after["counts"], bins)
-        follow_shift = directional_wasserstein(before["counts"], followup["counts"], bins)
-        reactivation = directional_wasserstein(after["counts"], followup["counts"], bins)
-        terminal_shift = directional_wasserstein(before["counts"], terminal["counts"], bins)
-        terminal_reactivation = directional_wasserstein(
-            after["counts"], terminal["counts"], bins
-        )
-        pre_post_adequate = _adequate(before, comparison) and _adequate(after, comparison)
-        substantial = (
-            pre_post_adequate and shift.d_down >= comparison.min_down_distance
-            and shift.downward_fraction >= comparison.min_downward_fraction
-        )
-        terminal_minimum = max(
-            2, int(np.ceil(
-                comparison.min_valid_samples
-                * config.binning.time_bin_hours / comparison.post_window_hours
-            )),
-        )
-        terminal_adequate = (
-            terminal["n_valid"] >= terminal_minimum
-            and terminal["coverage_fraction"] >= comparison.min_coverage_fraction
-        )
-        followup_adequate = _adequate(followup, comparison) and terminal_adequate
-        reactivation_up = max(reactivation.d_up, terminal_reactivation.d_up)
-        persistent = (
-            substantial and followup_adequate
-            and follow_shift.d_down >= comparison.min_down_distance
-            and follow_shift.downward_fraction >= comparison.min_downward_fraction
-            and terminal_shift.d_down >= comparison.min_down_distance
-            and terminal_shift.downward_fraction >= comparison.min_downward_fraction
-            and reactivation_up
-            <= comparison.max_reactivation_fraction * max(shift.d_down, np.finfo(float).eps)
-        )
-        if persistent:
-            level = "clear"
-        elif substantial and not followup_adequate:
-            level = "insufficient_followup"
-        elif substantial:
-            level = "transient"
-        elif (pre_post_adequate and shift.d_down > 0
-              and shift.downward_fraction >= comparison.min_downward_fraction):
-            level = "weak"
-        else:
-            level = "none"
-        tail_before = tail_after = np.nan
-        if config.tail is not None and before["n_valid"] and after["n_valid"]:
-            tail_before = bounded_tail_area(before["counts"], bins, config.tail)
-            tail_after = bounded_tail_area(after["counts"], bins, config.tail)
-        tail_drop = tail_before - tail_after
-        rows.append({
-            "time": candidate,
-            "candidate_level": level,
-            "d_down": shift.d_down,
-            "d_up": shift.d_up,
-            "w1": shift.w1,
-            "downward_fraction": shift.downward_fraction,
-            "followup_d_down": follow_shift.d_down,
-            "followup_downward_fraction": follow_shift.downward_fraction,
-            "reactivation_d_up": reactivation_up,
-            "tail_area_before": tail_before,
-            "tail_area_after": tail_after,
-            "tail_area_drop": tail_drop,
-            "tail_area_relative_drop": (
-                tail_drop / tail_before if np.isfinite(tail_before) and tail_before > 0 else np.nan
-            ),
-            "pre_n_valid": before["n_valid"],
-            "post_n_valid": after["n_valid"],
-            "followup_n_valid": followup["n_valid"],
-            "pre_coverage_fraction": before["coverage_fraction"],
-            "post_coverage_fraction": after["coverage_fraction"],
-            "followup_coverage_fraction": followup["coverage_fraction"],
-            "underflow_fraction_before": before["underflow_fraction"],
-            "overflow_fraction_before": before["overflow_fraction"],
-            "underflow_fraction_after": after["underflow_fraction"],
-            "overflow_fraction_after": after["overflow_fraction"],
-            "median_before": before["median"],
-            "median_after": after["median"],
-            "q25_before": before["q25"],
-            "q75_before": before["q75"],
-            "q25_after": after["q25"],
-            "q75_after": after["q75"],
-            "confirmed_until": candidate + pd.Timedelta(
-                hours=comparison.post_window_hours + comparison.persistence_hours
-            ),
-            "before_counts": before["counts"],
-            "after_counts": after["counts"],
-            "followup_counts": followup["counts"],
-        })
-    candidates = pd.DataFrame(rows)
-    if candidates.empty:
-        return SignalDistributionDetection(
-            "none", None, candidates, histograms, bins, {}
-        )
-    substantial_rows = candidates[candidates.candidate_level.isin(
-        ["clear", "transient", "insufficient_followup"]
-    )]
-    episode_peaks = _peak_rows(substantial_rows, config)
-    clear_peaks = [peak for peak in episode_peaks if peak.candidate_level == "clear"]
-    if clear_peaks:
-        selected = clear_peaks[0]
-        if (len(clear_peaks) > 1 and clear_peaks[1].d_down
-                >= clear_peaks[0].d_down * comparison.comparable_strength_fraction):
-            status = "ambiguous"
-        else:
-            status = "clear"
-    else:
-        insufficient_peaks = [
-            peak for peak in episode_peaks
-            if peak.candidate_level == "insufficient_followup"
-        ]
-        weak = candidates[candidates.candidate_level == "weak"]
-        if insufficient_peaks:
-            selected = insufficient_peaks[0]
+    nominal_ns = _nominal_interval_ns(time_ns[valid_all], cadence_ns)
+    record_end = pd.Timestamp(int(time_ns.max() + nominal_ns), unit="ns", tz="UTC")
+    rows = [
+        _per_bin_last_stable_drop(counts, bins, bin_index, config, record_end)
+        for bin_index in range(len(bins.labels))
+    ]
+    results = pd.DataFrame(rows)
+    stable = results[results.status == "stable_drop"]
+    eligible_count = int(results.eligible.sum())
+    if stable.empty:
+        if (results.status == "insufficient_followup").any():
             status = "insufficient_followup"
-        elif not weak.empty:
-            selected = weak.loc[weak.d_down.idxmax()]
-            status = "weak"
+        elif eligible_count == 0:
+            status = "insufficient_data"
         else:
-            selected = None
             status = "none"
-    return SignalDistributionDetection(
-        status, selected, candidates, histograms, bins,
-        _candidate_detail(selected, bins, config.tail),
+        return TTFFCessationDetection(status, None, results, counts, bins)
+
+    tolerance = pd.Timedelta(hours=config.comparison.agreement_tolerance_hours)
+    groups = _maximal_date_groups(stable, tolerance)
+
+    def group_key(group: list[int]) -> tuple[int, int]:
+        times = pd.DatetimeIndex(results.loc[group, "drop_time"]).asi8
+        return len(group), int(np.median(times))
+
+    groups.sort(key=group_key, reverse=True)
+    winner = groups[0]
+    minimum = config.comparison.min_agreeing_bins
+    disjoint_qualifier = any(
+        len(group) >= minimum and set(group).isdisjoint(winner)
+        for group in groups[1:]
     )
+    if len(winner) >= minimum and not disjoint_qualifier:
+        status = "clear"
+    elif len(stable) == 1:
+        status = "weak"
+    else:
+        status = "ambiguous"
+    results.loc[winner, "in_consensus"] = True
+    winner_rows = results.loc[winner]
+    winner_times = pd.DatetimeIndex(winner_rows.drop_time).asi8
+    consensus_ns = int(np.median(winner_times))
+    consensus_time = pd.Timestamp(consensus_ns, unit="ns", tz="UTC")
+    selected = pd.Series({
+        "time": consensus_time,
+        "confirmed_until": winner_rows.confirmed_until.min(),
+        "agreeing_bin_count": len(winner),
+        "consensus_span_hours": float(
+            (winner_rows.drop_time.max() - winner_rows.drop_time.min())
+            / pd.Timedelta(hours=1)
+        ),
+        "agreeing_pre_events": int(winner_rows.pre_events.sum()),
+        "agreeing_post_events": int(winner_rows.post_events.sum()),
+        "min_persistence_coverage_fraction": float(
+            winner_rows.persistence_min_coverage_fraction.min()
+        ),
+    })
+    return TTFFCessationDetection(status, selected, results, counts, bins)
 
 
 def _mad(values: np.ndarray) -> float:
@@ -1135,7 +1067,7 @@ def _intervals_corroborate(ttff: pd.Series, strain: pd.Series,
     return strain_until >= ttff_time + pd.Timedelta(config.strain.window)
 
 
-def _combine(ttff: SignalDistributionDetection, strain: StrainStepDetection,
+def _combine(ttff: TTFFCessationDetection, strain: StrainStepDetection,
              config: DrogueDetectionConfig) -> tuple[np.datetime64, str, str, str, float]:
     ttff_time, strain_time = _time(ttff.selected), _time(strain.selected)
     offset = np.nan
@@ -1165,9 +1097,9 @@ def _combine(ttff: SignalDistributionDetection, strain: StrainStepDetection,
 def detect_drogue_loss(platform_code: str, time: Any, ttff: Any, *, strain: Any | None = None,
                        hull_temperature: Any | None = None,
                        config: DrogueDetectionConfig = DrogueDetectionConfig()) -> DrogueDetection:
-    """Detect TTFF redistribution and an independent persistent strain step."""
+    """Detect TTFF-bin cessation and an independent persistent strain step."""
     frame = _raw_frame(time, ttff, strain, hull_temperature)
-    ttff_detection = detect_distribution_change(
+    ttff_detection = detect_ttff_cessation(
         frame.time, frame.ttff, config.ttff, missing_values=(-999,)
     )
     strain_detection = detect_strain_step(
@@ -1187,23 +1119,24 @@ def detect_drogue_loss(platform_code: str, time: Any, ttff: Any, *, strain: Any 
         auto_confidence=confidence,
         ttff_strain_relation=relation,
         ttff_change_time=_time(ttff_selected),
-        ttff_change_strength=_value(ttff_selected, "d_down"),
         ttff_change_status=ttff_detection.status,
-        ttff_d_down=_value(ttff_selected, "d_down"),
-        ttff_d_up=_value(ttff_selected, "d_up"),
-        ttff_w1=_value(ttff_selected, "w1"),
-        ttff_downward_fraction=_value(ttff_selected, "downward_fraction"),
-        ttff_tail_area_before=_value(ttff_selected, "tail_area_before"),
-        ttff_tail_area_after=_value(ttff_selected, "tail_area_after"),
-        ttff_tail_area_drop=_value(ttff_selected, "tail_area_drop"),
-        ttff_tail_area_relative_drop=_value(ttff_selected, "tail_area_relative_drop"),
-        ttff_pre_coverage_fraction=_value(ttff_selected, "pre_coverage_fraction"),
-        ttff_post_coverage_fraction=_value(ttff_selected, "post_coverage_fraction"),
-        ttff_followup_coverage_fraction=_value(ttff_selected, "followup_coverage_fraction"),
-        ttff_underflow_fraction_before=_value(ttff_selected, "underflow_fraction_before"),
-        ttff_overflow_fraction_before=_value(ttff_selected, "overflow_fraction_before"),
-        ttff_underflow_fraction_after=_value(ttff_selected, "underflow_fraction_after"),
-        ttff_overflow_fraction_after=_value(ttff_selected, "overflow_fraction_after"),
+        ttff_eligible_bin_count=int(ttff_detection.bin_results.eligible.sum()),
+        ttff_stable_drop_bin_count=int(
+            (ttff_detection.bin_results.status == "stable_drop").sum()
+        ),
+        ttff_agreeing_bin_count=(
+            0 if ttff_selected is None else int(ttff_selected.agreeing_bin_count)
+        ),
+        ttff_consensus_span_hours=_value(ttff_selected, "consensus_span_hours"),
+        ttff_agreeing_pre_events=(
+            0 if ttff_selected is None else int(ttff_selected.agreeing_pre_events)
+        ),
+        ttff_agreeing_post_events=(
+            0 if ttff_selected is None else int(ttff_selected.agreeing_post_events)
+        ),
+        ttff_min_persistence_coverage_fraction=_value(
+            ttff_selected, "min_persistence_coverage_fraction"
+        ),
         strain_change_time=_time(strain_selected),
         strain_change_strength=_value(strain_selected, "normalized_drop"),
         strain_change_status=strain_detection.status,
@@ -1227,9 +1160,8 @@ def detect_drogue_loss(platform_code: str, time: Any, ttff: Any, *, strain: Any 
         ),
     )
     return DrogueDetection(
-        result, diagnostics, ttff_detection.candidates, strain_detection.candidates,
-        ttff_detection.temporal_histograms, ttff_detection.bins,
-        ttff_detection.detail,
+        result, diagnostics, ttff_detection.bin_results, strain_detection.candidates,
+        ttff_detection.temporal_counts, ttff_detection.bins,
     )
 
 

@@ -3,6 +3,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import pytest
 from scipy.io import savemat
 import yaml
 
@@ -12,15 +13,15 @@ from drifterlab.experiments.arcterx.raw_drogue import read_raw_drogue_signals
 
 
 def write_raw(path: Path, platform="1001"):
-    n = 240
+    n = 600
     time = pd.date_range("2025-01-01", periods=n, freq="h")
-    before = np.resize(np.array([22., 28., 35., 80., 31., 100.]), 120)
-    after = np.resize(np.array([5., 6., 7.]), 120)
+    before = np.resize(np.array([22., 28., 35., 80., 31., 100.]), 240)
+    after = np.resize(np.array([5., 6., 7.]), n - len(before))
     track = {
         "PlatformId": int(platform),
         "ObsTimestamp": time.strftime("%Y-%m-%d %H:%M:%S").to_numpy(),
         "GpsTTFF": np.r_[before, after],
-        "Drogue": np.r_[np.full(120, 12.), np.full(120, 4.)],
+        "Drogue": np.r_[np.full(300, 12.), np.full(n - 300, 4.)],
         "HullTemperature": 20 + np.sin(np.arange(n) / 12),
     }
     savemat(path, {"dataset": {f"drifter_{platform}": track}})
@@ -44,7 +45,7 @@ def test_raw_adapter_and_automatic_cli_smoke(tmp_path):
     }), encoding="utf-8")
     signals = read_raw_drogue_signals(raw_path)
     assert signals.platform_code == "1001"
-    assert len(signals.time) == 240
+    assert len(signals.time) == 600
     assert detect_main([str(config)]) == 0
     table = pd.read_parquet(automatic)
     assert table.platform_code.astype(str).tolist() == ["1001"]
@@ -52,9 +53,14 @@ def test_raw_adapter_and_automatic_cli_smoke(tmp_path):
     assert pd.notna(table.auto_drogue_loss_time.iloc[0])
     effective = json.loads(table.detection_config_json.iloc[0])
     assert effective["ttff"]["binning"]["scale"] == "log"
+    assert effective["ttff"]["comparison"]["pre_activity_window_hours"] == 168
+    assert "tail" not in effective["ttff"]
+    assert "wasserstein_threshold" not in effective["ttff"]["comparison"]
     assert effective["strain"]["window"] == "12h"
     assert effective["strain"]["minimum_drop_absolute"] == 2.0
     assert "binning" not in effective["strain"]
+    assert table.ttff_agreeing_bin_count.iloc[0] >= 2
+    assert "ttff_w1" not in table.columns
     assert not review.exists()
 
     import matplotlib
@@ -94,3 +100,7 @@ def test_manual_review_persistence_loading_and_cutoff(tmp_path):
         "source_sha256": ["abc123", "def456"],
     })
     loaded.validate_against_automatic(automatic)
+    stale = automatic.copy()
+    stale.loc[0, "source_sha256"] = "changed"
+    with pytest.raises(ValueError, match="Raw source changed"):
+        loaded.validate_against_automatic(stale)

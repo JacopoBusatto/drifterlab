@@ -259,11 +259,11 @@ def plot_drifter(signals: RawDrogueSignals, data: pd.DataFrame, settings: Diagno
             signals.platform_code, signals.time, signals.ttff,
             strain=signals.strain, hull_temperature=signals.hull_temperature,
         )
-    return _plot_distribution_drifter(signals, data, output, detection, plt)
+    return _plot_drifter_evidence(signals, data, output, detection, plt)
 
 
-def _plot_distribution_drifter(signals: RawDrogueSignals, data: pd.DataFrame,
-                               output: Path, detection: DrogueDetection, plt) -> None:
+def _plot_drifter_evidence(signals: RawDrogueSignals, data: pd.DataFrame,
+                           output: Path, detection: DrogueDetection, plt) -> None:
     result = detection.result
     figure, axes = plt.subplots(7, 1, figsize=(15, 18), sharex=True,
                                constrained_layout=True)
@@ -273,10 +273,10 @@ def _plot_distribution_drifter(signals: RawDrogueSignals, data: pd.DataFrame,
     axes[0].set_ylabel("Raw GpsTTFF\n(unit unknown)")
     axes[0].set_title(f"Raw drogue-related signals - platform {signals.platform_code}")
 
-    histograms = detection.ttff_histograms
-    fractions = np.stack(histograms.fractions.to_numpy()).T
-    x_edges = [*histograms.time_start, histograms.time_end.iloc[-1]]
-    axes[1].pcolormesh(x_edges, np.arange(fractions.shape[0] + 1), fractions,
+    count_table = detection.ttff_counts
+    raw_counts = np.stack(count_table.bin_counts.to_numpy()).T
+    x_edges = [*count_table.time_start, count_table.time_end.iloc[-1]]
+    axes[1].pcolormesh(x_edges, np.arange(raw_counts.shape[0] + 1), raw_counts,
                        shading="flat", cmap="viridis", vmin=0)
     axes[1].set_yticks(np.arange(len(detection.ttff_bins.labels)) + .5)
     axes[1].set_yticklabels(detection.ttff_bins.labels, fontsize=6)
@@ -286,37 +286,37 @@ def _plot_distribution_drifter(signals: RawDrogueSignals, data: pd.DataFrame,
         if detection.ttff_bins.include_lower_than_first_bin
         else "values below first edge excluded"
     )
-    axes[1].set_title(
-        f"Normalized TTFF occupancy; {lower_policy}; open upper bin included"
-    )
+    axes[1].set_title(f"Raw TTFF event counts; {lower_policy}; open upper bin included")
+    for row in detection.ttff_bin_results.itertuples():
+        if pd.notna(row.drop_time):
+            axes[1].plot(row.drop_time, row.bin_index + .5, marker="v", ms=5,
+                         color="white", mec="black")
 
-    ttff_metrics = detection.ttff_candidates
-    if not ttff_metrics.empty:
-        axes[2].plot(ttff_metrics.time, ttff_metrics.d_down, color="tab:purple",
-                     label="D_down")
-        axes[2].plot(ttff_metrics.time, ttff_metrics.d_up, color="tab:orange",
-                     label="D_up")
-        tail_axis = axes[2].twinx()
-        tail_axis.plot(ttff_metrics.time, ttff_metrics.tail_area_drop,
-                       color="tab:green", lw=.9, alpha=.8, label="Tail-area decrease")
-        tail_axis.set_ylabel("Tail-area decrease", color="tab:green")
-        handles, labels = axes[2].get_legend_handles_labels()
-        extra_handles, extra_labels = tail_axis.get_legend_handles_labels()
-        axes[2].legend(handles + extra_handles, labels + extra_labels,
-                       loc="upper right", fontsize=8)
-    axes[2].axhline(0, color="black", lw=.6)
-    axes[2].set_ylabel("TTFF directional\ndistance")
-    axes[2].set_title(f"TTFF distribution change: {result.ttff_change_status}")
-    if detection.ttff_detail:
-        inset = axes[2].inset_axes([.02, .48, .27, .48])
-        inset.plot(detection.ttff_detail["survival_x"],
-                   detection.ttff_detail["survival_before"], label="Before", lw=1)
-        inset.plot(detection.ttff_detail["survival_x"],
-                   detection.ttff_detail["survival_after"], label="After", lw=1)
-        inset.set_xscale("log")
-        inset.set_title("Selected TTFF survival", fontsize=7)
-        inset.tick_params(labelsize=6)
-        inset.legend(fontsize=6)
+    forward = np.stack(count_table.forward_counts.to_numpy()).T
+    colors = plt.cm.viridis(np.linspace(.05, .95, len(detection.ttff_bins.labels)))
+    for bin_index, (label, color) in enumerate(zip(detection.ttff_bins.labels, colors)):
+        axes[2].step(count_table.time_start, forward[bin_index], where="post",
+                     color=color, lw=.9, label=label)
+    for row in detection.ttff_bin_results.itertuples():
+        if pd.notna(row.drop_time):
+            axes[2].axvline(row.drop_time, color=colors[row.bin_index], lw=.8, alpha=.7)
+    availability_axis = axes[2].twinx()
+    availability_axis.plot(count_table.time_center, count_table.n_valid,
+                           color=".35", lw=.7, alpha=.7, label="N_valid")
+    availability_axis.set_ylabel("All-valid TTFF count", color=".35")
+    for row in count_table[~count_table.forward_coverage_adequate].itertuples():
+        axes[2].axvspan(row.time_start, row.time_end, color="tab:red", alpha=.08)
+    handles, labels = axes[2].get_legend_handles_labels()
+    extra_handles, extra_labels = availability_axis.get_legend_handles_labels()
+    axes[2].legend(handles + extra_handles, labels + extra_labels,
+                   loc="upper right", fontsize=6, ncol=2)
+    status_counts = detection.ttff_bin_results.status.value_counts().to_dict()
+    axes[2].set_ylabel("Forward rolling\nevent count")
+    axes[2].set_title(
+        f"TTFF last-stable-drop: {result.ttff_change_status}; "
+        f"eligible={result.ttff_eligible_bin_count}, "
+        f"agreeing={result.ttff_agreeing_bin_count}; bins={status_counts}"
+    )
 
     detector_data = detection.diagnostics
     detector_time = detector_data.time

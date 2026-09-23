@@ -7,7 +7,7 @@ loss date.
 
 ```text
 raw TTFF and strain
-    -> TTFF distribution change + strain rolling-median step
+    -> TTFF per-bin activity cessation + strain rolling-median step
     -> strain-primary combination rule
     -> manual review
     -> reviewed_drogue_loss_time
@@ -42,49 +42,43 @@ saved decision refers to a superseded automatic time, review startup stops with
 an incompatibility error. Start a new review iteration or migrate it explicitly;
 do not silently reuse the old decision.
 
-## TTFF distribution method
+## TTFF per-bin cessation method
 
-Each configured TTFF time bin records raw value-bin counts, valid sample count,
-normalized fractions, actual observation coverage, and boundary-bin fractions.
-With `include_lower_than_first_bin: true` (the backward-compatible default), log
-TTFF bins include `[0, first_edge)` and the histogram retains its lower boundary
-bin. With it set to `false`, values below `first_edge` are excluded from the
-histogram, `n_valid`, normalization denominator, and coverage calculation. All
-configurations retain an open `>= last_edge` bin. Missing, non-finite, and
-configured sentinel values do not enter `n_valid`.
+Fixed temporal intervals retain the raw integer event count for every configured
+TTFF value bin. Counts are never normalized across value bins. `N_valid` and
+timestamp coverage are calculated separately from every finite, non-sentinel
+TTFF observation. Therefore values below an excluded first value edge still
+establish telemetry availability even though they do not enter a configured
+event bin. The upper value bin remains open (`>= last_edge`).
 
-For every candidate-grid time, normalized distributions are built from all
-valid observations in `[t-pre, t)` and `[t, t+post)`. Within finite value bins,
-probability is represented uniformly. Open-bin mass is clipped to the first or
-last finite edge for distance integration: it still affects occupancy and
-direction but is never assigned an arbitrary midpoint or unbounded leverage.
-TTFF uses the `log1p(value)` coordinate.
+At each temporal-bin boundary `t`, a value bin first has to establish active
+baseline behavior in `[t-168h, t)`: at least 12 events, at least three occupied
+temporal bins, and at least 75% timestamp coverage. Its baseline rate is raw
+events per observed coverage hour. The forward `[t, t+48h)` window is quiet when
+it contains at most one event or its event rate is at most 10% of the baseline
+rate. The detector then requires every complete 48-hour forward window through
+`t+120h` to be adequately covered and quiet. A record that does not physically
+reach that horizon yields `insufficient_followup`.
 
-With `F_before` and `F_after` on that common coordinate:
+After the persistence horizon, every complete, adequately covered 48-hour
+window through the observed record is checked for reactivation. Inadequately
+covered late windows provide no evidence either way. A candidate is rejected if
+an observed window exceeds both the one-event allowance and the 10% rate limit.
+Candidates are searched newest to oldest, so an early lull followed by activity
+is rejected and a later final cessation supplies the reported bin boundary.
 
-```text
-D_down = integral max(F_after - F_before, 0) dx
-D_up   = integral max(F_before - F_after, 0) dx
-W1     = D_down + D_up
-downward_fraction = D_down / W1
-```
-
-`D_down` is the change magnitude used for candidate ranking. Acceptance requires
-minimum `D_down`, predominantly downward direction, valid sample count, and
-actual temporal coverage. `W1`, `D_down`, and `D_up` are a decomposition, not
-independent scores.
-
-Persistence compares both the full follow-up interval and its terminal time bin
-with the pre-change distribution. Movement back toward the post-change high
-regime is bounded by `max_reactivation_fraction`. Candidate selection occurs at
-the strongest redistribution peak in each episode; a stronger transient peak
-cannot be replaced by a weaker edge candidate. Comparable separated persistent
-peaks produce `ambiguous`. A substantial end-of-record change without complete
-follow-up produces `insufficient_followup`.
+Each eligible value bin contributes at most one stable-drop date. Dates form
+agreement groups only when their complete span is within 48 hours. The largest
+group wins, with a later median breaking size ties. Two or more agreeing bins
+produce `clear` unless another disjoint group also contains at least two bins.
+A single stable bin is `weak`; conflicting stable dates are `ambiguous`.
+Singleton outliers remain in the detailed in-memory evidence but do not
+invalidate a clear group. Other TTFF statuses are `insufficient_followup`,
+`insufficient_data`, `none`, and `unavailable`.
 
 ## Strain rolling-median step method
 
-Strain event selection is separate from the TTFF histogram method. Raw strain is
+Strain event selection is separate from the TTFF count method. Raw strain is
 smoothed with a centered, time-based rolling median. At each observed candidate
 time, the detector compares the median of that smoothed signal in configured
 pre- and post-windows:
@@ -106,27 +100,12 @@ without a complete persistence interval produces `insufficient_followup`.
 The pre/post q25-q75 values are retained for visual context only. They do not
 form a competing event selector.
 
-## TTFF upper-cloud context
-
-From the same bounded histogram, the detector computes
-
-```text
-A_tail = integral P(TTFF > x) d log1p(x)
-```
-
-between the configured physical bounds, initially 50-1000. Before/after areas,
-their decrease, and the selected before/after survival curves are retained for
-inspection. Tail depletion supports interpretation; it is not stacked into a
-second confidence score. Values above 1000 remain visible in the open occupancy
-bin but have no leverage beyond the cap.
-
 ## Signal combination
 
 - A unique clear persistent strain step supplies the physical event
   time.
-- A clear TTFF change raises confidence when its confirmed lower-state interval
-  overlaps and persists through the strain change. No date averaging or fixed
-  +/-24-hour coincidence is used.
+- A clear TTFF cessation raises confidence when suppression remains adequately
+  observed through the strain change. No date averaging is used.
 - Clear strain without clear TTFF remains a medium-confidence strain candidate.
 - Missing or unclear strain with clear sustained TTFF produces a provisional
   medium-confidence TTFF candidate.
@@ -136,19 +115,21 @@ bin but have no leverage beyond the cap.
 
 ## Exploratory defaults
 
-TTFF distribution settings are unchanged:
+TTFF value-bin definitions remain configurable and unchanged. The production
+cessation defaults are:
 
 | TTFF setting | Default |
 | --- | ---: |
 | scale / first edge / factor / last edge | log / 10 / 1.5 / 1000 |
 | include lower-than-first bin | true |
-| diagnostic time bin | 12 h |
-| pre / post / persistence | 48 / 48 / 72 h |
-| minimum valid samples / coverage | 24 / 0.75 |
-| minimum `D_down` / downward fraction | 0.35 / 0.75 |
-| maximum reactivation fraction | 0.20 |
-| peak separation / comparable strength | 48 h / 0.80 |
-| tail interval | 50-1000 |
+| temporal-bin cadence | 12 h |
+| forward count window | 48 h |
+| pre-activity / persistence | 168 / 120 h |
+| minimum pre events / occupied temporal bins | 12 / 3 |
+| minimum coverage | 0.75 |
+| quiet rate fraction / event allowance | 0.10 / 1 |
+| reactivation window / agreement tolerance | 48 / 48 h |
+| minimum agreeing value bins | 2 |
 
 The provisional strain-step defaults are:
 
@@ -170,14 +151,16 @@ before downstream validation.
 ## Outputs
 
 - `auto_drogue_loss.parquet`: one row per raw file with independent component
-  dates/statuses, TTFF directional distances and tail evidence, strain
-  absolute/relative/normalized drops and robust levels, coverage, combined
-  date/confidence, source hash, and exact configuration JSON.
+  dates/statuses, concise TTFF eligible/stable/agreeing-bin counts, consensus
+  span, agreeing-bin pre/post event totals and persistence coverage, strain
+  absolute/relative/normalized drops and robust levels, combined date/confidence,
+  source hash, and exact configuration JSON. Detector changes require explicit
+  regeneration because this automatic schema is versioned by its content.
 - `drogue_review.csv`: explicit review decision, automatic time visible during
   review, reviewed physical time, and separate analysis cutoff.
-- Existing per-drifter diagnostic PNGs: raw TTFF, normalized occupancy heatmap,
-  directional TTFF metrics, selected TTFF survival curves, rolling strain with
-  descriptive quantiles, strain-step metrics, temperature context, and
-  automatic date lines.
+- Existing per-drifter diagnostic PNGs: raw TTFF, integer value-bin count
+  heatmap, per-bin forward counts/drop markers/statuses, `N_valid`, availability
+  shading, rolling strain with descriptive quantiles, strain-step metrics,
+  temperature context, and automatic date lines.
 
 No trajectory Zarr is modified and no observation is deleted.
