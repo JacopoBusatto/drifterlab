@@ -14,8 +14,9 @@ remain part of the unchanged production QC output.
 
 `drogue_signals.py` reads only raw MicroSVP `ObsTimestamp`, `GpsTTFF`, `Drogue`,
 and `HullTemperature`. Requested per-drifter figures run the configured standalone
-detector and overlay its TTFF, strain, and final automatic dates. The script does
-not read a QC Zarr, review table, or reference loss dates.
+detector and overlay its TTFF, strain, combined automatic, reviewed, and cutoff
+dates. When the configured review CSV exists, its decision is shown after a
+source-hash check. The script does not read a QC Zarr or reference loss dates.
 
 Generate one figure plus a one-row summary:
 
@@ -47,6 +48,29 @@ figure, and predictable `figures/drogue_signals_<platform>.png` files when figur
 are requested. The detector parameters come from the YAML `detection` section;
 rolling excursion, strain-delta, temperature, minimum-count, threshold, and
 output settings remain CLI options. Use `--help` for the complete list.
+
+## Robust strain sensitivity diagnostic
+
+`strain_two_regime.py` exercises the same authoritative robust two-regime method
+used by production. It aggregates raw strain into non-overlapping median blocks,
+fits robust one-level and two-level L1 models, and compares independent 3/6/12 h
+aggregation sensitivities without reading TTFF dates, reference loss dates, or
+review data. It does not change the production Parquet or reviewer.
+
+Run the configured 6-hour model and independent 3/6/12-hour sensitivities for a
+small selected set:
+
+```powershell
+python scripts/diagnostics/strain_two_regime.py `
+  configs/arcterx/drogue_detection.local.yml `
+  --settings configs/arcterx/strain_two_regime.yml `
+  --platform 300534067833760 `
+  --platform 300534061906090
+```
+
+Outputs are written under `data/diagnostics/strain_two_regime/`: a primary CSV,
+a long sensitivity CSV, the exact settings JSON, and focused two-panel figures.
+See [the method and status definitions](../../docs/strain_two_regime_experiment.md).
 
 ## Run other diagnostics when needed
 

@@ -1,0 +1,18 @@
+# Standalone sensitivity settings; production uses the same detector implementation.
+strain_two_regime:
+  aggregation_hours: 6
+  min_samples_per_block: 3
+  minimum_side_duration_hours: 72
+  minimum_drop_absolute: 2.0
+  minimum_drop_relative: 0.08
+  minimum_fit_improvement: 0.10
+  relative_floor: 1.0
+  ambiguity:
+    comparable_cost_fraction: 0.02
+    minimum_separation_hours: 48
+
+# Diagnostic-only sensitivity runs; these are reported independently.
+sensitivity_aggregation_hours:
+  - 3
+  - 6
+  - 12

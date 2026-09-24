@@ -1,4 +1,4 @@
-"""Run standalone drogue-loss detection on raw ARCTERX MicroSVP files."""
+"""Deprecated ARCTERX-only detector; use drifterlab-drogue --automatic."""
 
 import argparse
 

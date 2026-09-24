@@ -1,4 +1,4 @@
-"""Launch or resume standalone manual review of ARCTERX drogue-loss estimates."""
+"""Deprecated ARCTERX-only reviewer; use drifterlab-drogue --manual."""
 
 import argparse
 

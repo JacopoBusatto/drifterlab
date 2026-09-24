@@ -5,17 +5,19 @@ import pandas as pd
 import pytest
 
 from drifterlab.qc.drogue import (
+    ComponentDetectionResult,
     DrogueDetectionConfig,
-    StrainStepConfig,
+    DrogueCombinationConfig,
     TTFFCessationComparisonConfig,
     TTFFCessationConfig,
     ValueBinningConfig,
     analysis_cutoff_time,
+    combine_drogue_detections,
     detect_drogue_loss,
-    detect_strain_step,
     detect_ttff_cessation,
     histogram_counts,
     make_value_bins,
+    resolve_drogue_decision,
     temporal_event_counts,
 )
 
@@ -215,72 +217,64 @@ def test_disjoint_agreeing_groups_are_ambiguous():
     assert detection.status == "ambiguous"
 
 
-def test_rolling_median_strain_detector_regression_for_persistent_step():
-    time = hourly(420)
-    strain = np.r_[np.full(240, 20.0), np.full(180, 10.0)]
-    detection = detect_strain_step(time, strain, StrainStepConfig())
-    assert detection.status == "clear"
-    assert detection.selected.time == time[240]
-    assert detection.selected.drop_absolute == pytest.approx(10.0)
-    assert detection.selected.drop_relative == pytest.approx(.5)
-    assert detection.selected.normalized_drop == pytest.approx(10.0)
-
-
-def test_isolated_strain_spike_is_suppressed_by_rolling_median():
-    strain = np.full(360, 20.0)
-    strain[120] = 2.0
-    detection = detect_strain_step(hourly(len(strain)), strain, StrainStepConfig())
-    assert detection.status == "none"
-    assert detection.selected is None
-
-
-def test_temporary_strain_dip_that_recovers_is_not_a_loss_event():
-    strain = np.r_[np.full(120, 20.0), np.full(36, 10.0), np.full(204, 20.0)]
-    detection = detect_strain_step(hourly(len(strain)), strain, StrainStepConfig())
-    assert detection.status == "none"
-    assert detection.selected is None
-    assert "transient" in set(detection.candidates.candidate_level)
-
-
-def test_stable_strain_has_no_detectable_drop():
-    detection = detect_strain_step(
-        hourly(360), np.full(360, 20.0), StrainStepConfig(),
+def component(hour: int | None, status: str) -> ComponentDetectionResult:
+    value = (
+        np.datetime64("NaT", "ns") if hour is None
+        else np.datetime64("2025-01-01") + np.timedelta64(hour, "h")
     )
-    assert detection.status == "none"
-    assert detection.selected is None
+    return ComponentDetectionResult(value, status)
 
 
-def test_strain_step_handles_irregular_times_missing_values_and_sentinel():
-    removed = [3, 4, 8, 35, 121, 122, 180, 181, 250]
-    time = hourly(360).delete(removed)
-    strain = np.delete(np.r_[np.full(120, 20.0), np.full(240, 10.0)], removed)
-    strain[[5, 70, 160]] = [np.nan, -999, np.nan]
-    detection = detect_strain_step(
-        time, strain, StrainStepConfig(), missing_values=(-999,),
+@pytest.mark.parametrize("offset", [24, 48])
+def test_clear_component_agreement_chooses_earlier_date(offset):
+    combined = combine_drogue_detections(
+        component(240, "clear"), component(240 + offset, "clear"),
+        DrogueCombinationConfig(agreement_tolerance_hours=48),
     )
-    assert detection.status == "clear"
-    assert abs(detection.selected.time - hourly(360)[120]) <= pd.Timedelta("6h")
-    assert detection.selected.pre_n_valid > 0
-    assert detection.selected.post_n_valid > 0
+    assert combined.status == "clear_agreement"
+    assert combined.source == "ttff+strain"
+    assert combined.change_time == component(240, "clear").change_time
 
 
-def test_multiple_persistent_strain_steps_are_ambiguous():
-    strain = np.r_[np.full(120, 30.0), np.full(180, 20.0), np.full(250, 10.0)]
-    detection = detect_strain_step(hourly(len(strain)), strain, StrainStepConfig())
-    assert detection.status == "ambiguous"
-    assert detection.selected is not None
+def test_clear_component_dates_outside_tolerance_are_a_conflict():
+    combined = combine_drogue_detections(
+        component(240, "clear"), component(289, "clear"),
+    )
+    assert combined.status == "signal_conflict"
+    assert combined.source == "none"
+    assert np.isnat(combined.change_time)
 
 
-@pytest.mark.parametrize("start, stop", [(240, 246), (240, 264)])
-def test_rolling_median_strain_detector_rejects_transient_spikes(start, stop):
-    time = hourly(420)
-    strain = np.full(420, 20.0)
-    strain[start:stop] = 5.0
-    detection = detect_strain_step(time, strain, StrainStepConfig())
-    assert detection.status == "none"
+@pytest.mark.parametrize(
+    "ttff_status,strain_status,expected_status,expected_source,expected_hour",
+    [
+        ("clear", "no_change", "clear_ttff_only", "ttff", 240),
+        ("clear", "insufficient_data", "clear_ttff_only", "ttff", 240),
+        ("no_change", "clear", "clear_strain_only", "strain", 300),
+        ("insufficient_data", "clear", "clear_strain_only", "strain", 300),
+        ("weak", "no_change", "unresolved", "none", None),
+        ("ambiguous", "clear", "unresolved", "none", None),
+        ("no_change", "insufficient_data", "unresolved", "none", None),
+    ],
+)
+def test_combination_of_single_clear_and_unresolved_components(
+    ttff_status, strain_status, expected_status, expected_source, expected_hour,
+):
+    combined = combine_drogue_detections(
+        component(240 if ttff_status in {"clear", "weak", "ambiguous"} else None,
+                  ttff_status),
+        component(300 if strain_status in {"clear", "weak", "ambiguous"} else None,
+                  strain_status),
+    )
+    assert combined.status == expected_status
+    assert combined.source == expected_source
+    if expected_hour is None:
+        assert np.isnat(combined.change_time)
+    else:
+        assert combined.change_time == component(expected_hour, "clear").change_time
 
 
-def test_strain_remains_primary_and_ttff_only_corroborates():
+def test_production_integration_keeps_conflicting_component_dates_separate():
     time, ttff = binned_track(700, [240] * len(BIN_VALUES))
     hours = ((time - time[0]) / pd.Timedelta(hours=1)).astype(int)
     strain = np.where(hours < 300, 20.0, 10.0)
@@ -290,20 +284,22 @@ def test_strain_remains_primary_and_ttff_only_corroborates():
     ).result
     assert result.ttff_change_time == np.datetime64("2025-01-11T00:00:00")
     assert result.strain_change_time == np.datetime64("2025-01-13T12:00:00")
-    assert result.auto_drogue_loss_time == result.strain_change_time
-    assert result.auto_status == "detected_strain_primary_corroborated"
+    assert np.isnat(result.auto_drogue_loss_time)
+    assert result.auto_status == "signal_conflict"
+    assert result.auto_source == "none"
     assert result.ttff_strain_offset_hours == 60
 
 
-def test_ttff_is_provisional_when_strain_is_unavailable():
+def test_ttff_is_automatic_when_strain_is_insufficient():
     time, ttff = binned_track(650, [240] * len(BIN_VALUES))
     result = detect_drogue_loss(
         "test", time, ttff,
         config=DrogueDetectionConfig(ttff=ttff_config()),
     ).result
-    assert result.auto_status == "detected_ttff_provisional"
+    assert result.auto_status == "clear_ttff_only"
+    assert result.auto_source == "ttff"
     assert result.auto_drogue_loss_time == result.ttff_change_time
-    assert result.strain_change_status == "unavailable"
+    assert result.strain_status == "insufficient_data"
 
 
 def test_no_valid_ttff_is_unavailable_and_keeps_public_counts_zero():
@@ -312,25 +308,65 @@ def test_no_valid_ttff_is_unavailable_and_keeps_public_counts_zero():
         "test", time, np.full(400, -999.0), strain=np.full(400, 20.0),
         config=DrogueDetectionConfig(ttff=ttff_config()),
     )
-    assert detection.result.ttff_change_status == "unavailable"
+    assert detection.result.ttff_status == "insufficient_data"
+    assert detection.result.ttff_detail_status == "unavailable"
     assert detection.result.ttff_eligible_bin_count == 0
     assert detection.result.ttff_stable_drop_bin_count == 0
 
 
-def test_ttff_configuration_validation_and_obsolete_sections():
+def test_ttff_configuration_validation_and_unknown_sections():
     with pytest.raises(ValueError, match="multiple"):
         TTFFCessationConfig(
             ValueBinningConfig("linear", 100, None, 50, 300, 10),
             TTFFCessationComparisonConfig(),
         )
     with pytest.raises(ValueError, match="Unknown detection.ttff keys"):
-        DrogueDetectionConfig.from_dict({"ttff": {"tail": {}}})
-    with pytest.raises(ValueError, match="Unknown detection.ttff.comparison"):
-        DrogueDetectionConfig.from_dict({
-            "ttff": {"comparison": {"wasserstein_threshold": .2}},
-        })
+        DrogueDetectionConfig.from_dict({"ttff": {"unknown": {}}})
 
 
 def test_analysis_cutoff_remains_distinct_from_the_detected_event_time():
     event = np.datetime64("2025-01-10T12:00:00")
     assert analysis_cutoff_time(event, 24) == np.datetime64("2025-01-09T12:00:00")
+
+
+def test_resolver_uses_automatic_when_no_human_review_exists():
+    automatic = {"auto_drogue_loss_time": "2025-01-10T12:00:00Z"}
+    resolved = resolve_drogue_decision(automatic, default_margin_hours=24)
+    assert resolved.final_drogue_status == "lost"
+    assert resolved.final_drogue_loss_time == np.datetime64("2025-01-10T12:00:00")
+    assert resolved.analysis_cutoff_time == np.datetime64("2025-01-09T12:00:00")
+    assert resolved.decision_source == "automatic"
+
+
+def test_resolver_human_decision_overrides_automatic_and_uses_custom_margin():
+    automatic = {"auto_drogue_loss_time": "2025-01-10T12:00:00Z"}
+    review = {
+        "review_status": "manual_date",
+        "reviewed_drogue_loss_time": "2025-01-12T06:00:00Z",
+        "analysis_cutoff_margin_hours": 30,
+    }
+    resolved = resolve_drogue_decision(automatic, review)
+    assert resolved.final_drogue_loss_time == np.datetime64("2025-01-12T06:00:00")
+    assert resolved.analysis_cutoff_time == np.datetime64("2025-01-11T00:00:00")
+    assert resolved.decision_source == "manual_date"
+
+
+@pytest.mark.parametrize("status", ["not_lost", "uncertain"])
+def test_resolver_keeps_no_loss_and_uncertain_distinct(status):
+    resolved = resolve_drogue_decision(
+        {"auto_drogue_loss_time": "2025-01-10T12:00:00Z"},
+        {
+            "review_status": status,
+            "reviewed_drogue_loss_time": "",
+            "analysis_cutoff_margin_hours": 18,
+        },
+    )
+    assert resolved.final_drogue_status == status
+    assert np.isnat(resolved.final_drogue_loss_time)
+    assert np.isnat(resolved.analysis_cutoff_time)
+
+
+def test_resolver_leaves_unresolved_automatic_case_uncertain():
+    resolved = resolve_drogue_decision({"auto_drogue_loss_time": pd.NaT})
+    assert resolved.final_drogue_status == "uncertain"
+    assert resolved.decision_source == "automatic"

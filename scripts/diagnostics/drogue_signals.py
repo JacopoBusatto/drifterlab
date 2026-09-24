@@ -15,8 +15,9 @@ import pandas as pd
 import yaml
 
 from drifterlab.experiments.arcterx.raw_drogue import RawDrogueSignals, read_raw_drogue_signals
+from drifterlab.experiments.arcterx.drogue_loss_review import DrogueLossReviews
 from drifterlab.qc.drogue import (
-    DrogueDetection, DrogueDetectionConfig, detect_drogue_loss,
+    DrogueDetection, DrogueDetectionConfig, analysis_cutoff_time, detect_drogue_loss,
 )
 
 
@@ -88,6 +89,21 @@ def _forward_median(series: pd.Series, window: str, minimum: int) -> pd.Series:
     reversed_series = pd.Series(series.to_numpy()[::-1], index=mirrored)
     result = reversed_series.rolling(pd.Timedelta(window), min_periods=minimum).median()
     return result.iloc[::-1].set_axis(series.index)
+
+
+def _plot_with_gaps(axis, time: Any, values: Any, max_gap: pd.Timedelta, **kwargs) -> None:
+    """Plot observed segments without drawing lines across telemetry outages."""
+    index = pd.DatetimeIndex(time)
+    array = np.asarray(values, dtype=float)
+    if not len(index):
+        return
+    boundaries = [0, *(np.flatnonzero(np.diff(index.asi8) > max_gap.value) + 1), len(index)]
+    label = kwargs.pop("label", None)
+    for segment, (start, stop) in enumerate(zip(boundaries[:-1], boundaries[1:])):
+        axis.plot(
+            index[start:stop], array[start:stop],
+            label=label if segment == 0 else None, **kwargs,
+        )
 
 
 def rolling_diagnostics(signals: RawDrogueSignals,
@@ -251,19 +267,28 @@ def population_report(table: pd.DataFrame, exact_values: Counter,
 
 
 def plot_drifter(signals: RawDrogueSignals, data: pd.DataFrame, settings: DiagnosticSettings,
-                 output: Path, detection: DrogueDetection | None = None) -> None:
+                 output: Path, detection: DrogueDetection | None = None, *,
+                 review_row: dict[str, str] | None = None,
+                 cutoff_margin_hours: float = 24) -> None:
     import matplotlib.pyplot as plt
 
     if detection is None:
         detection = detect_drogue_loss(
             signals.platform_code, signals.time, signals.ttff,
-            strain=signals.strain, hull_temperature=signals.hull_temperature,
+            strain=signals.strain,
         )
-    return _plot_drifter_evidence(signals, data, output, detection, plt)
+    return _plot_drifter_evidence(
+        signals, data, output, detection, plt,
+        review_row=review_row, cutoff_margin_hours=cutoff_margin_hours,
+        temperature_gap=pd.Timedelta(settings.temperature_background_window),
+    )
 
 
 def _plot_drifter_evidence(signals: RawDrogueSignals, data: pd.DataFrame,
-                           output: Path, detection: DrogueDetection, plt) -> None:
+                           output: Path, detection: DrogueDetection, plt, *,
+                           review_row: dict[str, str] | None = None,
+                           cutoff_margin_hours: float = 24,
+                           temperature_gap: pd.Timedelta = pd.Timedelta("24h")) -> None:
     result = detection.result
     figure, axes = plt.subplots(7, 1, figsize=(15, 18), sharex=True,
                                constrained_layout=True)
@@ -275,6 +300,10 @@ def _plot_drifter_evidence(signals: RawDrogueSignals, data: pd.DataFrame,
 
     count_table = detection.ttff_counts
     raw_counts = np.stack(count_table.bin_counts.to_numpy()).T
+    raw_counts = np.ma.masked_where(
+        np.broadcast_to(count_table.n_valid.to_numpy() == 0, raw_counts.shape),
+        raw_counts,
+    )
     x_edges = [*count_table.time_start, count_table.time_end.iloc[-1]]
     axes[1].pcolormesh(x_edges, np.arange(raw_counts.shape[0] + 1), raw_counts,
                        shading="flat", cmap="viridis", vmin=0)
@@ -292,7 +321,8 @@ def _plot_drifter_evidence(signals: RawDrogueSignals, data: pd.DataFrame,
             axes[1].plot(row.drop_time, row.bin_index + .5, marker="v", ms=5,
                          color="white", mec="black")
 
-    forward = np.stack(count_table.forward_counts.to_numpy()).T
+    forward = np.stack(count_table.forward_counts.to_numpy()).T.astype(float)
+    forward[:, ~count_table.forward_coverage_adequate.to_numpy()] = np.nan
     colors = plt.cm.viridis(np.linspace(.05, .95, len(detection.ttff_bins.labels)))
     for bin_index, (label, color) in enumerate(zip(detection.ttff_bins.labels, colors)):
         axes[2].step(count_table.time_start, forward[bin_index], where="post",
@@ -313,63 +343,115 @@ def _plot_drifter_evidence(signals: RawDrogueSignals, data: pd.DataFrame,
     status_counts = detection.ttff_bin_results.status.value_counts().to_dict()
     axes[2].set_ylabel("Forward rolling\nevent count")
     axes[2].set_title(
-        f"TTFF last-stable-drop: {result.ttff_change_status}; "
+        f"TTFF last-stable-drop: {result.ttff_status} ({result.ttff_detail_status}); "
         f"eligible={result.ttff_eligible_bin_count}, "
         f"agreeing={result.ttff_agreeing_bin_count}; bins={status_counts}"
     )
 
-    detector_data = detection.diagnostics
-    detector_time = detector_data.time
     axes[3].plot(time, data.strain, ".", color=".6", ms=2, alpha=.6,
                  label="Raw strain")
-    axes[3].plot(detector_time, detector_data.rolling_median_strain, color="tab:blue",
-                 label="Rolling median")
-    axes[3].fill_between(
-                         detector_time, detector_data.rolling_q25_strain,
-                         detector_data.rolling_q75_strain,
-                         color="tab:blue", alpha=.18, label="Rolling q25-q75")
+    blocks = detection.strain_blocks
+    valid_blocks = blocks[blocks.strain_median.notna()]
+    if not valid_blocks.empty:
+        axes[3].plot(
+            blocks.time_center, blocks.strain_median, "o-",
+            color="tab:green", ms=2.5, lw=.8, label="Strain block median",
+        )
+    candidate = (
+        None if np.isnat(detection.strain_candidate_time)
+        else pd.Timestamp(detection.strain_candidate_time, tz="UTC")
+    )
+    if candidate is not None and not valid_blocks.empty:
+        block_time = pd.DatetimeIndex(blocks.time_center)
+        fitted = np.where(
+            blocks.strain_median.notna(),
+            np.where(block_time < candidate, result.strain_level_before,
+                     result.strain_level_after),
+            np.nan,
+        )
+        axes[3].plot(
+            block_time, fitted, color="tab:blue", lw=1.8,
+            label="Fitted pre/post levels",
+        )
+        axes[3].axvline(
+            candidate, color=("tab:green" if result.strain_status == "clear" else ".35"),
+            ls=":", lw=1.1, label="Best strain split",
+        )
     axes[3].set_ylabel("Strain\n(unit unknown)")
     axes[3].legend(loc="upper right", fontsize=8)
-
-    strain_metrics = detection.strain_candidates
-    if not strain_metrics.empty:
-        axes[4].plot(
-            strain_metrics.time, strain_metrics.drop_absolute, color="tab:green",
-            label="Absolute drop",
-        )
-        normalized_axis = axes[4].twinx()
-        normalized_axis.plot(
-            strain_metrics.time, strain_metrics.normalized_drop,
-            color="tab:purple", lw=.9, label="Normalized drop",
-        )
-        normalized_axis.set_ylabel("Normalized drop", color="tab:purple")
-        handles, labels = axes[4].get_legend_handles_labels()
-        extra_handles, extra_labels = normalized_axis.get_legend_handles_labels()
-        axes[4].legend(
-            handles + extra_handles, labels + extra_labels,
-            loc="upper right", fontsize=8,
-        )
-    axes[4].axhline(0, color="black", lw=.6)
-    axes[4].set_ylabel("Strain level drop")
-    axes[4].set_title(
-        f"Persistent rolling-median strain step: {result.strain_change_status}"
+    axes[3].set_title(
+        f"Robust two-regime strain: {result.strain_status}; "
+        f"levels={result.strain_level_before:.3g}->{result.strain_level_after:.3g}; "
+        f"drop={result.strain_absolute_drop:.3g} ({result.strain_relative_drop:.1%})"
     )
 
-    axes[5].plot(time, data.hull_temperature, color=".55", lw=.6,
+    strain_metrics = detection.strain_objective
+    if not strain_metrics.empty:
+        objective_gap = (
+            2 * (blocks.time_end.iloc[0] - blocks.time_start.iloc[0])
+            if not blocks.empty else pd.Timedelta("12h")
+        )
+        _plot_with_gaps(
+            axes[4], strain_metrics.time, strain_metrics.j1,
+            objective_gap,
+            color="tab:purple", label="Two-regime L1 cost",
+        )
+        if np.isfinite(detection.strain_null_objective):
+            axes[4].axhline(
+                detection.strain_null_objective,
+                color="tab:orange", ls="--", lw=.8,
+                label="One-level L1 cost",
+            )
+        axes[4].legend(loc="upper right", fontsize=8)
+    axes[4].set_ylabel("L1 objective")
+    axes[4].set_title(
+        f"Strain fit improvement={result.strain_fit_improvement:.1%}; "
+        f"blocks before/after/valid={result.strain_n_blocks_before}/"
+        f"{result.strain_n_blocks_after}/{result.strain_n_valid_blocks}"
+    )
+
+    axes[5].plot(time, data.hull_temperature, ".", color=".55", ms=1.5,
                  label="Raw hull temperature")
-    axes[5].plot(time, data.rolling_temperature_background, color="tab:orange",
-                 label="Rolling median background")
+    _plot_with_gaps(
+        axes[5], time, data.rolling_temperature_background,
+        temperature_gap,
+        color="tab:orange", label="Rolling median background",
+    )
     axes[5].set_ylabel("Hull temperature\n(unit unknown)")
     axes[5].legend(loc="upper right", fontsize=8)
-    axes[6].plot(time, data.rolling_temperature_mad, color="tab:purple", lw=.8)
+    _plot_with_gaps(
+        axes[6], time, data.rolling_temperature_mad,
+        temperature_gap,
+        color="tab:purple", lw=.8,
+    )
     axes[6].set_ylabel("Temperature\nanomaly MAD")
     axes[6].set_xlabel("UTC time")
 
-    change_lines = (
+    change_lines = [
         (result.ttff_change_time, "TTFF change", "tab:purple", "--", 1.4),
         (result.strain_change_time, "Strain change", "tab:green", "-.", 1.4),
-        (result.auto_drogue_loss_time, "Automatic drogue loss", "tab:red", "-", 1.8),
-    )
+        (result.auto_drogue_loss_time, "Automatic decision", "tab:red", "-", 1.8),
+    ]
+    if review_row is None:
+        reviewed = result.auto_drogue_loss_time
+        cutoff = analysis_cutoff_time(reviewed, cutoff_margin_hours)
+        reviewed_label = "Default physical loss"
+    else:
+        reviewed_value = review_row.get("reviewed_drogue_loss_time", "")
+        cutoff_value = review_row.get("analysis_cutoff_time", "")
+        reviewed = (
+            np.datetime64("NaT", "ns") if not reviewed_value
+            else pd.Timestamp(reviewed_value).to_datetime64()
+        )
+        cutoff = (
+            np.datetime64("NaT", "ns") if not cutoff_value
+            else pd.Timestamp(cutoff_value).to_datetime64()
+        )
+        reviewed_label = "Reviewed physical loss"
+    change_lines.extend([
+        (reviewed, reviewed_label, "tab:blue", "--", 1.4),
+        (cutoff, "Analysis cutoff", "black", ":", 1.4),
+    ])
     for axis in axes:
         drawn = set()
         for value, label, color, style, width in change_lines:
@@ -428,7 +510,9 @@ def _atomic_text(path: Path, text: str) -> None:
         temporary.unlink(missing_ok=True)
 
 
-def _input_config(path: Path) -> tuple[Path, str, float, DrogueDetectionConfig]:
+def _input_config(
+    path: Path,
+) -> tuple[Path, str, float, DrogueDetectionConfig, Path | None, float]:
     path = path.resolve()
     with path.open(encoding="utf-8-sig") as stream:
         config = yaml.safe_load(stream)
@@ -452,7 +536,19 @@ def _input_config(path: Path) -> tuple[Path, str, float, DrogueDetectionConfig]:
         detection_config = DrogueDetectionConfig.from_dict(detection)
     except TypeError as exc:
         raise ValueError(f"Invalid detection configuration: {exc}") from exc
-    return directory, pattern, float(missing), detection_config
+    review_value = config.get("output", {}).get("review")
+    review_path = None
+    if isinstance(review_value, str) and review_value.strip():
+        review_path = Path(review_value).expanduser()
+        if not review_path.is_absolute():
+            review_path = (path.parent / review_path).resolve()
+    margin = config.get("processing", {}).get("analysis_cutoff_margin_hours", 24)
+    if (isinstance(margin, bool) or not isinstance(margin, (int, float))
+            or not np.isfinite(margin) or margin < 0):
+        raise ValueError(
+            "processing.analysis_cutoff_margin_hours must be finite and nonnegative"
+        )
+    return directory, pattern, float(missing), detection_config, review_path, float(margin)
 
 
 def _select_files(files: list[Path], platforms: list[str], missing_value: float) -> list[Path]:
@@ -479,7 +575,8 @@ def _select_files(files: list[Path], platforms: list[str], missing_value: float)
 def run(config_path: Path, output: Path, *, platforms: list[str] | None = None,
         all_figures: bool = False, population_figures: bool = True,
         settings: DiagnosticSettings = DiagnosticSettings()) -> pd.DataFrame:
-    input_directory, pattern, missing_value, detection_config = _input_config(config_path)
+    (input_directory, pattern, missing_value, detection_config,
+     review_path, cutoff_margin_hours) = _input_config(config_path)
     if not input_directory.is_dir():
         raise ValueError(f"Input directory does not exist: {input_directory}")
     output = output.resolve()
@@ -492,6 +589,10 @@ def run(config_path: Path, output: Path, *, platforms: list[str] | None = None,
     if platforms and all_figures:
         raise ValueError("Use either --platform or --all, not both")
     files = _select_files(files, platforms, missing_value)
+    reviews = (
+        DrogueLossReviews(review_path, cutoff_margin_hours=cutoff_margin_hours)
+        if review_path is not None and review_path.exists() else None
+    )
     make_drifter_figures = bool(platforms) or all_figures
     print(json.dumps(RAW_VARIABLES, indent=2))
     rows, exact_values, ttff_chunks = [], Counter(), []
@@ -510,13 +611,20 @@ def run(config_path: Path, output: Path, *, platforms: list[str] | None = None,
         if make_drifter_figures:
             detection = detect_drogue_loss(
                 signals.platform_code, signals.time, signals.ttff,
-                strain=signals.strain, hull_temperature=signals.hull_temperature,
+                strain=signals.strain,
                 config=detection_config,
             )
+            review_row = None if reviews is None else reviews.rows.get(signals.platform_code)
+            if (review_row is not None
+                    and review_row["source_sha256"] != signals.source_sha256):
+                raise ValueError(
+                    f"Raw source changed for reviewed platform {signals.platform_code}"
+                )
             plot_drifter(
                 signals, diagnostics, settings,
                 output / "figures" / f"drogue_signals_{signals.platform_code}.png",
-                detection,
+                detection, review_row=review_row,
+                cutoff_margin_hours=cutoff_margin_hours,
             )
         print(f"Diagnosed {index}/{len(files)}: {signals.platform_code}", flush=True)
     table = pd.DataFrame(rows).sort_values("platform_code", kind="stable").reset_index(drop=True)

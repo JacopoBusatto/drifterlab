@@ -1,83 +1,102 @@
-"""Matplotlib reviewer for standalone ARCTERX drogue-loss evidence."""
+"""Compact two-panel reviewer for standalone ARCTERX drogue-loss evidence."""
 
 from pathlib import Path
+from typing import Iterable
 
 import numpy as np
 import pandas as pd
 
-from drifterlab.qc.drogue import detect_drogue_loss
+from drifterlab.qc.drogue import analysis_cutoff_time
+from drifterlab.qc.strain_two_regime import aggregate_strain_blocks
 from .drogue_config import load_drogue_config
 from .drogue_loss_review import DrogueLossReviews
-from .raw_drogue import read_raw_drogue_signals
+from .drogue_pipeline import load_drogue_detection
+from .raw_drogue import RawDrogueSignals, read_raw_drogue_signals
+
+
+def _utc(value: object) -> pd.Timestamp | None:
+    timestamp = pd.Timestamp(value)
+    if pd.isna(timestamp):
+        return None
+    return timestamp.tz_localize("UTC") if timestamp.tzinfo is None else timestamp.tz_convert("UTC")
 
 
 class DrogueLossReviewer:
-    def __init__(self, config_path: str | Path):
+    """Review a selected automatic-table subset without rerunning either detector."""
+
+    def __init__(self, config_path: str | Path, *, mode: str | None = None,
+                 platform_codes: Iterable[str] | None = None):
         import matplotlib.dates as mdates
         import matplotlib.pyplot as plt
-        from matplotlib.widgets import Button
+        from matplotlib.widgets import Button, TextBox
 
         self.mdates, self.plt = mdates, plt
         self.config = load_drogue_config(config_path)
+        if mode is not None:
+            self.config = self.config.for_mode(mode)
         if not self.config.automatic_output.exists():
             raise ValueError(f"Automatic result does not exist: {self.config.automatic_output}")
-        self.automatic = pd.read_parquet(self.config.automatic_output)
-        required = {
-            "platform_code", "source_path", "source_filename", "source_sha256",
-            "auto_drogue_loss_time", "auto_status", "auto_confidence",
-            "ttff_change_time", "ttff_change_status", "ttff_eligible_bin_count",
-            "ttff_stable_drop_bin_count", "ttff_agreeing_bin_count",
-            "ttff_consensus_span_hours", "ttff_agreeing_pre_events",
-            "ttff_agreeing_post_events", "ttff_min_persistence_coverage_fraction",
-            "strain_change_time", "strain_change_status", "strain_change_strength",
-            "strain_drop_absolute", "strain_drop_relative", "strain_normalized_drop",
-            "strain_pre_coverage_fraction", "ttff_strain_offset_hours",
-        }
-        missing = required - set(self.automatic)
-        if missing:
-            raise ValueError(
-                "Automatic result uses an incompatible schema; rerun detection with "
-                f"--overwrite. Missing columns: {sorted(missing)}"
-            )
-        if self.automatic.empty or self.automatic.platform_code.astype(str).duplicated().any():
-            raise ValueError("Automatic result must contain unique platform rows")
-        self.automatic["platform_code"] = self.automatic.platform_code.astype(str)
+        all_automatic = load_drogue_detection(self.config.automatic_output)
         self.reviews = DrogueLossReviews(
             self.config.review_output,
             cutoff_margin_hours=self.config.analysis_cutoff_margin_hours,
         )
-        self.reviews.validate_against_automatic(self.automatic)
-        undecided = np.flatnonzero(~self.automatic.platform_code.isin(self.reviews.rows))
-        self.cursor = int(undecided[0]) if len(undecided) else 0
-        self.selected_time: pd.Timestamp | None = None
-        self.loaded_platform: str | None = None
+        self.reviews.validate_against_automatic(all_automatic)
 
-        self.figure = plt.figure(figsize=(16, 10))
-        grid = self.figure.add_gridspec(3, 2, left=.07, right=.94, top=.91, bottom=.22,
-                                       hspace=.34, wspace=.25)
-        self.full_ax = self.figure.add_subplot(grid[0, :])
-        self.ttff_ax = self.figure.add_subplot(grid[1, 0])
-        self.ttff_count_ax = self.ttff_ax.twinx()
-        self.strain_ax = self.figure.add_subplot(grid[1, 1], sharex=self.ttff_ax)
-        self.strain_metric_ax = self.strain_ax.twinx()
-        self.temperature_ax = self.figure.add_subplot(grid[2, :], sharex=self.ttff_ax)
-        self.temperature_variability_ax = self.temperature_ax.twinx()
+        if platform_codes is None:
+            self.automatic = all_automatic.reset_index(drop=True)
+        else:
+            requested = list(dict.fromkeys(map(str, platform_codes)))
+            known = set(all_automatic.platform_code)
+            unknown = set(requested) - known
+            if unknown:
+                raise ValueError(f"Requested review platforms are unknown: {sorted(unknown)}")
+            indexed = all_automatic.set_index("platform_code", drop=False)
+            self.automatic = indexed.loc[requested].reset_index(drop=True)
+        if self.automatic.empty:
+            raise ValueError("No platforms require drogue review")
+
+        pending = np.flatnonzero(
+            ~self.automatic.platform_code.isin(self.reviews.rows)
+            | self.automatic.platform_code.isin(self.reviews.stale_automatic)
+        )
+        self.cursor = int(pending[0]) if len(pending) else 0
+        self.selected_time: pd.Timestamp | None = None
+        self.review_margin_hours = self.config.analysis_cutoff_margin_hours
+        self.selection_dirty = False
+        self.loaded_platform: str | None = None
+        self.display_cache: dict[str, tuple[RawDrogueSignals, pd.DataFrame]] = {}
+        self.overlay_artists: list[object] = []
+
+        self.figure, (self.ttff_ax, self.strain_ax) = plt.subplots(
+            2, 1, figsize=(15, 8), sharex=True,
+        )
+        self.figure.subplots_adjust(left=.07, right=.96, top=.88, bottom=.24, hspace=.24)
         handler = getattr(self.figure.canvas.manager, "key_press_handler_id", None)
         if handler is not None:
             self.figure.canvas.mpl_disconnect(handler)
         buttons = [
-            ("Accept auto", "accept"), ("Set manual", "manual"), ("No loss", "none"),
-            ("Uncertain", "uncertain"), ("-6 h", "-6"), ("-1 h", "-1"),
-            ("+1 h", "+1"), ("+6 h", "+6"), ("Previous", "previous"),
-            ("Next", "next"), ("Save", "save"), ("Quit", "quit"),
+            ("Accept auto", "accept"), ("Set manual", "manual"),
+            ("Not lost", "none"), ("Uncertain", "uncertain"),
+            ("-6 h", "-6"), ("-1 h", "-1"), ("+1 h", "+1"), ("+6 h", "+6"),
+            ("Previous", "previous"), ("Next", "next"),
+            ("Quit", "quit"),
         ]
         self.buttons = []
         for index, (label, action) in enumerate(buttons):
-            row, column = divmod(index, 6)
-            button = Button(self.figure.add_axes((.055 + column * .155, .125 - row * .057, .14, .042)), label)
+            button_row, column = divmod(index, 6)
+            button = Button(
+                self.figure.add_axes((.055 + column * .155, .135 - button_row * .058, .14, .042)),
+                label,
+            )
             button.on_clicked(lambda event, value=action: self.action(value))
             self.buttons.append(button)
-        self.status = self.figure.text(.07, .015, "", fontsize=9)
+        self.margin_box = TextBox(
+            self.figure.add_axes((.81, .014, .09, .032)), "Cutoff margin (h) ",
+            initial=f"{self.review_margin_hours:g}",
+        )
+        self.margin_box.on_submit(self.on_margin_submit)
+        self.status = self.figure.text(.07, .018, "", fontsize=9)
         self.figure.canvas.mpl_connect("button_press_event", self.on_click)
         self.figure.canvas.mpl_connect("key_press_event", self.on_key)
         self.figure.canvas.mpl_connect("close_event", self.on_close)
@@ -85,273 +104,346 @@ class DrogueLossReviewer:
         self.draw()
 
     def _automatic_time(self, row: pd.Series) -> pd.Timestamp | None:
-        value = pd.Timestamp(row.auto_drogue_loss_time)
-        if pd.isna(value):
-            return None
-        return value.tz_localize("UTC") if value.tzinfo is None else value.tz_convert("UTC")
+        return _utc(row.auto_drogue_loss_time)
 
     def _load(self) -> pd.Series:
         row = self.automatic.iloc[self.cursor]
         platform = str(row.platform_code)
-        if platform != self.loaded_platform:
+        if platform == self.loaded_platform:
+            return row
+        if platform not in self.display_cache:
             path = Path(str(row.source_path))
             if not path.exists():
                 path = self.config.input_directory / str(row.source_filename)
-            self.signals = read_raw_drogue_signals(path, missing_value=self.config.missing_value)
-            if self.signals.source_sha256 != str(row.source_sha256):
-                raise ValueError(f"Raw source changed for platform {platform}")
-            self.detection = detect_drogue_loss(
-                platform, self.signals.time, self.signals.ttff,
-                strain=self.signals.strain, hull_temperature=self.signals.hull_temperature,
-                config=self.config.detection,
+            signals = read_raw_drogue_signals(
+                path,
+                missing_value=self.config.missing_value,
+                include_hull_temperature=False,
             )
-            recomputed = pd.Timestamp(self.detection.result.auto_drogue_loss_time)
-            stored = self._automatic_time(row)
-            if (stored is None) != pd.isna(recomputed):
-                raise ValueError(f"Automatic result cannot be reproduced for platform {platform}")
-            if stored is not None and recomputed.tz_localize("UTC") != stored:
-                raise ValueError(f"Automatic candidate cannot be reproduced for platform {platform}")
-            decision = self.reviews.rows.get(platform)
-            reviewed = None if decision is None else decision["reviewed_drogue_loss_time"]
-            self.selected_time = (pd.Timestamp(reviewed) if reviewed else stored)
-            if self.selected_time is None:
-                times = pd.DatetimeIndex(self.detection.diagnostics.time)
-                self.selected_time = times[len(times) // 2]
-            if self.selected_time.tzinfo is None:
-                self.selected_time = self.selected_time.tz_localize("UTC")
-            self.loaded_platform = platform
+            if signals.source_sha256 != str(row.source_sha256):
+                raise ValueError(f"Raw source changed for platform {platform}")
+            strain = (
+                np.full(len(signals.time), np.nan)
+                if signals.strain is None else signals.strain
+            )
+            blocks = aggregate_strain_blocks(
+                signals.time, strain, self.config.detection.strain,
+                missing_values=(self.config.missing_value,),
+            )
+            self.display_cache[platform] = signals, blocks
+        self.signals, self.strain_blocks = self.display_cache[platform]
+
+        decision = self.reviews.rows.get(platform)
+        reviewed = None if decision is None else _utc(decision["reviewed_drogue_loss_time"])
+        automatic = self._automatic_time(row)
+        self.selected_time = reviewed if reviewed is not None else automatic
+        if self.selected_time is None:
+            valid_time = pd.DatetimeIndex(self.signals.time).dropna()
+            self.selected_time = _utc(valid_time[len(valid_time) // 2])
+        self.review_margin_hours = float(
+            decision["analysis_cutoff_margin_hours"]
+            if decision is not None else row.default_analysis_cutoff_margin_hours
+        )
+        self.margin_box.eventson = False
+        self.margin_box.set_val(f"{self.review_margin_hours:g}")
+        self.margin_box.eventson = True
+        self.selection_dirty = False
+        self.loaded_platform = platform
         return row
 
-    def _reason(self) -> str:
-        result = self.detection.result
-        if result.ttff_change_status == "clear" and result.strain_change_status == "clear":
-            return "ttff_strain_agree"
-        if result.strain_change_status == "clear":
-            return "strain_clear"
-        if result.ttff_change_status == "clear":
-            return "ttff_clear"
-        return "ambiguous"
+    def _reason(self, status: str) -> str:
+        auto_status = str(self.automatic.iloc[self.cursor].auto_status)
+        if status == "manual_date":
+            return "manual_adjustment"
+        if status == "not_lost":
+            return "not_lost"
+        if status == "uncertain":
+            return "signal_conflict" if auto_status == "signal_conflict" else "uncertain"
+        return {
+            "clear_agreement": "automatic_agreement",
+            "clear_ttff_only": "ttff_only",
+            "clear_strain_only": "strain_only",
+        }.get(auto_status, "uncertain")
 
-    def _set(self, status: str, reason: str) -> None:
+    def _set(self, status: str) -> bool:
         row = self.automatic.iloc[self.cursor]
-        reviewed = self.selected_time if status == "manual_time" else None
-        self.reviews.set(
-            platform_code=str(row.platform_code),
-            auto_drogue_loss_time=row.auto_drogue_loss_time,
-            review_status=status,
-            reviewed_drogue_loss_time=reviewed,
-            review_reason=reason,
-            source_sha256=str(row.source_sha256),
-        )
-        self.status.set_text(f"Recorded {status} ({reason}); press Save to persist.")
+        reviewed = self.selected_time if status == "manual_date" else None
+        platform = str(row.platform_code)
+        previous = self.reviews.rows.get(platform)
+        previous = None if previous is None else previous.copy()
+        was_stale = platform in self.reviews.stale_automatic
+        try:
+            self.reviews.set(
+                platform_code=platform,
+                ttff_change_time=row.ttff_change_time,
+                strain_change_time=row.strain_change_time,
+                auto_drogue_loss_time=row.auto_drogue_loss_time,
+                auto_status=str(row.auto_status),
+                auto_source=str(row.auto_source),
+                review_status=status,
+                reviewed_drogue_loss_time=reviewed,
+                review_reason=self._reason(status),
+                source_sha256=str(row.source_sha256),
+                analysis_cutoff_margin_hours=self.review_margin_hours,
+            )
+            self.reviews.save()
+        except (OSError, ValueError) as exc:
+            if previous is None:
+                self.reviews.rows.pop(platform, None)
+            else:
+                self.reviews.rows[platform] = previous
+            if was_stale:
+                self.reviews.stale_automatic.add(platform)
+            self.status.set_text(f"Could not save decision: {exc}")
+            self.figure.canvas.draw_idle()
+            return False
+        self.selection_dirty = False
+        self.status.set_text(f"Saved {status} to {self.config.review_output}")
+        return True
+
+    def _pending_indices(self) -> list[int]:
+        return [
+            index for index, platform in enumerate(self.automatic.platform_code.astype(str))
+            if platform not in self.reviews.rows
+            or platform in self.reviews.stale_automatic
+        ]
+
+    def _next_pending(self, *, exclude_current: bool = False) -> int | None:
+        pending = self._pending_indices()
+        if exclude_current:
+            pending = [index for index in pending if index != self.cursor]
+        if not pending:
+            return None
+        later = [index for index in pending if index > self.cursor]
+        return later[0] if later else pending[0]
+
+    def _advance_after_save(self) -> None:
+        following = self._next_pending()
+        if following is None:
+            self.closed = True
+            self.plt.close(self.figure)
+            return
+        self.cursor = following
+        self.loaded_platform = None
         self.draw()
 
-    def draw(self) -> None:
-        row = self._load()
-        result = self.detection.result
-        data = self.detection.diagnostics
-        for axis in (self.full_ax, self.ttff_ax, self.ttff_count_ax, self.strain_ax,
-                     self.strain_metric_ax,
-                     self.temperature_ax, self.temperature_variability_ax):
+    def _record(self, status: str) -> None:
+        if self._set(status):
+            self._advance_after_save()
+
+    def _displayed_loss_time(self, row: pd.Series) -> pd.Timestamp | None:
+        if self.selection_dirty:
+            return self.selected_time
+        decision = self.reviews.rows.get(str(row.platform_code))
+        if decision is None:
+            return self._automatic_time(row)
+        return _utc(decision["reviewed_drogue_loss_time"])
+
+    def _displayed_cutoff_time(self, row: pd.Series) -> pd.Timestamp | None:
+        physical = self._displayed_loss_time(row)
+        if physical is None:
+            return None
+        return _utc(analysis_cutoff_time(
+            physical.tz_localize(None).to_datetime64(), self.review_margin_hours,
+        ))
+
+    def _render_platform(self, row: pd.Series) -> None:
+        for axis in (self.ttff_ax, self.strain_ax):
             axis.clear()
-        time = pd.DatetimeIndex(data.time)
-        automatic = self._automatic_time(row)
-        self.full_ax.plot(time, data.ttff, ".", color=".45", ms=2, label="Raw TTFF")
-        self.full_ax.set_ylabel("TTFF")
-        self.full_ax.set_title("Full record")
-        count_table = self.detection.ttff_counts
-        raw_counts = np.stack(count_table.bin_counts.to_numpy()).T
-        x_edges = [*count_table.time_start, count_table.time_end.iloc[-1]]
-        self.ttff_ax.pcolormesh(
-            x_edges, np.arange(raw_counts.shape[0] + 1), raw_counts,
-            shading="flat", cmap="viridis", vmin=0,
+        time = pd.DatetimeIndex(self.signals.time)
+        ttff = np.asarray(self.signals.ttff, dtype=float)
+        positive = np.isfinite(ttff) & (ttff > 0)
+        self.ttff_ax.plot(
+            time[positive], ttff[positive], ".", color=".4", ms=2,
+            label="Positive raw TTFF",
         )
-        self.ttff_ax.set_yticks(np.arange(len(self.detection.ttff_bins.labels)) + .5)
-        self.ttff_ax.set_yticklabels(self.detection.ttff_bins.labels, fontsize=6)
-        marker_label = True
-        for component in self.detection.ttff_bin_results.itertuples():
-            if pd.notna(component.drop_time):
-                self.ttff_ax.plot(
-                    component.drop_time, component.bin_index + .5,
-                    marker="v", ms=5, color="white", mec="black",
-                    label=("Per-bin stable drop" if marker_label else None),
-                )
-                marker_label = False
-        forward_counts = np.stack(count_table.forward_counts.to_numpy()).T
-        colors = self.plt.cm.viridis(
-            np.linspace(.05, .95, len(self.detection.ttff_bins.labels))
-        )
-        for bin_index, color in enumerate(colors):
-            self.ttff_count_ax.step(
-                count_table.time_start, forward_counts[bin_index], where="post",
-                color=color, lw=.65, alpha=.65,
-                label=("Per-bin forward 48 h counts" if bin_index == 0 else None),
-            )
-        self.ttff_count_ax.plot(
-            count_table.time_center, count_table.n_valid, color="tab:orange", lw=.9,
-            ls="--",
-            label="N_valid",
-        )
-        for availability in count_table[
-            ~count_table.forward_coverage_adequate
-        ].itertuples():
-            self.ttff_ax.axvspan(
-                availability.time_start, availability.time_end,
-                color="tab:red", alpha=.10,
-            )
-        self.ttff_count_ax.set_ylabel("Forward events / N_valid", color="tab:orange")
-        self.ttff_ax.set_ylabel("TTFF value bins")
-        status_counts = self.detection.ttff_bin_results.status.value_counts().to_dict()
+        self.ttff_ax.set_yscale("log")
+        self.ttff_ax.set_ylabel("TTFF (log)")
         self.ttff_ax.set_title(
-            f"TTFF bin cessation: {result.ttff_change_status} "
-            f"(eligible={result.ttff_eligible_bin_count}, "
-            f"stable={result.ttff_stable_drop_bin_count}, "
-            f"agreeing={result.ttff_agreeing_bin_count}; {status_counts})"
+            f"TTFF: {row.ttff_status} ({row.ttff_detail_status})"
         )
-        self.strain_ax.plot(time, data.strain, ".", color=".6", ms=2, label="Raw strain")
-        self.strain_ax.plot(time, data.rolling_median_strain, color="tab:green",
-                            label="Rolling median")
-        self.strain_ax.fill_between(
-            time, data.rolling_q25_strain, data.rolling_q75_strain,
-            color="tab:green", alpha=.18, label="Rolling q25-q75",
-        )
-        strain_metrics = self.detection.strain_candidates
-        if not strain_metrics.empty:
-            self.strain_metric_ax.plot(
-                strain_metrics.time, strain_metrics.drop_absolute,
-                color="tab:purple", lw=1.0, label="Absolute drop",
+        self.ttff_ax.grid(alpha=.2)
+
+        if self.signals.strain is not None:
+            self.strain_ax.plot(
+                time, self.signals.strain, ".", color=".75", ms=2,
+                label="Raw strain",
             )
-            self.strain_metric_ax.plot(
-                strain_metrics.time, strain_metrics.normalized_drop,
-                color="tab:orange", lw=.8, label="Normalized drop",
+        blocks = self.strain_blocks
+        if not blocks.empty and blocks.strain_median.notna().any():
+            self.strain_ax.plot(
+                blocks.time_center, blocks.strain_median, "o-",
+                color="tab:green", ms=2.5, lw=.8, label="Strain block median",
             )
-        self.strain_metric_ax.set_ylabel("Step diagnostics", color="tab:purple")
+            change = _utc(row.strain_change_time)
+            if change is not None:
+                block_time = pd.DatetimeIndex(blocks.time_center)
+                fitted = np.where(
+                    blocks.strain_median.notna(),
+                    np.where(block_time < change, row.strain_level_before,
+                             row.strain_level_after),
+                    np.nan,
+                )
+                self.strain_ax.plot(
+                    block_time, fitted, color="tab:blue", lw=1.8,
+                    label="Fitted pre/post levels",
+                )
         self.strain_ax.set_ylabel("Strain")
+        self.strain_ax.set_xlabel("UTC time")
         self.strain_ax.set_title(
-            f"Persistent strain step: {result.strain_change_status} "
-            f"(drop={result.strain_drop_absolute:.3g}, "
-            f"relative={result.strain_drop_relative:.1%}, "
-            f"normalized={result.strain_normalized_drop:.3g})"
+            f"Robust strain: {row.strain_status}; "
+            f"levels={row.strain_level_before:.3g}->{row.strain_level_after:.3g}; "
+            f"drop={row.strain_absolute_drop:.3g} ({row.strain_relative_drop:.1%}); "
+            f"fit={row.strain_fit_improvement:.1%}"
         )
-        self.temperature_ax.plot(time, data.hull_temperature, color="tab:red", lw=.7,
-                                 label="Hull temperature")
-        self.temperature_ax.plot(time, data.temperature_background, color="tab:orange", lw=1,
-                                 label="Rolling median background")
-        self.temperature_variability_ax.plot(time, data.temperature_rolling_mad,
-                                              color="tab:purple", lw=.9,
-                                              label="Local anomaly MAD")
-        self.temperature_ax.set_ylabel("Hull temperature")
-        self.temperature_variability_ax.set_ylabel("Local MAD", color="tab:purple")
-        self.temperature_ax.set_title(
-            f"Hull temperature context only: {result.temperature_context_status}"
-        )
-        events = []
-        if not np.isnat(result.ttff_change_time):
-            events.append((pd.Timestamp(result.ttff_change_time), "TTFF change", "tab:purple", "--"))
-        if not np.isnat(result.strain_change_time):
-            events.append((pd.Timestamp(result.strain_change_time), "Strain change", "tab:green", "-."))
+        self.strain_ax.grid(alpha=.2)
+        self.ttff_ax.legend(loc="upper right", fontsize=8)
+        self.strain_ax.legend(loc="upper right", fontsize=8)
+
+    def _update_overlays(self, row: pd.Series) -> None:
+        for artist in self.overlay_artists:
+            artist.remove()
+        self.overlay_artists.clear()
+        automatic = self._automatic_time(row)
+        self.buttons[0].set_active(automatic is not None)
+        physical = self._displayed_loss_time(row)
+        cutoff = self._displayed_cutoff_time(row)
+        events: list[tuple[pd.Timestamp, str, str, str, float]] = []
+        for value, label, color, style, width in (
+            (row.ttff_change_time, "TTFF change", "tab:purple", "--", 1.3),
+            (row.strain_change_time, "Strain change", "tab:green", "-.", 1.3),
+        ):
+            timestamp = _utc(value)
+            if timestamp is not None:
+                events.append((timestamp, label, color, style, width))
         if automatic is not None:
-            events.append((automatic, "Automatic candidate", "tab:red", "-"))
-        for axis in (self.full_ax, self.ttff_ax, self.strain_ax, self.temperature_ax):
-            drawn: dict[int, list[str]] = {}
-            for event_time, label, color, style in events:
+            events.append((automatic, "Automatic decision", "tab:red", "-", 1.7))
+        if physical is not None:
+            events.append((physical, "Selected physical loss", "tab:blue", "--", 1.4))
+        if cutoff is not None:
+            events.append((cutoff, "Analysis cutoff", "black", ":", 1.4))
+        for axis in (self.ttff_ax, self.strain_ax):
+            drawn: set[int] = set()
+            for event_time, label, color, style, width in events:
                 key = int(event_time.value)
                 if key in drawn:
-                    drawn[key].append(label)
                     continue
-                drawn[key] = [label]
+                drawn.add(key)
                 same = [item[1] for item in events if int(item[0].value) == key]
-                axis.axvline(event_time, color=color, lw=1.6, ls=style,
-                             label=" / ".join(same))
-            if self.selected_time is not None:
-                axis.axvline(self.selected_time, color="tab:blue", lw=1.2, ls="--",
-                             label="Selected review time")
-            axis.grid(alpha=.2)
-        center = automatic if automatic is not None else self.selected_time
-        if center is not None:
-            half = pd.Timedelta(self.config.review_zoom_window)
-            for axis in (self.ttff_ax, self.strain_ax, self.temperature_ax):
-                axis.set_xlim(center - half, center + half)
-        self.full_ax.legend(loc="upper right", fontsize=8)
-        handles, labels = self.ttff_ax.get_legend_handles_labels()
-        extra_handles, extra_labels = self.ttff_count_ax.get_legend_handles_labels()
-        self.ttff_ax.legend(handles + extra_handles, labels + extra_labels,
-                            loc="upper right", fontsize=8)
-        strain_handles, strain_labels = self.strain_ax.get_legend_handles_labels()
-        strain_extra_handles, strain_extra_labels = self.strain_metric_ax.get_legend_handles_labels()
-        self.strain_ax.legend(strain_handles + strain_extra_handles,
-                              strain_labels + strain_extra_labels,
-                              loc="upper right", fontsize=8)
-        temp_handles, temp_labels = self.temperature_ax.get_legend_handles_labels()
-        temp_extra_handles, temp_extra_labels = self.temperature_variability_ax.get_legend_handles_labels()
-        self.temperature_ax.legend(temp_handles + temp_extra_handles,
-                                   temp_labels + temp_extra_labels,
-                                   loc="upper right", fontsize=8)
-        decision = self.reviews.rows.get(str(row.platform_code))
+                self.overlay_artists.append(axis.axvline(
+                    event_time, color=color, lw=width, ls=style,
+                    label=" / ".join(same),
+                ))
+            axis.legend(loc="upper right", fontsize=8)
+        platform = str(row.platform_code)
+        decision = self.reviews.rows.get(platform)
         decision_text = "unreviewed" if decision is None else decision["review_status"]
+        stale = " | STALE DETECTOR SNAPSHOT" if platform in self.reviews.stale_automatic else ""
         self.figure.suptitle(
-            f"{row.platform_code}  {self.cursor + 1}/{len(self.automatic)}  "
-            f"status={row.auto_status} confidence={row.auto_confidence} review={decision_text}\n"
-            f"TTFF eligible/stable/agreeing="
-            f"{row.ttff_eligible_bin_count}/{row.ttff_stable_drop_bin_count}/"
-            f"{row.ttff_agreeing_bin_count}, span={row.ttff_consensus_span_hours:.2f} h; "
-            f"strain drop abs/relative/normalized="
-            f"{row.strain_drop_absolute:.3g}/{row.strain_drop_relative:.1%}/"
-            f"{row.strain_normalized_drop:.3g}; "
-            f"component offset={row.ttff_strain_offset_hours:.2f} h"
+            f"{platform}  {self.cursor + 1}/{len(self.automatic)}  "
+            f"auto={row.auto_status} ({row.auto_source})  review={decision_text}{stale}\n"
+            f"TTFF={row.ttff_status}, strain={row.strain_status}, "
+            f"margin={self.review_margin_hours:g} h"
         )
         self.figure.canvas.draw_idle()
+
+    def draw(self) -> None:
+        previous = self.loaded_platform
+        row = self._load()
+        if previous != self.loaded_platform:
+            self.overlay_artists.clear()
+            self._render_platform(row)
+        self._update_overlays(row)
 
     def action(self, action: str) -> None:
         if action == "accept":
             if self._automatic_time(self.automatic.iloc[self.cursor]) is None:
-                self.status.set_text("No automatic candidate is available to accept.")
+                self.status.set_text("No automatic decision is available to accept.")
+                self.figure.canvas.draw_idle()
             else:
-                self._set("accepted_auto", self._reason())
+                self._record("accepted_auto")
         elif action == "manual":
-            self._set("manual_time", "manual_adjustment")
+            self._record("manual_date")
         elif action == "none":
-            self._set("no_detectable_loss", "ambiguous")
+            self._record("not_lost")
         elif action == "uncertain":
-            self._set("uncertain", "ambiguous")
+            self._record("uncertain")
         elif action in {"-6", "-1", "+1", "+6"}:
             self.selected_time += pd.Timedelta(hours=int(action))
-            self._set("manual_time", "manual_adjustment")
-        elif action in {"previous", "next"}:
-            delta = -1 if action == "previous" else 1
-            self.cursor = (self.cursor + delta) % len(self.automatic)
+            self.selection_dirty = True
+            self.status.set_text("Selected time changed; press Set manual to save it.")
+            self._update_overlays(self.automatic.iloc[self.cursor])
+        elif action == "previous":
+            self.cursor = (self.cursor - 1) % len(self.automatic)
             self.loaded_platform = None
             self.status.set_text("")
             self.draw()
-        elif action == "save":
-            self.reviews.save()
-            self.status.set_text(f"Saved {self.config.review_output}")
-            self.figure.canvas.draw_idle()
+        elif action == "next":
+            following = self._next_pending(exclude_current=True)
+            if following is None:
+                self.status.set_text("This is the only unfinished platform.")
+                self.figure.canvas.draw_idle()
+                return
+            self.cursor = following
+            self.loaded_platform = None
+            self.status.set_text("")
+            self.draw()
         elif action == "quit":
-            self.reviews.save()
             self.closed = True
             self.plt.close(self.figure)
 
-    def on_click(self, event) -> None:
-        if event.inaxes not in {self.full_ax, self.ttff_ax, self.ttff_count_ax, self.strain_ax,
-                                self.strain_metric_ax,
-                                self.temperature_ax, self.temperature_variability_ax}:
+    def on_margin_submit(self, text: str) -> None:
+        try:
+            margin = float(text)
+            if not np.isfinite(margin) or margin < 0:
+                raise ValueError
+        except ValueError:
+            self.status.set_text("Cutoff margin must be finite and nonnegative.")
+            self.margin_box.eventson = False
+            self.margin_box.set_val(f"{self.review_margin_hours:g}")
+            self.margin_box.eventson = True
+            self.figure.canvas.draw_idle()
             return
-        if event.xdata is None:
+        self.review_margin_hours = margin
+        platform = str(self.automatic.iloc[self.cursor].platform_code)
+        if platform in self.reviews.rows:
+            previous = self.reviews.rows[platform].copy()
+            try:
+                self.reviews.set_margin(platform, margin)
+                self.reviews.save()
+                message = f"Margin saved to {self.config.review_output}."
+            except (OSError, ValueError) as exc:
+                self.reviews.rows[platform] = previous
+                self.review_margin_hours = float(
+                    previous["analysis_cutoff_margin_hours"]
+                )
+                self.margin_box.eventson = False
+                self.margin_box.set_val(f"{self.review_margin_hours:g}")
+                self.margin_box.eventson = True
+                message = f"Could not save margin: {exc}"
+        else:
+            message = "Margin selected; record a review decision to store it."
+        self.status.set_text(message)
+        self._update_overlays(self.automatic.iloc[self.cursor])
+
+    def on_click(self, event) -> None:
+        if event.inaxes not in {self.ttff_ax, self.strain_ax} or event.xdata is None:
             return
         self.selected_time = pd.Timestamp(self.mdates.num2date(event.xdata)).tz_convert("UTC")
-        self.status.set_text("Selected time changed; press Set manual to record it.")
-        self.draw()
+        self.selection_dirty = True
+        self.status.set_text("Selected physical loss time changed; press Set manual to record it.")
+        self._update_overlays(self.automatic.iloc[self.cursor])
 
     def on_key(self, event) -> None:
-        mapping = {"a": "accept", "m": "manual", "u": "uncertain", "n": "next",
-                   "p": "previous", "s": "save", "q": "quit"}
+        mapping = {
+            "a": "accept", "m": "manual", "l": "none", "u": "uncertain",
+            "n": "next", "p": "previous", "q": "quit",
+        }
         if event.key in mapping:
             self.action(mapping[event.key])
 
     def on_close(self, event) -> None:
         if not self.closed:
-            self.reviews.save()
             self.closed = True
 
     def show(self) -> None:

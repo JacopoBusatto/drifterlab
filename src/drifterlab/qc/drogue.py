@@ -1,4 +1,4 @@
-"""TTFF per-bin cessation and strain-step drogue detection plus analysis masks."""
+"""Independent TTFF/strain drogue detection and explicit decision combination."""
 
 from __future__ import annotations
 
@@ -7,6 +7,12 @@ from typing import Any, Iterable
 
 import numpy as np
 import pandas as pd
+
+from .strain_two_regime import (
+    StrainTwoRegimeConfig,
+    StrainTwoRegimeDetection,
+    robust_two_regime_strain_change,
+)
 
 
 @dataclass(frozen=True)
@@ -127,56 +133,16 @@ class TTFFCessationConfig:
 
 
 @dataclass(frozen=True)
-class StrainStepConfig:
-    """Time windows and thresholds for persistent strain level drops."""
-
-    window: str = "12h"
-    pre_window: str = "48h"
-    post_window: str = "48h"
-    persistence_window: str = "48h"
-    minimum_drop_absolute: float = 2.0
-    minimum_drop_relative: float = .10
-    minimum_normalized_drop: float = 1.5
-    weak_drop_absolute: float = 1.0
-    weak_drop_relative: float = .05
-    weak_normalized_drop: float = .75
-    relative_floor: float = 1.0
-    variability_floor: float = 1.0
-    persistence_tolerance: float = 1.0
+class DrogueCombinationConfig:
+    agreement_tolerance_hours: float = 48.0
 
     def __post_init__(self) -> None:
-        for name in ("window", "pre_window", "post_window", "persistence_window"):
-            try:
-                duration = pd.Timedelta(getattr(self, name))
-            except (TypeError, ValueError) as exc:
-                raise ValueError(f"strain.{name} must be a valid duration") from exc
-            if duration <= pd.Timedelta(0):
-                raise ValueError(f"strain.{name} must be positive")
-        nonnegative = (
-            "minimum_drop_absolute", "minimum_drop_relative",
-            "minimum_normalized_drop", "weak_drop_absolute",
-            "weak_drop_relative", "weak_normalized_drop", "persistence_tolerance",
-        )
-        for name in nonnegative:
-            value = getattr(self, name)
-            if (isinstance(value, (bool, np.bool_))
-                    or not isinstance(value, (int, float, np.number))
-                    or not np.isfinite(value) or value < 0):
-                raise ValueError(f"strain.{name} must be finite and nonnegative")
-        for name in ("relative_floor", "variability_floor"):
-            value = getattr(self, name)
-            if (isinstance(value, (bool, np.bool_))
-                    or not isinstance(value, (int, float, np.number))
-                    or not np.isfinite(value) or value <= 0):
-                raise ValueError(f"strain.{name} must be finite and positive")
-        pairs = (
-            ("minimum_drop_absolute", "weak_drop_absolute"),
-            ("minimum_drop_relative", "weak_drop_relative"),
-            ("minimum_normalized_drop", "weak_normalized_drop"),
-        )
-        for minimum, weak in pairs:
-            if getattr(self, minimum) < getattr(self, weak):
-                raise ValueError(f"strain.{minimum} cannot be less than strain.{weak}")
+        value = self.agreement_tolerance_hours
+        if (isinstance(value, (bool, np.bool_)) or not np.isfinite(value)
+                or value < 0):
+            raise ValueError(
+                "combination.agreement_tolerance_hours must be finite and nonnegative"
+            )
 
 
 def _default_ttff() -> TTFFCessationConfig:
@@ -188,21 +154,11 @@ def _default_ttff() -> TTFFCessationConfig:
 
 @dataclass(frozen=True)
 class DrogueDetectionConfig:
-    """Settings for TTFF-bin cessation, strain steps, and contextual temperature."""
+    """Settings for independent detectors and their experiment-level combination."""
 
     ttff: TTFFCessationConfig = field(default_factory=_default_ttff)
-    strain: StrainStepConfig = field(default_factory=StrainStepConfig)
-    temperature_background_window: str = "24h"
-    temperature_variability_window: str = "6h"
-
-    def __post_init__(self) -> None:
-        for name in ("temperature_background_window", "temperature_variability_window"):
-            try:
-                duration = pd.Timedelta(getattr(self, name))
-            except (TypeError, ValueError) as exc:
-                raise ValueError(f"{name} must be a valid duration") from exc
-            if duration <= pd.Timedelta(0):
-                raise ValueError(f"{name} must be positive")
+    strain: StrainTwoRegimeConfig = field(default_factory=StrainTwoRegimeConfig)
+    combination: DrogueCombinationConfig = field(default_factory=DrogueCombinationConfig)
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -211,8 +167,7 @@ class DrogueDetectionConfig:
     def from_dict(cls, data: dict[str, Any]) -> DrogueDetectionConfig:
         if not isinstance(data, dict):
             raise ValueError("detection must be a mapping")
-        allowed = {"ttff", "strain", "temperature_background_window",
-                   "temperature_variability_window"}
+        allowed = {"ttff", "strain", "combination"}
         unknown = set(data) - allowed
         if unknown:
             raise ValueError(f"Unknown detection keys: {sorted(unknown)}")
@@ -255,29 +210,31 @@ class DrogueDetectionConfig:
 
         raw_strain = data.get("strain")
         if raw_strain is None:
-            strain = StrainStepConfig()
+            strain = StrainTwoRegimeConfig()
         else:
             if not isinstance(raw_strain, dict):
                 raise ValueError("detection.strain must be a mapping")
-            valid_strain = set(StrainStepConfig.__dataclass_fields__)
-            unknown_strain = set(raw_strain) - valid_strain
-            if unknown_strain:
-                raise ValueError(
-                    f"Unknown detection.strain keys: {sorted(unknown_strain)}"
-                )
-            strain = StrainStepConfig(**{
-                **asdict(StrainStepConfig()), **raw_strain,
-            })
+            try:
+                strain = StrainTwoRegimeConfig.from_dict(raw_strain)
+            except ValueError as exc:
+                raise ValueError(f"Invalid detection.strain: {exc}") from exc
+
+        raw_combination = data.get("combination", {})
+        if not isinstance(raw_combination, dict):
+            raise ValueError("detection.combination must be a mapping")
+        valid_combination = set(DrogueCombinationConfig.__dataclass_fields__)
+        unknown_combination = set(raw_combination) - valid_combination
+        if unknown_combination:
+            raise ValueError(
+                "Unknown detection.combination keys: "
+                f"{sorted(unknown_combination)}"
+            )
+        combination = DrogueCombinationConfig(**raw_combination)
 
         return cls(
             ttff=ttff,
             strain=strain,
-            temperature_background_window=data.get(
-                "temperature_background_window", "24h"
-            ),
-            temperature_variability_window=data.get(
-                "temperature_variability_window", "6h"
-            ),
+            combination=combination,
         )
 
 
@@ -299,11 +256,33 @@ class TTFFCessationDetection:
     bins: ValueBins
 
 
-@dataclass
-class StrainStepDetection:
+@dataclass(frozen=True)
+class ComponentDetectionResult:
+    """Common interface consumed by the experiment-level decision layer."""
+
+    change_time: np.datetime64
     status: str
-    selected: pd.Series | None
-    candidates: pd.DataFrame
+
+
+@dataclass(frozen=True)
+class CombinedDrogueDecision:
+    change_time: np.datetime64
+    status: str
+    source: str
+
+
+@dataclass(frozen=True)
+class ResolvedDrogueDecision:
+    """Effective decision computed from automatic evidence and an optional review."""
+
+    final_drogue_status: str
+    final_drogue_loss_time: np.datetime64
+    analysis_cutoff_margin_hours: float
+    analysis_cutoff_time: np.datetime64
+    decision_source: str
+
+    def as_dict(self) -> dict[str, Any]:
+        return asdict(self)
 
 
 @dataclass(frozen=True)
@@ -311,10 +290,10 @@ class DrogueDetectionResult:
     platform_code: str
     auto_drogue_loss_time: np.datetime64
     auto_status: str
-    auto_confidence: str
-    ttff_strain_relation: str
+    auto_source: str
     ttff_change_time: np.datetime64
-    ttff_change_status: str
+    ttff_status: str
+    ttff_detail_status: str
     ttff_eligible_bin_count: int
     ttff_stable_drop_bin_count: int
     ttff_agreeing_bin_count: int
@@ -323,24 +302,16 @@ class DrogueDetectionResult:
     ttff_agreeing_post_events: int
     ttff_min_persistence_coverage_fraction: float
     strain_change_time: np.datetime64
-    strain_change_strength: float
-    strain_change_status: str
-    strain_drop_absolute: float
-    strain_drop_relative: float
-    strain_normalized_drop: float
-    strain_median_before: float
-    strain_median_after: float
-    strain_mad_before: float
-    strain_mad_after: float
-    strain_q25_before: float
-    strain_q75_before: float
-    strain_q25_after: float
-    strain_q75_after: float
-    strain_pre_coverage_fraction: float
-    strain_post_coverage_fraction: float
-    strain_followup_coverage_fraction: float
+    strain_status: str
+    strain_level_before: float
+    strain_level_after: float
+    strain_absolute_drop: float
+    strain_relative_drop: float
+    strain_fit_improvement: float
+    strain_n_blocks_before: int
+    strain_n_blocks_after: int
+    strain_n_valid_blocks: int
     ttff_strain_offset_hours: float
-    temperature_context_status: str
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -349,9 +320,11 @@ class DrogueDetectionResult:
 @dataclass
 class DrogueDetection:
     result: DrogueDetectionResult
-    diagnostics: pd.DataFrame
     ttff_bin_results: pd.DataFrame
-    strain_candidates: pd.DataFrame
+    strain_blocks: pd.DataFrame
+    strain_objective: pd.DataFrame
+    strain_null_objective: float
+    strain_candidate_time: np.datetime64
     ttff_counts: pd.DataFrame
     ttff_bins: ValueBins
 
@@ -789,216 +762,7 @@ def detect_ttff_cessation(time: Any, values: Any, config: TTFFCessationConfig, *
     return TTFFCessationDetection(status, selected, results, counts, bins)
 
 
-def _mad(values: np.ndarray) -> float:
-    values = np.asarray(values, dtype=float)
-    values = values[np.isfinite(values)]
-    if not len(values):
-        return np.nan
-    center = np.median(values)
-    return float(np.median(np.abs(values - center)))
-
-
-def _duration_ns(value: str) -> int:
-    return int(pd.Timedelta(value).value)
-
-
-def _strain_window_summary(time_ns: np.ndarray, raw: np.ndarray, smoothed: np.ndarray,
-                           start_ns: int, end_ns: int, nominal_ns: int) -> dict[str, float]:
-    left = int(np.searchsorted(time_ns, start_ns, side="left"))
-    right = int(np.searchsorted(time_ns, end_ns, side="left"))
-    raw_values = raw[left:right]
-    raw_valid = np.isfinite(raw_values)
-    finite_raw = raw_values[raw_valid]
-    smooth_values = smoothed[left:right]
-    smooth_values = smooth_values[np.isfinite(smooth_values)]
-    duration_hours = (end_ns - start_ns) / 3_600_000_000_000
-    observed_times = time_ns[left:right][raw_valid]
-    coverage = _coverage_hours(observed_times, start_ns, end_ns, nominal_ns)
-    return {
-        "median": float(np.median(smooth_values)) if len(smooth_values) else np.nan,
-        "mad": _mad(finite_raw),
-        "q25": float(np.quantile(finite_raw, .25)) if len(finite_raw) else np.nan,
-        "q75": float(np.quantile(finite_raw, .75)) if len(finite_raw) else np.nan,
-        "n_valid": int(len(finite_raw)),
-        "coverage_fraction": min(1.0, coverage / duration_hours),
-    }
-
-
-def _strain_thresholds(drop: float, relative: float, normalized: float,
-                       config: StrainStepConfig, *, weak: bool) -> bool:
-    prefix = "weak" if weak else "minimum"
-    return (
-        drop >= getattr(config, f"{prefix}_drop_absolute")
-        and relative >= getattr(config, f"{prefix}_drop_relative")
-        and normalized >= getattr(config, f"{prefix}_normalized_drop")
-    )
-
-
-def _strain_episode_peaks(rows: pd.DataFrame, window: pd.Timedelta) -> list[pd.Series]:
-    if rows.empty:
-        return []
-    working = rows.sort_values("time").copy()
-    working["_episode"] = working.time.diff().gt(window).cumsum()
-    peaks: list[pd.Series] = []
-    for _, episode in working.groupby("_episode", sort=False):
-        maximum = episode.normalized_drop.max()
-        maxima = episode[np.isclose(episode.normalized_drop, maximum)]
-        peaks.append(maxima.iloc[len(maxima) // 2])
-    peaks.sort(
-        key=lambda row: (float(row.normalized_drop), float(row.drop_absolute)),
-        reverse=True,
-    )
-    return peaks
-
-
-def detect_strain_step(time: Any, values: Any, config: StrainStepConfig, *,
-                       missing_values: Iterable[float] = ()) -> StrainStepDetection:
-    """Detect a persistent downward step in time-smoothed raw strain."""
-    index, raw, valid = _prepared(time, values, missing_values)
-    raw = raw.copy()
-    raw[~valid] = np.nan
-    if not valid.any():
-        return StrainStepDetection("unavailable", None, pd.DataFrame())
-
-    series = pd.Series(raw, index=index)
-    smoothed = series.rolling(
-        pd.Timedelta(config.window), min_periods=1, center=True,
-    ).median().to_numpy()
-    time_ns = index.to_numpy(dtype="datetime64[ns]").astype(np.int64)
-    valid_time_ns = time_ns[valid]
-    nominal_ns = _nominal_interval_ns(valid_time_ns, _duration_ns(config.window))
-    pre_ns = _duration_ns(config.pre_window)
-    post_ns = _duration_ns(config.post_window)
-    persistence_ns = _duration_ns(config.persistence_window)
-    record_end_ns = int(time_ns[-1] + nominal_ns)
-
-    rows: list[dict[str, Any]] = []
-    for candidate_ns in np.unique(time_ns)[1:]:
-        candidate_ns = int(candidate_ns)
-        before = _strain_window_summary(
-            time_ns, raw, smoothed, candidate_ns - pre_ns, candidate_ns, nominal_ns,
-        )
-        after = _strain_window_summary(
-            time_ns, raw, smoothed, candidate_ns, candidate_ns + post_ns, nominal_ns,
-        )
-        persistence_end = candidate_ns + post_ns + persistence_ns
-        followup = _strain_window_summary(
-            time_ns, raw, smoothed, candidate_ns + post_ns,
-            persistence_end, nominal_ns,
-        )
-        if not np.isfinite(before["median"]) or not np.isfinite(after["median"]):
-            continue
-
-        drop = before["median"] - after["median"]
-        relative = drop / max(abs(before["median"]), config.relative_floor)
-        variability = max(
-            before["mad"] if np.isfinite(before["mad"]) else 0.0,
-            after["mad"] if np.isfinite(after["mad"]) else 0.0,
-            config.variability_floor,
-        )
-        normalized = drop / variability
-        clear_initial = _strain_thresholds(
-            drop, relative, normalized, config, weak=False,
-        )
-        weak_initial = _strain_thresholds(
-            drop, relative, normalized, config, weak=True,
-        )
-        full_followup = record_end_ns >= persistence_end
-        followup_drop = before["median"] - followup["median"]
-        followup_relative = (
-            followup_drop / max(abs(before["median"]), config.relative_floor)
-            if np.isfinite(followup_drop) else np.nan
-        )
-        followup_variability = max(
-            before["mad"] if np.isfinite(before["mad"]) else 0.0,
-            followup["mad"] if np.isfinite(followup["mad"]) else 0.0,
-            config.variability_floor,
-        )
-        followup_normalized = followup_drop / followup_variability
-        level_persists = (
-            np.isfinite(followup["median"])
-            and followup["median"] <= after["median"] + config.persistence_tolerance
-        )
-        clear_persistence = (
-            level_persists
-            and _strain_thresholds(
-                followup_drop, followup_relative, followup_normalized,
-                config, weak=False,
-            )
-        )
-        weak_persistence = (
-            level_persists
-            and _strain_thresholds(
-                followup_drop, followup_relative, followup_normalized,
-                config, weak=True,
-            )
-        )
-        if clear_initial and full_followup and clear_persistence:
-            level = "clear"
-        elif weak_initial and full_followup and weak_persistence:
-            level = "weak"
-        elif weak_initial and not full_followup:
-            level = "insufficient_followup"
-        elif weak_initial:
-            level = "transient"
-        else:
-            level = "none"
-        rows.append({
-            "time": pd.Timestamp(candidate_ns, unit="ns", tz="UTC"),
-            "candidate_level": level,
-            "drop_absolute": float(drop),
-            "drop_relative": float(relative),
-            "normalized_drop": float(normalized),
-            "median_before": before["median"],
-            "median_after": after["median"],
-            "mad_before": before["mad"],
-            "mad_after": after["mad"],
-            "q25_before": before["q25"],
-            "q75_before": before["q75"],
-            "q25_after": after["q25"],
-            "q75_after": after["q75"],
-            "persistence_median": followup["median"],
-            "persistence_rise": (
-                followup["median"] - after["median"]
-                if np.isfinite(followup["median"]) else np.nan
-            ),
-            "pre_n_valid": before["n_valid"],
-            "post_n_valid": after["n_valid"],
-            "followup_n_valid": followup["n_valid"],
-            "pre_coverage_fraction": before["coverage_fraction"],
-            "post_coverage_fraction": after["coverage_fraction"],
-            "followup_coverage_fraction": followup["coverage_fraction"],
-            "confirmed_until": pd.Timestamp(persistence_end, unit="ns", tz="UTC"),
-        })
-
-    candidates = pd.DataFrame(rows)
-    if candidates.empty:
-        return StrainStepDetection("none", None, candidates)
-    window = pd.Timedelta(config.window)
-    clear_peaks = _strain_episode_peaks(
-        candidates[candidates.candidate_level == "clear"], window,
-    )
-    if clear_peaks:
-        status = "ambiguous" if len(clear_peaks) > 1 else "clear"
-        selected = clear_peaks[0]
-    else:
-        weak_peaks = _strain_episode_peaks(
-            candidates[candidates.candidate_level == "weak"], window,
-        )
-        insufficient_peaks = _strain_episode_peaks(
-            candidates[candidates.candidate_level == "insufficient_followup"], window,
-        )
-        if insufficient_peaks:
-            status, selected = "insufficient_followup", insufficient_peaks[0]
-        elif weak_peaks:
-            status, selected = "weak", weak_peaks[0]
-        else:
-            status, selected = "none", None
-    return StrainStepDetection(status, selected, candidates)
-
-
-def _raw_frame(time: Any, ttff: Any, strain: Any | None,
-               hull_temperature: Any | None) -> pd.DataFrame:
+def _raw_frame(time: Any, ttff: Any, strain: Any | None) -> pd.DataFrame:
     raw_time = np.asarray(time).reshape(-1)
 
     def values(raw: Any | None, name: str) -> np.ndarray:
@@ -1016,7 +780,6 @@ def _raw_frame(time: Any, ttff: Any, strain: Any | None,
         "time": pd.to_datetime(raw_time, errors="coerce", utc=True),
         "ttff": values(ttff, "ttff"),
         "strain": values(strain, "strain"),
-        "hull_temperature": values(hull_temperature, "hull_temperature"),
     })
     frame = frame[frame.time.notna()].sort_values("time", kind="stable").reset_index(drop=True)
     if frame.empty:
@@ -1024,102 +787,110 @@ def _raw_frame(time: Any, ttff: Any, strain: Any | None,
     return frame
 
 
-def _context_diagnostics(frame: pd.DataFrame, config: DrogueDetectionConfig) -> pd.DataFrame:
-    index = pd.DatetimeIndex(frame.time)
-    strain = pd.Series(frame.strain.to_numpy(), index=index)
-    strain_window = pd.Timedelta(config.strain.window)
-    rolling_strain = strain.rolling(strain_window, min_periods=1, center=True)
-    minimum = 12
-    temperature = pd.Series(frame.hull_temperature.to_numpy(), index=index)
-    background = temperature.rolling(
-        pd.Timedelta(config.temperature_background_window), min_periods=minimum, center=True
-    ).median()
-    anomaly = temperature - background
-    variability = anomaly.rolling(
-        pd.Timedelta(config.temperature_variability_window), min_periods=minimum, center=True
-    ).apply(_mad, raw=True)
-    return pd.DataFrame({
-        "rolling_median_strain": rolling_strain.median().to_numpy(),
-        "rolling_q25_strain": rolling_strain.quantile(.25).to_numpy(),
-        "rolling_q75_strain": rolling_strain.quantile(.75).to_numpy(),
-        "rolling_mad_strain": rolling_strain.apply(_mad, raw=True).to_numpy(),
-        "temperature_background": background.to_numpy(),
-        "temperature_anomaly": anomaly.to_numpy(),
-        "temperature_rolling_mad": variability.to_numpy(),
-    })
+def _nat() -> np.datetime64:
+    return np.datetime64("NaT", "ns")
 
 
-def _time(selected: pd.Series | None) -> np.datetime64:
-    return np.datetime64("NaT", "ns") if selected is None else pd.Timestamp(selected.time).to_datetime64()
-
-
-def _value(selected: pd.Series | None, name: str) -> float:
+def _selected_value(selected: pd.Series | None, name: str) -> float:
     return np.nan if selected is None else float(selected[name])
 
 
-def _intervals_corroborate(ttff: pd.Series, strain: pd.Series,
-                           config: DrogueDetectionConfig) -> bool:
-    ttff_time, strain_time = pd.Timestamp(ttff.time), pd.Timestamp(strain.time)
-    ttff_until = pd.Timestamp(ttff.confirmed_until)
-    strain_until = pd.Timestamp(strain.confirmed_until)
-    if ttff_time <= strain_time:
-        return ttff_until >= strain_time + pd.Timedelta(hours=config.ttff.binning.time_bin_hours)
-    return strain_until >= ttff_time + pd.Timedelta(config.strain.window)
+def _ttff_component(detection: TTFFCessationDetection) -> ComponentDetectionResult:
+    status_map = {
+        "clear": "clear",
+        "weak": "weak",
+        "ambiguous": "ambiguous",
+        "none": "no_change",
+        "insufficient_followup": "insufficient_data",
+        "insufficient_data": "insufficient_data",
+        "unavailable": "insufficient_data",
+    }
+    try:
+        status = status_map[detection.status]
+    except KeyError as exc:
+        raise ValueError(f"Unsupported TTFF detector status: {detection.status}") from exc
+    time = (
+        pd.Timestamp(detection.selected.time).to_datetime64()
+        if detection.selected is not None and status in {"clear", "weak"}
+        else _nat()
+    )
+    return ComponentDetectionResult(time, status)
 
 
-def _combine(ttff: TTFFCessationDetection, strain: StrainStepDetection,
-             config: DrogueDetectionConfig) -> tuple[np.datetime64, str, str, str, float]:
-    ttff_time, strain_time = _time(ttff.selected), _time(strain.selected)
-    offset = np.nan
-    if not np.isnat(ttff_time) and not np.isnat(strain_time):
-        offset = float((strain_time - ttff_time) / np.timedelta64(1, "h"))
-    if "ambiguous" in {ttff.status, strain.status}:
-        return (np.datetime64("NaT", "ns"), "ambiguous_component_changes", "low",
-                "ambiguous", offset)
-    if strain.status == "clear":
-        if ttff.status == "clear":
-            if _intervals_corroborate(ttff.selected, strain.selected, config):
-                return strain_time, "detected_strain_primary_corroborated", "high", "corroborating", offset
-            return (np.datetime64("NaT", "ns"), "ambiguous_signal_conflict", "low",
-                    "contradictory", offset)
-        relation = "unavailable" if ttff.status == "unavailable" else ttff.status
-        return strain_time, "detected_strain_primary", "medium", relation, offset
-    if ttff.status == "clear":
-        relation = "strain_unavailable" if strain.status == "unavailable" else "strain_unclear"
-        return ttff_time, "detected_ttff_provisional", "medium", relation, offset
-    if "insufficient_followup" in {ttff.status, strain.status}:
-        return (np.datetime64("NaT", "ns"), "insufficient_followup", "uncertain",
-                "insufficient_followup", offset)
-    return (np.datetime64("NaT", "ns"), "no_clear_component_change", "uncertain",
-            "none", offset)
+def _strain_component(detection: StrainTwoRegimeDetection) -> ComponentDetectionResult:
+    result = detection.result
+    return ComponentDetectionResult(result.change_time, result.status)
+
+
+def combine_drogue_detections(
+    ttff: ComponentDetectionResult,
+    strain: ComponentDetectionResult,
+    config: DrogueCombinationConfig = DrogueCombinationConfig(),
+) -> CombinedDrogueDecision:
+    """Combine independent component decisions without changing either date."""
+    valid_statuses = {"clear", "weak", "ambiguous", "no_change", "insufficient_data"}
+    for name, component in (("TTFF", ttff), ("strain", strain)):
+        if component.status not in valid_statuses:
+            raise ValueError(f"Unsupported {name} component status: {component.status}")
+        if component.status == "clear" and np.isnat(component.change_time):
+            raise ValueError(f"A clear {name} component requires a change time")
+
+    if ttff.status == strain.status == "clear":
+        difference = abs(float(
+            (strain.change_time - ttff.change_time) / np.timedelta64(1, "h")
+        ))
+        if difference <= config.agreement_tolerance_hours:
+            return CombinedDrogueDecision(
+                min(ttff.change_time, strain.change_time),
+                "clear_agreement",
+                "ttff+strain",
+            )
+        return CombinedDrogueDecision(_nat(), "signal_conflict", "none")
+
+    benign = {"no_change", "insufficient_data"}
+    if ttff.status == "clear" and strain.status in benign:
+        return CombinedDrogueDecision(
+            ttff.change_time, "clear_ttff_only", "ttff",
+        )
+    if strain.status == "clear" and ttff.status in benign:
+        return CombinedDrogueDecision(
+            strain.change_time, "clear_strain_only", "strain",
+        )
+    return CombinedDrogueDecision(_nat(), "unresolved", "none")
 
 
 def detect_drogue_loss(platform_code: str, time: Any, ttff: Any, *, strain: Any | None = None,
-                       hull_temperature: Any | None = None,
                        config: DrogueDetectionConfig = DrogueDetectionConfig()) -> DrogueDetection:
-    """Detect TTFF-bin cessation and an independent persistent strain step."""
-    frame = _raw_frame(time, ttff, strain, hull_temperature)
+    """Run independent production detectors, then combine their decisions."""
+    frame = _raw_frame(time, ttff, strain)
     ttff_detection = detect_ttff_cessation(
         frame.time, frame.ttff, config.ttff, missing_values=(-999,)
     )
-    strain_detection = detect_strain_step(
+    strain_detection = robust_two_regime_strain_change(
         frame.time, frame.strain, config.strain, missing_values=(-999,)
     )
-    diagnostics = pd.concat(
-        [frame.reset_index(drop=True), _context_diagnostics(frame, config)], axis=1
+    ttff_component = _ttff_component(ttff_detection)
+    strain_component = _strain_component(strain_detection)
+    automatic = combine_drogue_detections(
+        ttff_component, strain_component, config.combination,
     )
-    automatic, status, confidence, relation, offset = _combine(
-        ttff_detection, strain_detection, config
-    )
-    ttff_selected, strain_selected = ttff_detection.selected, strain_detection.selected
+    ttff_selected = ttff_detection.selected
+    offset = np.nan
+    if (not np.isnat(ttff_component.change_time)
+            and not np.isnat(strain_component.change_time)):
+        offset = float(
+            (strain_component.change_time - ttff_component.change_time)
+            / np.timedelta64(1, "h")
+        )
+    strain_result = strain_detection.result
     result = DrogueDetectionResult(
         platform_code=str(platform_code),
-        auto_drogue_loss_time=automatic,
-        auto_status=status,
-        auto_confidence=confidence,
-        ttff_strain_relation=relation,
-        ttff_change_time=_time(ttff_selected),
-        ttff_change_status=ttff_detection.status,
+        auto_drogue_loss_time=automatic.change_time,
+        auto_status=automatic.status,
+        auto_source=automatic.source,
+        ttff_change_time=ttff_component.change_time,
+        ttff_status=ttff_component.status,
+        ttff_detail_status=ttff_detection.status,
         ttff_eligible_bin_count=int(ttff_detection.bin_results.eligible.sum()),
         ttff_stable_drop_bin_count=int(
             (ttff_detection.bin_results.status == "stable_drop").sum()
@@ -1127,40 +898,33 @@ def detect_drogue_loss(platform_code: str, time: Any, ttff: Any, *, strain: Any 
         ttff_agreeing_bin_count=(
             0 if ttff_selected is None else int(ttff_selected.agreeing_bin_count)
         ),
-        ttff_consensus_span_hours=_value(ttff_selected, "consensus_span_hours"),
+        ttff_consensus_span_hours=_selected_value(
+            ttff_selected, "consensus_span_hours"
+        ),
         ttff_agreeing_pre_events=(
             0 if ttff_selected is None else int(ttff_selected.agreeing_pre_events)
         ),
         ttff_agreeing_post_events=(
             0 if ttff_selected is None else int(ttff_selected.agreeing_post_events)
         ),
-        ttff_min_persistence_coverage_fraction=_value(
+        ttff_min_persistence_coverage_fraction=_selected_value(
             ttff_selected, "min_persistence_coverage_fraction"
         ),
-        strain_change_time=_time(strain_selected),
-        strain_change_strength=_value(strain_selected, "normalized_drop"),
-        strain_change_status=strain_detection.status,
-        strain_drop_absolute=_value(strain_selected, "drop_absolute"),
-        strain_drop_relative=_value(strain_selected, "drop_relative"),
-        strain_normalized_drop=_value(strain_selected, "normalized_drop"),
-        strain_median_before=_value(strain_selected, "median_before"),
-        strain_median_after=_value(strain_selected, "median_after"),
-        strain_mad_before=_value(strain_selected, "mad_before"),
-        strain_mad_after=_value(strain_selected, "mad_after"),
-        strain_q25_before=_value(strain_selected, "q25_before"),
-        strain_q75_before=_value(strain_selected, "q75_before"),
-        strain_q25_after=_value(strain_selected, "q25_after"),
-        strain_q75_after=_value(strain_selected, "q75_after"),
-        strain_pre_coverage_fraction=_value(strain_selected, "pre_coverage_fraction"),
-        strain_post_coverage_fraction=_value(strain_selected, "post_coverage_fraction"),
-        strain_followup_coverage_fraction=_value(strain_selected, "followup_coverage_fraction"),
+        strain_change_time=strain_component.change_time,
+        strain_status=strain_component.status,
+        strain_level_before=strain_result.level_before,
+        strain_level_after=strain_result.level_after,
+        strain_absolute_drop=strain_result.absolute_drop,
+        strain_relative_drop=strain_result.relative_drop,
+        strain_fit_improvement=strain_result.fit_improvement,
+        strain_n_blocks_before=strain_result.n_blocks_before,
+        strain_n_blocks_after=strain_result.n_blocks_after,
+        strain_n_valid_blocks=strain_result.n_valid_blocks,
         ttff_strain_offset_hours=offset,
-        temperature_context_status=(
-            "available" if frame.hull_temperature.notna().any() else "unavailable"
-        ),
     )
     return DrogueDetection(
-        result, diagnostics, ttff_detection.bin_results, strain_detection.candidates,
+        result, ttff_detection.bin_results, strain_detection.blocks,
+        strain_detection.candidates, strain_result.j0, strain_result.candidate_time,
         ttff_detection.temporal_counts, ttff_detection.bins,
     )
 
@@ -1181,6 +945,75 @@ def analysis_cutoff_time(reviewed_drogue_loss_time: np.datetime64,
                          cutoff_margin_hours: float = 24) -> np.datetime64:
     """Keep the reviewed physical event separate from its analysis margin."""
     return drogue_cutoff(reviewed_drogue_loss_time, cutoff_margin_hours)
+
+
+def _row_value(row: Any, name: str, default: Any = None) -> Any:
+    if row is None:
+        return default
+    if isinstance(row, dict):
+        return row.get(name, default)
+    if hasattr(row, "get"):
+        return row.get(name, default)
+    return getattr(row, name, default)
+
+
+def _optional_datetime64(value: Any) -> np.datetime64:
+    if value is None or str(value).strip() in {"", "NaT", "nan", "None"}:
+        return _nat()
+    timestamp = pd.Timestamp(value)
+    if pd.isna(timestamp):
+        return _nat()
+    if timestamp.tzinfo is not None:
+        timestamp = timestamp.tz_convert("UTC").tz_localize(None)
+    return timestamp.to_datetime64().astype("datetime64[ns]")
+
+
+def resolve_drogue_decision(
+    automatic_row: Any,
+    review_row: Any | None = None,
+    *,
+    default_margin_hours: float = 24,
+) -> ResolvedDrogueDecision:
+    """Resolve an effective drogue state without creating another product table."""
+    margin = float(default_margin_hours)
+    if not np.isfinite(margin) or margin < 0:
+        raise ValueError("default_margin_hours must be finite and nonnegative")
+
+    if review_row is not None:
+        status = str(_row_value(review_row, "review_status", "")).strip()
+        reviewed_margin = _row_value(
+            review_row, "analysis_cutoff_margin_hours", margin,
+        )
+        margin = float(reviewed_margin)
+        if not np.isfinite(margin) or margin < 0:
+            raise ValueError("Reviewed analysis cutoff margin must be finite and nonnegative")
+        if status in {"accepted_auto", "manual_date"}:
+            loss_time = _optional_datetime64(
+                _row_value(review_row, "reviewed_drogue_loss_time")
+            )
+            if np.isnat(loss_time):
+                raise ValueError(f"{status} review requires a physical loss time")
+            return ResolvedDrogueDecision(
+                "lost", loss_time, margin,
+                analysis_cutoff_time(loss_time, margin), status,
+            )
+        if status in {"not_lost", "uncertain"}:
+            return ResolvedDrogueDecision(
+                status, _nat(), margin, _nat(), status,
+            )
+        raise ValueError(f"Unsupported drogue review status: {status!r}")
+
+    automatic_time = _optional_datetime64(
+        _row_value(automatic_row, "auto_drogue_loss_time")
+    )
+    if not np.isnat(automatic_time):
+        return ResolvedDrogueDecision(
+            "lost", automatic_time, margin,
+            analysis_cutoff_time(automatic_time, margin), "automatic",
+        )
+    return ResolvedDrogueDecision(
+        "uncertain", _nat(), margin, _nat(), "automatic",
+    )
 
 
 def drogue_valid(time: np.ndarray, decision: str, cutoff: np.datetime64) -> np.ndarray:

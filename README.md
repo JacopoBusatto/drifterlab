@@ -180,16 +180,32 @@ Reconstructed coordinate range flags and masks remain representation-specific.
 
 ## Standalone drogue-loss detection and review
 
-The drogue QC stage reads raw `ObsTimestamp`, `GpsTTFF`, optional `Drogue`
-strain, and optional `HullTemperature`. A raw per-value-bin count method detects
-the last persistent cessation of TTFF activity, while a separate rolling-median
-detector finds persistent downward strain steps. Strain supplies the preferred
-physical time; TTFF corroborates it or provides a provisional fallback. Hull
-temperature is context only. The automatic result supports a separate
-interactive review.
+The drogue QC stage reads raw `ObsTimestamp`, `GpsTTFF`, and optional `Drogue`
+strain. A raw per-value-bin count method detects
+the last persistent cessation of TTFF activity. An independent robust
+two-regime L1 detector fits a single downward change to non-overlapping strain
+block medians. A small decision layer accepts agreeing clear dates, permits one
+clear component when the other has no change or insufficient data, and leaves
+conflicts or unresolved evidence undated for review. The physical loss date and
+the separately margined analysis cutoff remain distinct.
 It never reads or displays the supplied `drogue_off` date and does not modify the
 trajectory Zarr. See [the commands, outputs, controls, and initial configurable
 thresholds](docs/drogue_loss_review.md).
+
+Use one generic command and choose exactly one mode:
+
+```powershell
+drifterlab-drogue configs/arcterx/drogue_detection.local.yml --automatic
+drifterlab-drogue configs/arcterx/drogue_detection.local.yml --semiautomatic
+drifterlab-drogue configs/arcterx/drogue_detection.local.yml --manual
+```
+
+Automatic mode has no GUI, semiautomatic mode reviews only problematic cases,
+and manual mode considers every platform. Each mode has independent files,
+formed by adding `_auto`, `_semi`, or `_manual` to the configured base name.
+Manual and semiautomatic runs reuse their own existing automatic results and
+resume at the first unfinished review. Add `--overwrite` to recompute the
+selected mode's automatic results. Review decisions save immediately.
 
 ## Existing trajectory-ingestion drogue decisions
 

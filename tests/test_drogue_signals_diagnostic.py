@@ -71,7 +71,7 @@ def test_drifter_figure_marks_all_detected_dates_on_all_panels(tmp_path, monkeyp
     matplotlib.use("Agg", force=True)
     from matplotlib.axes import Axes
 
-    n, ttff_event, strain_event = 700, 240, 300
+    n, ttff_event, strain_event = 700, 240, 264
     before = np.resize(np.array([10., 30., 80., 150., 400.]), ttff_event)
     after = np.resize(np.array([2., 4., 6., 8.]), n - ttff_event)
     source = signals(
@@ -86,7 +86,6 @@ def test_drifter_figure_marks_all_detected_dates_on_all_panels(tmp_path, monkeyp
     data = rolling_diagnostics(source, diagnostic_settings)
     detection = detect_drogue_loss(
         source.platform_code, source.time, source.ttff, strain=source.strain,
-        hull_temperature=source.hull_temperature,
         config=DrogueDetectionConfig(),
     )
     labels = []
@@ -98,10 +97,18 @@ def test_drifter_figure_marks_all_detected_dates_on_all_panels(tmp_path, monkeyp
 
     monkeypatch.setattr(Axes, "axvline", record_line)
     output = tmp_path / "drifter.png"
-    plot_drifter(source, data, diagnostic_settings, output, detection)
+    plot_drifter(
+        source, data, diagnostic_settings, output, detection,
+        review_row={
+            "reviewed_drogue_loss_time": "2025-01-12T06:00:00+00:00",
+            "analysis_cutoff_time": "2025-01-11T06:00:00+00:00",
+        },
+    )
     assert output.exists()
-    assert labels.count("TTFF change") == 7
-    assert labels.count("Strain change / Automatic drogue loss") == 7
+    assert labels.count("TTFF change / Automatic decision") == 7
+    assert labels.count("Strain change") == 7
+    assert labels.count("Reviewed physical loss") == 7
+    assert labels.count("Analysis cutoff") == 7
 
 
 def test_single_platform_cli_smoke(tmp_path):

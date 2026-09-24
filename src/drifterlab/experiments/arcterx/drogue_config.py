@@ -1,14 +1,28 @@
 """Configuration for the standalone ARCTERX drogue-loss workflow."""
 
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, fields, replace
 from pathlib import Path
 from typing import Any
 
 import math
-import pandas as pd
 import yaml
 
 from drifterlab.qc.drogue import DrogueDetectionConfig
+
+
+DROGUE_MODE_LABELS = {
+    "automatic": "auto",
+    "semiautomatic": "semi",
+    "manual": "manual",
+}
+
+
+def _mode_path(path: Path, mode: str) -> Path:
+    try:
+        label = DROGUE_MODE_LABELS[mode]
+    except KeyError as exc:
+        raise ValueError(f"Unsupported drogue workflow mode: {mode!r}") from exc
+    return path.with_name(f"{path.stem}_{label}{path.suffix}")
 
 
 def _keys(mapping: Any, allowed: set[str], name: str) -> dict:
@@ -28,15 +42,22 @@ class DrogueWorkflowConfig:
     review_output: Path
     missing_value: float
     analysis_cutoff_margin_hours: float
-    review_zoom_window: str
     detection: DrogueDetectionConfig
+
+    def for_mode(self, mode: str) -> "DrogueWorkflowConfig":
+        """Return independent automatic/review paths for a unified CLI mode."""
+        return replace(
+            self,
+            automatic_output=_mode_path(self.automatic_output, mode),
+            review_output=_mode_path(self.review_output, mode),
+        )
 
 
 def load_drogue_config(path: str | Path) -> DrogueWorkflowConfig:
     path = Path(path).resolve()
     with path.open(encoding="utf-8-sig") as stream:
         data = yaml.safe_load(stream)
-    data = _keys(data, {"experiment", "input", "output", "processing", "detection", "review"},
+    data = _keys(data, {"experiment", "input", "output", "processing", "detection"},
                  "configuration")
     if data.get("experiment") != "arcterx":
         raise ValueError("experiment must be arcterx")
@@ -44,10 +65,9 @@ def load_drogue_config(path: str | Path) -> DrogueWorkflowConfig:
     output = _keys(data.get("output", {}), {"automatic", "review"}, "output")
     processing = _keys(
         data.get("processing", {}),
-        {"missing_value", "analysis_cutoff_margin_hours", "analysis_safety_margin_hours"},
+        {"missing_value", "analysis_cutoff_margin_hours"},
         "processing",
     )
-    review = _keys(data.get("review", {}), {"zoom_window"}, "review")
     detection_data = _keys(data.get("detection", {}),
                            {field.name for field in fields(DrogueDetectionConfig)}, "detection")
 
@@ -61,31 +81,18 @@ def load_drogue_config(path: str | Path) -> DrogueWorkflowConfig:
     if not isinstance(pattern, str) or not pattern or Path(pattern).is_absolute() or ".." in Path(pattern).parts:
         raise ValueError("input.pattern must be a nonempty relative glob without '..'")
     missing = processing.get("missing_value", -999)
-    if {"analysis_cutoff_margin_hours", "analysis_safety_margin_hours"} <= set(processing):
-        raise ValueError(
-            "Use only processing.analysis_cutoff_margin_hours; "
-            "analysis_safety_margin_hours is a legacy alias"
-        )
-    margin = processing.get(
-        "analysis_cutoff_margin_hours", processing.get("analysis_safety_margin_hours", 24)
-    )
+    margin = processing.get("analysis_cutoff_margin_hours", 24)
     if (isinstance(missing, bool) or not isinstance(missing, (int, float))
             or not math.isfinite(missing)):
         raise ValueError("processing.missing_value must be finite")
     if (isinstance(margin, bool) or not isinstance(margin, (int, float))
             or not math.isfinite(margin) or margin < 0):
         raise ValueError("processing.analysis_cutoff_margin_hours must be finite and nonnegative")
-    zoom = review.get("zoom_window", "3D")
-    try:
-        if pd.Timedelta(zoom) <= pd.Timedelta(0):
-            raise ValueError
-    except (TypeError, ValueError) as exc:
-        raise ValueError("review.zoom_window must be a positive duration") from exc
     automatic = resolved(output.get("automatic"), "output.automatic")
     manual = resolved(output.get("review"), "output.review")
     if automatic == manual:
         raise ValueError("Automatic and manual-review outputs must be separate")
     return DrogueWorkflowConfig(
         resolved(source.get("directory"), "input.directory"), pattern, automatic, manual,
-        float(missing), float(margin), str(zoom), DrogueDetectionConfig.from_dict(detection_data),
+        float(missing), float(margin), DrogueDetectionConfig.from_dict(detection_data),
     )

@@ -45,7 +45,12 @@ def _optional_vector(track: dict, field: str, length: int, missing_value: float)
     return values
 
 
-def read_raw_drogue_signals(path: str | Path, *, missing_value: float = -999) -> RawDrogueSignals:
+def read_raw_drogue_signals(
+    path: str | Path,
+    *,
+    missing_value: float = -999,
+    include_hull_temperature: bool = True,
+) -> RawDrogueSignals:
     """Map raw ARCTERX names to the generic detector inputs without loss metadata."""
     path = Path(path).resolve()
     loaded = read_matlab(path)
@@ -71,7 +76,10 @@ def read_raw_drogue_signals(path: str | Path, *, missing_value: float = -999) ->
     if len(ttff) != len(time):
         raise ValueError(f"GpsTTFF length {len(ttff)} does not match ObsTimestamp length {len(time)}")
     strain = _optional_vector(track, "Drogue", len(time), missing_value)
-    temperature = _optional_vector(track, "HullTemperature", len(time), missing_value)
+    temperature = (
+        _optional_vector(track, "HullTemperature", len(time), missing_value)
+        if include_hull_temperature else None
+    )
     order = np.argsort(time, kind="stable")
     return RawDrogueSignals(
         platform, time[order], ttff[order],

@@ -1,166 +1,166 @@
-# Standalone drogue-loss detection and review
+# Drogue-loss detection and review
 
-This workflow estimates physical drogue-loss times from raw `GpsTTFF` and
-optional `Drogue` strain. Hull temperature is manual-review context only. It
-never reads or plots supplied ARCTERX `drogue_off` values or another reference
-loss date.
+The drogue workflow estimates physical loss times independently from raw
+`GpsTTFF` and `Drogue` strain, combines clear evidence, and optionally records
+human decisions. It never reads or plots supplied ARCTERX `drogue_off` dates.
+Hull temperature is not part of detection or interactive review.
+
+## One command, three modes
+
+Run from the repository root with exactly one mode:
+
+```powershell
+drifterlab-drogue configs/arcterx/drogue_detection.local.yml --automatic
+drifterlab-drogue configs/arcterx/drogue_detection.local.yml --semiautomatic
+drifterlab-drogue configs/arcterx/drogue_detection.local.yml --manual
+```
+
+- `--automatic` creates its automatic Parquet and does not open a GUI.
+- `--semiautomatic` reuses its existing automatic Parquet when available, then
+  reviews unresolved, conflicting, or stale platforms.
+- `--manual` reuses its existing automatic Parquet when available and resumes
+  at the first undecided or stale platform across the complete population.
+
+Add `--overwrite` to regenerate only the selected mode's automatic Parquet.
+Automatic mode refuses to replace an existing result without this flag. A
+completed reviewer mode reports that no work remains and does not open a GUI.
+
+`--mode automatic|semiautomatic|manual` is equivalent. The configuration's
+`experiment` field dispatches to the experiment adapter. Only `arcterx` is
+currently implemented; other values fail explicitly.
+
+The old `drifterlab-detect-arcterx-drogue` and
+`drifterlab-review-arcterx-drogue` entry points remain deprecated compatibility
+commands. They are not the normal workflow.
+
+## Current scientific methods
+
+TTFF uses raw integer event counts in fixed value and time bins. At each time-bin
+boundary it tests adequate pre-activity, a quiet 48-hour forward window,
+120-hour persistence, and later reactivation. Each value bin contributes at
+most one last stable cessation date. Agreement across at least two value bins
+within the configured tolerance produces a clear TTFF date. Counts are never
+normalized across value bins; all valid TTFF observations separately establish
+coverage.
+
+Strain uses one authoritative robust method. Finite observations are aggregated
+into non-overlapping UTC-aligned block medians. Every downward split with enough
+valid blocks on both sides is fitted with two medians and an L1 objective. The
+best split is classified using absolute drop, relative drop, fit improvement,
+and comparable well-separated alternatives. Missing blocks are not filled.
+
+Both components expose the common statuses:
 
 ```text
-raw TTFF and strain
-    -> TTFF per-bin activity cessation + strain rolling-median step
-    -> strain-primary combination rule
-    -> manual review
-    -> reviewed_drogue_loss_time
-    -> analysis_cutoff_time = reviewed time - configured margin
+clear  weak  ambiguous  no_change  insufficient_data
 ```
 
-## Run
+Detailed TTFF reasons remain available in the automatic evidence.
 
-Set the raw and output paths in `configs/arcterx/drogue_detection.local.yml`.
-After a detector-method change, regenerate the automatic table explicitly:
+## Combination
 
-```powershell
-drifterlab-detect-arcterx-drogue configs/arcterx/drogue_detection.local.yml --overwrite
-```
+- Two clear dates within 48 hours: `clear_agreement`, using the earlier date
+  without averaging; source `ttff+strain`.
+- Two clear dates outside 48 hours: `signal_conflict`, with no automatic date.
+- One clear component plus `no_change` or `insufficient_data` from the other:
+  `clear_ttff_only` or `clear_strain_only`.
+- Other weak, ambiguous, or unresolved combinations: `unresolved`, with no
+  automatic date.
 
-Generate one diagnostic figure:
+The tolerance remains configurable. Neither detector tunes or moves the other.
 
-```powershell
-python scripts/diagnostics/drogue_signals.py configs/arcterx/drogue_detection.local.yml --output data/diagnostics/drogue_signals --platform 300534061906090 --no-population-figures
-```
+## Reviewer
 
-Launch or resume review:
+The compact reviewer has two scientific panels:
 
-```powershell
-drifterlab-review-arcterx-drogue configs/arcterx/drogue_detection.local.yml
-```
+1. positive raw TTFF on a logarithmic scale;
+2. raw strain, robust block medians, and fitted pre/post levels.
 
-The reviewer retains Accept auto, Set manual, No loss, Uncertain, time
-adjustments, navigation, save, and resume behavior. The automatic Parquet can be
-replaced explicitly, but the review CSV is never overwritten by detection. If a
-saved decision refers to a superseded automatic time, review startup stops with
-an incompatibility error. Start a new review iteration or migrate it explicitly;
-do not silently reuse the old decision.
+Both panels show component dates, the combined or selected physical loss date,
+and the analysis cutoff. Controls are `Accept auto`, `Set manual`, `Not lost`,
+`Uncertain`, one/six-hour nudges, navigation, quit, and a per-platform
+cutoff margin.
 
-## TTFF per-bin cessation method
+The four decision controls save atomically and move to the next unfinished
+platform. Date nudges remain drafts until `Set manual` is pressed. `Next` skips
+without recording a decision. At the end of the table the reviewer returns to
+any skipped or stale platform and closes only after a fresh check finds no work.
+Changing the margin of an existing decision saves immediately.
 
-Fixed temporal intervals retain the raw integer event count for every configured
-TTFF value bin. Counts are never normalized across value bins. `N_valid` and
-timestamp coverage are calculated separately from every finite, non-sentinel
-TTFF observation. Therefore values below an excluded first value edge still
-establish telemetry availability even though they do not enter a configured
-event bin. The upper value bin remains open (`>= last_edge`).
+The reviewer reuses its mode's automatic Parquet. It does not rerun
+TTFF or strain detection, does not compute detailed TTFF-bin plots, and does not
+extract hull temperature. Raw TTFF/strain and display block medians are cached
+per platform during the session. Date or margin edits redraw only vertical
+overlays and text.
 
-At each temporal-bin boundary `t`, a value bin first has to establish active
-baseline behavior in `[t-168h, t)`: at least 12 events, at least three occupied
-temporal bins, and at least 75% timestamp coverage. Its baseline rate is raw
-events per observed coverage hour. The forward `[t, t+48h)` window is quiet when
-it contains at most one event or its event rate is at most 10% of the baseline
-rate. The detector then requires every complete 48-hour forward window through
-`t+120h` to be adequately covered and quiet. A record that does not physically
-reach that horizon yields `insufficient_followup`.
-
-After the persistence horizon, every complete, adequately covered 48-hour
-window through the observed record is checked for reactivation. Inadequately
-covered late windows provide no evidence either way. A candidate is rejected if
-an observed window exceeds both the one-event allowance and the 10% rate limit.
-Candidates are searched newest to oldest, so an early lull followed by activity
-is rejected and a later final cessation supplies the reported bin boundary.
-
-Each eligible value bin contributes at most one stable-drop date. Dates form
-agreement groups only when their complete span is within 48 hours. The largest
-group wins, with a later median breaking size ties. Two or more agreeing bins
-produce `clear` unless another disjoint group also contains at least two bins.
-A single stable bin is `weak`; conflicting stable dates are `ambiguous`.
-Singleton outliers remain in the detailed in-memory evidence but do not
-invalidate a clear group. Other TTFF statuses are `insufficient_followup`,
-`insufficient_data`, `none`, and `unavailable`.
-
-## Strain rolling-median step method
-
-Strain event selection is separate from the TTFF count method. Raw strain is
-smoothed with a centered, time-based rolling median. At each observed candidate
-time, the detector compares the median of that smoothed signal in configured
-pre- and post-windows:
+Review statuses are:
 
 ```text
-drop_absolute   = median_before - median_after
-drop_relative   = drop_absolute / max(abs(median_before), relative_floor)
-normalized_drop = drop_absolute / max(MAD_before, MAD_after, variability_floor)
+accepted_auto  manual_date  not_lost  uncertain
 ```
 
-A candidate must pass the configured absolute, relative, and normalized
-thresholds. The later persistence window must remain within
-`persistence_tolerance` of the new post-change level and must retain the required
-drop from the pre-change level. Thus an isolated spike is suppressed by the
-rolling median, while a temporary dip that returns to the earlier level is
-rejected. Separate qualifying episodes produce `ambiguous`; a qualifying event
-without a complete persistence interval produces `insufficient_followup`.
+Changing the margin never changes a component, automatic, or reviewed physical
+date. `not_lost` and `uncertain` both have no cutoff but retain distinct meaning.
 
-The pre/post q25-q75 values are retained for visual context only. They do not
-form a competing event selector.
+## Products
 
-## Signal combination
+The configured output names are bases. The unified command inserts a mode label
+before each extension:
 
-- A unique clear persistent strain step supplies the physical event
-  time.
-- A clear TTFF cessation raises confidence when suppression remains adequately
-  observed through the strain change. No date averaging is used.
-- Clear strain without clear TTFF remains a medium-confidence strain candidate.
-- Missing or unclear strain with clear sustained TTFF produces a provisional
-  medium-confidence TTFF candidate.
-- Ambiguous components or non-overlapping clear changes produce no automatic
-  date and require review.
-- Neither clear produces no automatic date.
+```text
+auto_drogue_loss_auto.parquet
+auto_drogue_loss_semi.parquet     drogue_review_semi.csv
+auto_drogue_loss_manual.parquet   drogue_review_manual.csv
+```
 
-## Exploratory defaults
+The modes are independent: switching mode neither reads nor overwrites another
+mode's files. Existing unsuffixed products are not migrated automatically. The
+deprecated experiment-specific commands retain their unsuffixed paths for
+compatibility.
 
-TTFF value-bin definitions remain configurable and unchanged. The production
-cessation defaults are:
+The automatic Parquet contains one row per platform with component status/date
+and concise evidence, the combined status/source/date, default cutoff margin and
+cutoff, source provenance, and exact effective configuration. It does not store
+per-bin time series or strain objective curves.
 
-| TTFF setting | Default |
-| --- | ---: |
-| scale / first edge / factor / last edge | log / 10 / 1.5 / 1000 |
-| include lower-than-first bin | true |
-| temporal-bin cadence | 12 h |
-| forward count window | 48 h |
-| pre-activity / persistence | 168 / 120 h |
-| minimum pre events / occupied temporal bins | 12 / 3 |
-| minimum coverage | 0.75 |
-| quiet rate fraction / event allowance | 0.10 / 1 |
-| reactivation window / agreement tolerance | 48 / 48 h |
-| minimum agreeing value bins | 2 |
+The review CSV contains only actual human rows. It stores TTFF/strain/automatic
+snapshots needed to detect stale automatic results, the human status and
+physical date, selected margin and cutoff, reason, timestamp, and source hash.
+Regenerating automatic results never overwrites the corresponding review CSV.
+Changed automatic snapshots are marked stale and returned to the review queue;
+changed raw-source hashes remain hard errors.
 
-The provisional strain-step defaults are:
+## Downstream resolver
 
-| Strain setting | Default |
-| --- | ---: |
-| rolling window | 12 h |
-| pre / post / persistence | 48 / 48 / 48 h |
-| clear absolute / relative / normalized drop | 2.0 / 0.10 / 1.5 |
-| weak absolute / relative / normalized drop | 1.0 / 0.05 / 0.75 |
-| relative / variability floor | 1.0 / 1.0 |
-| persistence tolerance | 1.0 |
+`drifterlab.qc.resolve_drogue_decision(automatic_row, review_row)` computes the
+effective state without writing another table:
 
-Temperature background/variability windows are 24/6 hours. The analysis cutoff
-margin is 24 hours. These parameters are provisional smoke-test defaults, not
-calibrated scientific thresholds. TTFF bin sensitivity and strain window/drop
-thresholds must be assessed on representative tracks without reference dates
-before downstream validation.
+- a human row takes precedence;
+- `accepted_auto` and `manual_date` resolve to `lost` with the reviewed physical
+  date and reviewed margin;
+- without a human row, a dated automatic result resolves to `lost` using the
+  configured default margin;
+- `not_lost` remains `not_lost`;
+- human `uncertain`, conflicts, and unresolved automatic cases remain
+  `uncertain` and never become silently drogued-through-end decisions.
 
-## Outputs
+The cutoff is always `physical_loss_time - margin`.
 
-- `auto_drogue_loss.parquet`: one row per raw file with independent component
-  dates/statuses, concise TTFF eligible/stable/agreeing-bin counts, consensus
-  span, agreeing-bin pre/post event totals and persistence coverage, strain
-  absolute/relative/normalized drops and robust levels, combined date/confidence,
-  source hash, and exact configuration JSON. Detector changes require explicit
-  regeneration because this automatic schema is versioned by its content.
-- `drogue_review.csv`: explicit review decision, automatic time visible during
-  review, reviewed physical time, and separate analysis cutoff.
-- Existing per-drifter diagnostic PNGs: raw TTFF, integer value-bin count
-  heatmap, per-bin forward counts/drop markers/statuses, `N_valid`, availability
-  shading, rolling strain with descriptive quantiles, strain-step metrics,
-  temperature context, and automatic date lines.
+## Configuration shape
 
-No trajectory Zarr is modified and no observation is deleted.
+The production YAML contains only:
+
+```text
+experiment
+input
+output
+processing.missing_value
+processing.analysis_cutoff_margin_hours
+detection.ttff.binning
+detection.ttff.comparison
+detection.strain
+detection.combination.agreement_tolerance_hours
+```
+
+There is no strain method switch, temperature detector configuration, or review
+zoom configuration. Only settings used by the current detectors are accepted.

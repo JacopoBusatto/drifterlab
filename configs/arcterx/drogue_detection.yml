@@ -33,24 +33,18 @@ detection:
       agreement_tolerance_hours: 48
       min_agreeing_bins: 2
 
-  # Rolling-median persistent downward-step detector for strain.
+  # Robust one-change-point detector on non-overlapping strain block medians.
   strain:
-    window: 12h
-    pre_window: 48h
-    post_window: 48h
-    persistence_window: 48h
+    aggregation_hours: 6
+    min_samples_per_block: 3
+    minimum_side_duration_hours: 72
     minimum_drop_absolute: 2.0
-    minimum_drop_relative: 0.10
-    minimum_normalized_drop: 1.5
-    weak_drop_absolute: 1.0
-    weak_drop_relative: 0.05
-    weak_normalized_drop: 0.75
+    minimum_drop_relative: 0.08
+    minimum_fit_improvement: 0.10
     relative_floor: 1.0
-    variability_floor: 1.0
-    persistence_tolerance: 1.0
+    ambiguity:
+      comparable_cost_fraction: 0.02
+      minimum_separation_hours: 48
 
-  # Supporting context only; temperature never changes the automatic decision.
-  temperature_background_window: 24h
-  temperature_variability_window: 6h
-review:
-  zoom_window: 3D
+  combination:
+    agreement_tolerance_hours: 48
