@@ -180,8 +180,9 @@ Reconstructed coordinate range flags and masks remain representation-specific.
 
 ## Standalone drogue-loss detection and review
 
-The drogue QC stage reads raw `ObsTimestamp`, `GpsTTFF`, and optional `Drogue`
-strain. A raw per-value-bin count method detects
+The generic drogue workflow reads source files through a configured adapter.
+The current `microsvp_mat` reader maps `ObsTimestamp`, `GpsTTFF`, and optional
+`Drogue` strain into the common raw-signal schema. A raw per-value-bin method detects
 the last persistent cessation of TTFF activity. An independent robust
 two-regime L1 detector fits a single downward change to non-overlapping strain
 block medians. A small decision layer accepts agreeing clear dates, permits one
@@ -201,11 +202,13 @@ drifterlab-drogue configs/arcterx/drogue_detection.local.yml --manual
 ```
 
 Automatic mode has no GUI, semiautomatic mode reviews only problematic cases,
-and manual mode considers every platform. Each mode has independent files,
-formed by adding `_auto`, `_semi`, or `_manual` to the configured base name.
-Manual and semiautomatic runs reuse their own existing automatic results and
-resume at the first unfinished review. Add `--overwrite` to recompute the
-selected mode's automatic results. Review decisions save immediately.
+and manual mode considers every platform. All modes share the configured
+automatic Parquet and review CSV. Manual and semiautomatic runs reuse existing
+automatic results and resume at the first unfinished review. Add `--overwrite`
+to recompute the automatic results without deleting human decisions. Review
+decisions save immediately. A different source schema requires only another
+reader returning the generic drogue signals; the science and reviewer remain
+unchanged.
 
 ## Existing trajectory-ingestion drogue decisions
 

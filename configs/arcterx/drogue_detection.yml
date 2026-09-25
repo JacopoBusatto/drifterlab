@@ -1,5 +1,5 @@
-experiment: arcterx
 input:
+  reader: microsvp_mat
   # Edit this path or copy this file to drogue_detection.local.yml.
   directory: ../../data/source/ARCTERX/Data/Raw/MicroSVP
   pattern: "*.mat"

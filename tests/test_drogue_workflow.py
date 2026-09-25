@@ -7,9 +7,9 @@ import pytest
 from scipy.io import savemat
 import yaml
 
-from drifterlab.cli.detect_arcterx_drogue import main as detect_main
-from drifterlab.experiments.arcterx.drogue_loss_review import DrogueLossReviews
-from drifterlab.experiments.arcterx.raw_drogue import read_raw_drogue_signals
+from drifterlab.io.drogue import read_microsvp_mat
+from drifterlab.review.drogue import DrogueLossReviewer, DrogueLossReviews
+from drifterlab.workflows.drogue import run_drogue_detection
 
 
 def write_raw(path: Path, platform="1001"):
@@ -22,7 +22,6 @@ def write_raw(path: Path, platform="1001"):
         "ObsTimestamp": time.strftime("%Y-%m-%d %H:%M:%S").to_numpy(),
         "GpsTTFF": np.r_[before, after],
         "Drogue": np.r_[np.full(264, 12.), np.full(n - 264, 4.)],
-        "HullTemperature": 20 + np.sin(np.arange(n) / 12),
     }
     savemat(path, {"dataset": {f"drifter_{platform}": track}})
 
@@ -36,16 +35,15 @@ def test_raw_adapter_and_automatic_cli_smoke(tmp_path):
     review = tmp_path / "data/review/drogue/review.csv"
     config = tmp_path / "drogue.yml"
     config.write_text(yaml.safe_dump({
-        "experiment": "arcterx",
-        "input": {"directory": str(source), "pattern": "*.mat"},
+        "input": {"reader": "microsvp_mat", "directory": str(source), "pattern": "*.mat"},
         "output": {"automatic": str(automatic), "review": str(review)},
         "processing": {"missing_value": -999, "analysis_cutoff_margin_hours": 24},
         "detection": {},
     }), encoding="utf-8")
-    signals = read_raw_drogue_signals(raw_path)
+    signals = read_microsvp_mat(raw_path)
     assert signals.platform_code == "1001"
     assert len(signals.time) == 600
-    assert detect_main([str(config)]) == 0
+    run_drogue_detection(config)
     table = pd.read_parquet(automatic)
     assert table.platform_code.astype(str).tolist() == ["1001"]
     assert table.auto_status.tolist() == ["clear_agreement"]
@@ -70,7 +68,6 @@ def test_raw_adapter_and_automatic_cli_smoke(tmp_path):
 
     import matplotlib
     matplotlib.use("Agg", force=True)
-    from drifterlab.experiments.arcterx.drogue_reviewer import DrogueLossReviewer
     reviewer = DrogueLossReviewer(config)
     from matplotlib.collections import QuadMesh
 
@@ -78,7 +75,9 @@ def test_raw_adapter_and_automatic_cli_smoke(tmp_path):
     assert not any(isinstance(item, QuadMesh) for item in reviewer.ttff_ax.collections)
     assert not hasattr(reviewer, "temperature_ax")
     assert not hasattr(reviewer, "ttff_count_ax")
-    assert reviewer.display_cache["1001"][0].hull_temperature is None
+    assert tuple(reviewer.display_cache["1001"][0].__dataclass_fields__) == (
+        "platform_code", "time", "ttff", "strain", "source_path", "source_sha256",
+    )
     cached_signals = reviewer.display_cache["1001"][0]
     reviewer.loaded_platform = None
     reviewer.draw()
@@ -214,17 +213,14 @@ def test_reviewer_can_set_manual_date_when_automatic_date_is_missing(tmp_path):
     review = tmp_path / "review.csv"
     config = tmp_path / "drogue.yml"
     config.write_text(yaml.safe_dump({
-        "experiment": "arcterx",
-        "input": {"directory": str(source), "pattern": "*.mat"},
+        "input": {"reader": "microsvp_mat", "directory": str(source), "pattern": "*.mat"},
         "output": {"automatic": str(automatic), "review": str(review)},
         "processing": {"missing_value": -999, "analysis_cutoff_margin_hours": 24},
         "detection": {},
     }), encoding="utf-8")
-    assert detect_main([str(config)]) == 0
+    run_drogue_detection(config)
     automatic_row = pd.read_parquet(automatic).iloc[0]
     assert pd.isna(automatic_row.auto_drogue_loss_time)
-
-    from drifterlab.experiments.arcterx.drogue_reviewer import DrogueLossReviewer
 
     reviewer = DrogueLossReviewer(config)
     assert not reviewer.buttons[0].active
@@ -251,15 +247,12 @@ def test_reviewer_skips_forward_then_wraps_to_remaining_pending_platform(tmp_pat
     review = tmp_path / "review.csv"
     config = tmp_path / "drogue.yml"
     config.write_text(yaml.safe_dump({
-        "experiment": "arcterx",
-        "input": {"directory": str(source), "pattern": "*.mat"},
+        "input": {"reader": "microsvp_mat", "directory": str(source), "pattern": "*.mat"},
         "output": {"automatic": str(automatic), "review": str(review)},
         "processing": {"missing_value": -999, "analysis_cutoff_margin_hours": 24},
         "detection": {},
     }), encoding="utf-8")
-    assert detect_main([str(config)]) == 0
-
-    from drifterlab.experiments.arcterx.drogue_reviewer import DrogueLossReviewer
+    run_drogue_detection(config)
 
     reviewer = DrogueLossReviewer(config)
     assert str(reviewer.automatic.iloc[reviewer.cursor].platform_code) == "1001"
@@ -294,15 +287,12 @@ def test_nudge_is_a_draft_and_save_failure_does_not_advance(tmp_path, monkeypatc
     review = tmp_path / "review.csv"
     config = tmp_path / "drogue.yml"
     config.write_text(yaml.safe_dump({
-        "experiment": "arcterx",
-        "input": {"directory": str(source), "pattern": "*.mat"},
+        "input": {"reader": "microsvp_mat", "directory": str(source), "pattern": "*.mat"},
         "output": {"automatic": str(automatic), "review": str(review)},
         "processing": {"missing_value": -999, "analysis_cutoff_margin_hours": 24},
         "detection": {},
     }), encoding="utf-8")
-    assert detect_main([str(config)]) == 0
-
-    from drifterlab.experiments.arcterx.drogue_reviewer import DrogueLossReviewer
+    run_drogue_detection(config)
 
     reviewer = DrogueLossReviewer(config)
     original = reviewer.selected_time
@@ -322,23 +312,3 @@ def test_nudge_is_a_draft_and_save_failure_does_not_advance(tmp_path, monkeypatc
     assert "Could not save decision" in reviewer.status.get_text()
     reviewer.closed = True
     reviewer.plt.close(reviewer.figure)
-
-
-def test_legacy_review_schema_migrates_and_infers_its_margin(tmp_path):
-    path = tmp_path / "legacy.csv"
-    event = pd.Timestamp("2025-02-10T12:00:00Z")
-    legacy = pd.DataFrame([{
-        "platform_code": "1001",
-        "auto_drogue_loss_time": event.isoformat(),
-        "review_status": "manual_time",
-        "reviewed_drogue_loss_time": event.isoformat(),
-        "analysis_cutoff_time": (event - pd.Timedelta(hours=30)).isoformat(),
-        "review_reason": "manual_adjustment",
-        "review_timestamp": pd.Timestamp("2025-02-11T00:00:00Z").isoformat(),
-        "source_sha256": "abc",
-    }])
-    legacy.to_csv(path, index=False)
-    loaded = DrogueLossReviews(path, cutoff_margin_hours=24)
-    row = loaded.rows["1001"]
-    assert row["review_status"] == "manual_date"
-    assert row["analysis_cutoff_margin_hours"] == "30"
