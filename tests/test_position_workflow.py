@@ -125,13 +125,11 @@ def test_automatic_writes_one_platform_file_with_complete_metadata_and_reuses(po
         for event in provenance["event_catalog"]
     )
     effective = provenance["effective_configuration"]["position"]
-    assert effective["one_sided_spike_window_points"] == 15
-    assert effective["one_sided_spike_min_samples"] == 8
-    assert effective["one_sided_spike_residual_z_threshold"] == 6.0
-    assert effective["one_sided_spike_residual_scale_floor_m"] == 10.0
-    assert effective["one_sided_spike_bridge_z_max"] == 3.0
-    assert effective["one_sided_spike_bridge_speed_scale_floor_m_s"] == .05
-    assert effective["one_sided_spike_score_margin_z"] == 2.0
+    assert effective["local_speed_window_points"] == 15
+    assert effective["endpoint_speed_min_samples"] == 8
+    assert effective["bridge_speed_warning_z"] == 3.0
+    assert effective["local_speed_scale_floor_m_s"] == .05
+    assert effective["endpoint_speed_score_margin_z"] == 2.0
     assert effective["max_automatic_removal_points"] == 5
     assert result.summary_path.exists()
     summary = pd.read_csv(result.summary_path)
@@ -144,17 +142,17 @@ def test_automatic_writes_one_platform_file_with_complete_metadata_and_reuses(po
     assert any("Reusing position QC" in message for message in messages)
 
 
-def test_multiple_platforms_are_independent_and_legacy_monolith_is_ignored(tmp_path):
+def test_multiple_platforms_are_independent_and_unrelated_output_is_untouched(tmp_path):
     _, _, config_path = make_inputs(tmp_path, ("1001", "1002"))
     config = load_position_config(config_path)
     config.output_directory.mkdir(parents=True)
-    legacy = config.output_directory / "position_qc.parquet"
-    legacy.write_bytes(b"legacy monolith")
-    before = legacy.read_bytes()
+    unrelated = config.output_directory / "position_qc.parquet"
+    unrelated.write_bytes(b"unrelated output")
+    before = unrelated.read_bytes()
     result = run_position_workflow(config_path, "automatic")
     assert [path.name for path in result.files] == ["1001.parquet", "1002.parquet"]
     assert all(path.exists() for path in result.files)
-    assert legacy.read_bytes() == before
+    assert unrelated.read_bytes() == before
 
 
 def test_review_change_rebuilds_only_affected_platform(tmp_path):

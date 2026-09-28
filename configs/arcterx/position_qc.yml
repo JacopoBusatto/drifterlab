@@ -26,16 +26,12 @@ position_qc:
   max_local_gap_seconds: 1800
   gap_tolerance_seconds: 1
   speed_threshold_m_s: 3.0
-  # Deprecated compatibility alias; the explicit automatic limit is used below.
-  max_bridge_skip_points: 3
   max_automatic_removal_points: 5
-  one_sided_spike_window_points: 15
-  one_sided_spike_min_samples: 8
-  one_sided_spike_residual_z_threshold: 6.0
-  one_sided_spike_residual_scale_floor_m: 10.0
-  one_sided_spike_bridge_z_max: 3.0
-  one_sided_spike_bridge_speed_scale_floor_m_s: 0.05
-  one_sided_spike_score_margin_z: 2.0
+  local_speed_window_points: 15
+  endpoint_speed_min_samples: 8
+  bridge_speed_warning_z: 3.0
+  local_speed_scale_floor_m_s: 0.05
+  endpoint_speed_score_margin_z: 2.0
 review:
   context_points: 12
   merge_gap_edges: 2

@@ -248,7 +248,7 @@ def test_unique_one_sided_spike_rejects_the_interpolation_outlier(kind):
 def test_one_sided_spike_needs_local_samples_and_respects_human_protection():
     sparse = run_native_position_qc(
         one_sided_spike_track(), drogue(),
-        position_config=NativePositionConfig(one_sided_spike_min_samples=100),
+        position_config=NativePositionConfig(endpoint_speed_min_samples=100),
     )
     assert not sparse.point_auto_reason.eq(
         "unique_endpoint_speed_cure"

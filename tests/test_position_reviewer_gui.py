@@ -961,14 +961,14 @@ def test_q_then_restart_cannot_resume_in_completed_block(tmp_path):
     plt.close(resumed.figure)
 
 
-def test_legacy_corrupt_and_source_mismatched_sessions_fall_back(tmp_path):
+def test_unsupported_corrupt_and_source_mismatched_sessions_fall_back(tmp_path):
     trajectory, frame, _temporal, _event_type = representative_case("persistent")
     event_id = frame.loc[frame.local_event_id.astype(str).ne(""), "local_event_id"].iloc[0]
     session = tmp_path / "cursor.json"
     session.write_text(f'{{"event_id": "{event_id}", "point_index": 1}}', encoding="utf-8")
-    legacy = make_reviewer(tmp_path, trajectory, frame, session_path=session)
-    assert "legacy" in legacy.status_text.get_text().lower()
-    plt.close(legacy.figure)
+    unsupported = make_reviewer(tmp_path, trajectory, frame, session_path=session)
+    assert "unsupported schema" in unsupported.status_text.get_text().lower()
+    plt.close(unsupported.figure)
     session.write_text("not-json", encoding="utf-8")
     corrupt = make_reviewer(tmp_path, trajectory, frame, session_path=session)
     assert "unreadable" in corrupt.status_text.get_text()

@@ -149,11 +149,6 @@ def load_position_config(path: str | Path) -> PositionWorkflowConfig:
                                {field.name for field in fields(TemporalSegmentConfig)}, "temporal_segments")
     position_values = _mapping(data.get("position_qc", {}),
                                {field.name for field in fields(NativePositionConfig)}, "position_qc")
-    if ("max_automatic_removal_points" not in position_values
-            and "max_bridge_skip_points" in position_values):
-        position_values["max_automatic_removal_points"] = position_values[
-            "max_bridge_skip_points"
-        ]
     review_values = _mapping(data.get("review", {}),
                              {field.name for field in fields(PositionReviewConfig)}, "review")
     temporal = TemporalSegmentConfig(**temporal_values)
@@ -168,9 +163,8 @@ def load_position_config(path: str | Path) -> PositionWorkflowConfig:
     if not 0 < temporal.fragment_max_observation_fraction <= 1 or not 0 < temporal.fragment_max_duration_fraction <= 1:
         raise ValueError("Fragment fractions must be in (0, 1]")
     position_integer_fields = {
-        "max_bridge_skip_points", "max_automatic_removal_points",
-        "one_sided_spike_window_points",
-        "one_sided_spike_min_samples",
+        "max_automatic_removal_points", "local_speed_window_points",
+        "endpoint_speed_min_samples",
     }
     for name, value in asdict(position).items():
         if name in position_integer_fields:
@@ -393,141 +387,6 @@ def _write_run_summary(
     finally:
         temporary.unlink(missing_ok=True)
     return path, aggregate
-
-
-def _run_monolithic_position_workflow_legacy(
-    config_path: str | Path, mode: str, *, overwrite: bool = False,
-    progress: Callable[[str], None] | None = None,
-    reviewer_factory: Callable[..., Any] | None = None,
-) -> pd.DataFrame:
-    if mode not in {"automatic", "semiautomatic", "manual"}:
-        raise ValueError(f"Unsupported position workflow mode: {mode!r}")
-    report = progress or (lambda message: None)
-    config = load_position_config(config_path)
-    if not config.input_directory.is_dir():
-        raise ValueError(f"Input directory does not exist: {config.input_directory}")
-    files = sorted(path for path in config.input_directory.glob(config.input_pattern) if path.is_file())
-    if not files:
-        raise ValueError(f"No files match {config.input_pattern!r} in {config.input_directory}")
-    reader = get_position_reader(config.input_reader)
-    trajectories: dict[str, NativeTrajectory] = {}
-    for path in files:
-        trajectory = reader(path, **config.input_options)
-        if trajectory.platform_code in trajectories:
-            raise ValueError(f"Duplicate position platform: {trajectory.platform_code}")
-        trajectories[trajectory.platform_code] = trajectory
-    source_hashes = {code: value.source_sha256 for code, value in trajectories.items()}
-    source_indices = {code: set(map(int, value.source_obs_index)) for code, value in trajectories.items()}
-
-    automatic = load_drogue_detection(config.drogue_automatic)
-    automatic_rows = {str(row.platform_code): row for row in automatic.itertuples()}
-    missing = set(trajectories) - set(automatic_rows)
-    if missing:
-        raise ValueError(f"Drogue automatic table is missing platforms: {sorted(missing)}")
-    for code, trajectory in trajectories.items():
-        if str(automatic_rows[code].source_sha256) != trajectory.source_sha256:
-            raise ValueError(f"Drogue/position source hash mismatch for {code}")
-    drogue_reviews = DrogueLossReviews(config.drogue_review)
-    drogue_reviews.validate_against_automatic(automatic)
-    deployments, deployment_hash = load_deployments(config.deployment_metadata)
-    unknown_deployments = set(deployments) - set(trajectories)
-    if unknown_deployments:
-        raise ValueError(f"Deployment metadata contains unknown platforms: {sorted(unknown_deployments)}")
-    reviews = PositionReviews(config.review_output)
-    reviews.validate_sources(source_hashes, source_indices)
-    config_hash = position_config_sha256(config)
-    dependencies = {
-        "schema_version": POSITION_QC_SCHEMA_VERSION,
-        "algorithm_version": POSITION_QC_ALGORITHM_VERSION,
-        "drifterlab_version": __version__,
-        "effective_configuration": config.effective(),
-        "config_sha256": config_hash, "review_sha256": reviews.sha256,
-        "drogue_automatic_sha256": file_sha256(config.drogue_automatic),
-        "drogue_review_sha256": file_sha256(config.drogue_review),
-        "deployment_sha256": deployment_hash, "source_sha256": source_hashes,
-        "source_provenance": {
-            code: {"path": str(value.source_path), "sha256": value.source_sha256}
-            for code, value in trajectories.items()
-        },
-    }
-    if config.automatic_output.exists() and not overwrite and _metadata(config.automatic_output) == dependencies:
-        report(f"Reusing compatible position QC: {config.automatic_output}")
-        table = pd.read_parquet(config.automatic_output)
-    else:
-        cache: dict[str, pd.DataFrame] = {}
-
-        def compute(code: str) -> pd.DataFrame:
-            auto = automatic_rows[code]
-            review_row = drogue_reviews.rows.get(code)
-            resolved = resolve_drogue_decision(auto, review_row,
-                                               default_margin_hours=float(auto.default_analysis_cutoff_margin_hours))
-            result = run_native_position_qc(
-                trajectories[code], resolved, deployment=deployments.get(code),
-                reviews=reviews.table(), temporal_config=config.temporal,
-                position_config=config.position, review_config=config.review,
-            )
-            cache[code] = result
-            return result
-
-        for number, code in enumerate(sorted(trajectories), start=1):
-            compute(code)
-            report(f"Position QC {number}/{len(trajectories)}")
-        table = pd.concat([cache[code] for code in sorted(cache)], ignore_index=True)
-        dependencies["review_sha256"] = reviews.sha256
-        _publish(table, config.automatic_output, dependencies)
-        report(f"Published position QC: {config.automatic_output}")
-
-    if mode == "automatic":
-        return table
-
-    # Build a live cached session. Recompute only the affected platform after a click.
-    results = {code: table[table.platform_code.astype(str) == code].copy() for code in trajectories}
-
-    def recompute(code: str) -> pd.DataFrame:
-        auto = automatic_rows[code]
-        resolved = resolve_drogue_decision(
-            auto, drogue_reviews.rows.get(code),
-            default_margin_hours=float(auto.default_analysis_cutoff_margin_hours),
-        )
-        results[code] = run_native_position_qc(
-            trajectories[code], resolved, deployment=deployments.get(code),
-            reviews=reviews.table(), temporal_config=config.temporal,
-            position_config=config.position, review_config=config.review,
-        )
-        return results[code]
-
-    checkpoint_count = 0
-    latest_snapshot = table
-
-    def checkpoint() -> pd.DataFrame:
-        nonlocal checkpoint_count, latest_snapshot
-        snapshot = pd.concat([results[code] for code in sorted(results)], ignore_index=True)
-        current = dict(dependencies)
-        current["review_sha256"] = reviews.sha256
-        _publish(snapshot, config.automatic_output, current)
-        checkpoint_count += 1
-        latest_snapshot = snapshot
-        return snapshot
-
-    if reviewer_factory is None:
-        from drifterlab.review.position import PositionReviewer
-        reviewer_factory = PositionReviewer
-    reviewer = reviewer_factory(
-        table, reviews, mode=mode, config_sha256=config_hash,
-        context_points=config.review.context_points,
-        position_config=config.position, platform_frames=results,
-        trajectory_loader=lambda code: trajectories[code],
-        recompute_platform=recompute, checkpoint=checkpoint,
-    )
-    reviewer.show()
-    # A real reviewer checkpoints from its clean-close path.  Headless/custom
-    # reviewers may simply return, so retain the workflow-level safety net
-    # without duplicating a checkpoint already performed by the UI.
-    if checkpoint_count == 0 and not getattr(reviewer, "close_handled", False):
-        checkpoint()
-    if checkpoint_count:
-        return latest_snapshot
-    return pd.concat([results[code] for code in sorted(results)], ignore_index=True)
 
 
 def run_position_workflow(

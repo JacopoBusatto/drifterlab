@@ -204,8 +204,6 @@ _EVENT_TITLES = {
 _REASON_TEXT = {
     "single_high_speed_edge_has_no_unique_bad_endpoint":
         "One high-speed edge is present, but the evidence does not identify a unique bad endpoint.",
-    "no_bidirectionally_confirmed_block_within_skip_limit":
-        "The excursion is not a uniquely confirmed short block in both scan directions.",
     "no_bidirectionally_confirmed_cure_within_timing_limit":
         "The excursion does not return to a uniquely confirmed bridge within the configured timing limit.",
     "high_speed_edge_has_untrusted_timing":
@@ -216,10 +214,6 @@ _REASON_TEXT = {
         "The exact finite longitude/latitude pair occurs more than once in eligible retained data.",
     "positive_dt_below_minimum_local_interval":
         "This observation arrived too soon after the last retained observation and was removed automatically.",
-    "bidirectional_exact_block_with_confirmed_continuations":
-        "Forward and backward recovery agree on the same skipped observations and plausible bridge.",
-    "unique_one_sided_local_residual_with_ordinary_bridge":
-        "One endpoint is a strong local interpolation-residual outlier, and only removing that endpoint restores locally ordinary motion.",
     "bidirectionally_confirmed_time_bounded_excursion_cure":
         "Forward and backward searches found the same smallest time-bounded block whose removal cures the speed anomaly.",
     "unique_endpoint_speed_cure":
@@ -232,7 +226,6 @@ _REASON_TEXT = {
 }
 
 _MANUAL_GEOMETRY_CONFIRMATION_REASONS = {
-    "unique_one_sided_local_residual_with_ordinary_bridge",
     "unique_endpoint_speed_cure",
     "bidirectionally_confirmed_time_bounded_excursion_cure",
 }
@@ -406,8 +399,6 @@ class PositionReviewer:
             self.frames = OrderedDict()
         else:
             self.frames = OrderedDict((str(code), frame) for code, frame in supplied.items())
-        # Kept only as a compatibility handle; all reviewer lookups use frames.
-        self.table = table
         self._trajectory_cache: OrderedDict[str, dict[str, Any]] = OrderedDict()
         self._platform_events: dict[str, pd.DataFrame] = {}
         if event_catalog is not None:
@@ -740,19 +731,6 @@ class PositionReviewer:
                 f" The group contains {int(first.repeated_coordinate_count)} occurrences over "
                 f"{_finite_text(first.repeat_duration_seconds, ' s')}."
             )
-        elif reason == "unique_one_sided_local_residual_with_ordinary_bridge":
-            chosen = _json_value(str(first.forward_result_json), {})
-            competitor = _json_value(str(first.backward_result_json), {})
-            baseline = chosen.get("baseline", {}) if isinstance(chosen, dict) else {}
-            explanation += (
-                f" Candidate residual {_finite_text(chosen.get('residual_m'), ' m')} "
-                f"(robust z {_finite_text(chosen.get('residual_robust_z'))}) from "
-                f"{int(baseline.get('sample_count', 0))} clean local triplets; bridge "
-                f"{_finite_text(chosen.get('bridge_speed'), ' m/s')} with robust deviation "
-                f"{_finite_text(chosen.get('bridge_speed_robust_z'))}. The competing endpoint "
-                f"has residual z {_finite_text(competitor.get('residual_robust_z'))} and bridge "
-                f"deviation {_finite_text(competitor.get('bridge_speed_robust_z'))}."
-            )
         elif reason == "unique_endpoint_speed_cure":
             chosen = _json_value(str(first.forward_result_json), {})
             competitor = _json_value(str(first.backward_result_json), {})
@@ -917,30 +895,11 @@ class PositionReviewer:
         event_id = _safe_text(saved.get("event_id"))
         matches = np.flatnonzero(self.events.event_id.astype(str).eq(event_id))
         if saved.get("schema_version") != self.SESSION_SCHEMA_VERSION:
-            if len(matches):
-                matched = int(matches[0])
-                pending = self._first_pending_index()
-                if not bool(self.events.iloc[matched].pending) and pending is not None:
-                    self.index = pending
-                    self.selected_source_obs_index = None
-                    self._resume_message = (
-                        "Saved event is complete; opened the first pending event. "
-                        "Use P to browse completed history."
-                    )
-                else:
-                    self.index = matched
-                    group = self._group_for(self.events.iloc[self.index]).sort_values(
-                        "source_obs_index", kind="stable",
-                    )
-                    try:
-                        legacy_position = int(saved.get("point_index", 0)) % max(1, len(group))
-                        self.selected_source_obs_index = int(group.iloc[legacy_position].source_obs_index)
-                    except (TypeError, ValueError, IndexError):
-                        self.selected_source_obs_index = None
-                    self._resume_message = "Restored and upgraded the legacy reviewer cursor."
-            else:
-                self.index = self._fallback_index()
-                self._resume_message = "Legacy cursor no longer matched an event; opened the next pending event."
+            self.index = self._fallback_index()
+            self._resume_message = (
+                "Saved reviewer session has an unsupported schema; "
+                "opened the next pending event."
+            )
             self._finish_restore()
             return
         platform = _safe_text(saved.get("platform_code"))
@@ -2312,106 +2271,6 @@ class PositionReviewer:
                     recenter = selected
         self._restored_draft = ""
         self.draw(recenter_source=recenter)
-
-    def _legacy_immediate_action(self, action: str) -> None:
-        if self.events.empty:
-            return
-        try:
-            self._flush_session_save()
-        except OSError as exc:
-            self._set_status(f"Decision stopped because the session could not be saved: {exc}", error=True)
-            return
-        aliases = {
-            "keep": "retain_segment" if self.events.iloc[self.index].kind == "temporal" else "keep_point",
-            "reject": "exclude_segment" if self.events.iloc[self.index].kind == "temporal" else "reject_point",
-            "uncertain": "uncertain_segment" if self.events.iloc[self.index].kind == "temporal" else "uncertain_point",
-            "accept": "accept_auto",
-        }
-        action = aliases.get(action, action)
-        event, group = self._group()
-        first = group.iloc[0]
-        platform = str(event.platform_code)
-        decision_source = "accepted_auto" if action == "accept_auto" else "manual"
-        note = None
-        original_rows = {key: dict(value) for key, value in self.reviews.rows.items()}
-        committed = False
-        try:
-            if event.kind == "temporal":
-                if action == "accept_auto":
-                    decision = _safe_text(first.temporal_auto_decision)
-                else:
-                    decision = {
-                        "retain_segment": "retain", "exclude_segment": "exclude",
-                        "uncertain_segment": "uncertain",
-                        "keep_point": "retain", "reject_point": "exclude",
-                        "uncertain_point": "uncertain",
-                    }.get(action, "")
-                if decision not in {"retain", "exclude", "uncertain"}:
-                    self._set_status("This temporal event has no concrete automatic action to accept.", error=True)
-                    return
-                self.reviews.set_segment(
-                    first, decision, decision_source=decision_source,
-                    config_sha256=self.config_sha256, note=note,
-                )
-            else:
-                point_actions = {
-                    "keep_point": "keep", "reject_point": "reject", "uncertain_point": "uncertain",
-                }
-                group_actions = {
-                    "keep_group": "keep", "reject_group": "reject", "uncertain_group": "uncertain",
-                }
-                if action in point_actions:
-                    row = self._current_row()
-                    if not self._eligible_point(row):
-                        self._set_status("The selected observation is outside point-decision scope.", error=True)
-                        return
-                    source_indices = [int(self.selected_source_obs_index)]
-                    decision = point_actions[action]
-                elif action in group_actions:
-                    if not self.presentation or not self.presentation.proposed_sources:
-                        self._set_status("This event has no exact block/group target.", error=True)
-                        return
-                    source_indices = list(self.presentation.proposed_sources)
-                    decision = group_actions[action]
-                elif action == "accept_auto":
-                    suggested = _safe_text(first.point_auto_decision) or _safe_text(first.human_auto_decision_snapshot)
-                    if suggested != "reject" or not self.presentation or not self.presentation.proposed_sources:
-                        self._set_status("This event has no concrete automatic point decision to accept.", error=True)
-                        return
-                    source_indices = list(self.presentation.proposed_sources)
-                    decision = "reject"
-                else:
-                    return
-                self.reviews.set_observations(
-                    self._frame(platform), source_indices, decision,
-                    decision_source=decision_source, config_sha256=self.config_sha256, note=note,
-                )
-            self.reviews.save()
-            committed = True
-            self._state_generation += 1
-            current_id = str(event.event_id)
-            selected = self.selected_source_obs_index
-            old_position = self.index
-            self._refresh_after_action(platform, current_id, selected, old_position)
-            self._set_status("Review CSV saved; the affected platform was recalculated in memory.")
-            self._save_session()
-        except Exception as exc:
-            if committed:
-                # The CSV contains the action.  Clean close retries its in-memory
-                # calculation before publishing the new review hash.
-                self._stale_platforms.add(platform)
-                message = f"Review was saved but platform refresh failed: {exc}"
-            else:
-                # set_observations/set_segment mutate memory before the atomic save.
-                # Restore it when persistence itself fails so a later checkpoint
-                # cannot publish decisions that never reached the authoritative CSV.
-                self.reviews.rows = original_rows
-                message = f"Review decision was not saved: {exc}"
-            self._set_status(message, error=True)
-            try:
-                self._save_session()
-            except OSError:
-                pass
 
     def _install_updated_platform(self, platform: str, updated: pd.DataFrame) -> None:
         platform = str(platform)

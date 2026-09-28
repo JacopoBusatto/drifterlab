@@ -56,29 +56,23 @@ position_qc:
   max_local_gap_seconds: 1800
   gap_tolerance_seconds: 1
   speed_threshold_m_s: 3.0
-  max_bridge_skip_points: 3
   max_automatic_removal_points: 5
-  one_sided_spike_window_points: 15
-  one_sided_spike_min_samples: 8
-  one_sided_spike_residual_z_threshold: 6.0
-  one_sided_spike_residual_scale_floor_m: 10.0
-  one_sided_spike_bridge_z_max: 3.0
-  one_sided_spike_bridge_speed_scale_floor_m_s: 0.05
-  one_sided_spike_score_margin_z: 2.0
+  local_speed_window_points: 15
+  endpoint_speed_min_samples: 8
+  bridge_speed_warning_z: 3.0
+  local_speed_scale_floor_m_s: 0.05
+  endpoint_speed_score_margin_z: 2.0
 
 review:
   context_points: 12
   merge_gap_edges: 2
 ```
 
-The `one_sided_spike_residual_*` names and `max_bridge_skip_points` remain accepted
-so existing configuration files continue to load. When the new key is absent, an
-explicit legacy `max_bridge_skip_points` value supplies
-`max_automatic_removal_points`; otherwise the new key takes precedence. Recovery
-is bounded by both this point count and elapsed time. The interpolation residual
-is evidence rather than a decision gate. `one_sided_spike_bridge_z_max` controls the
-atypical-bridge warning threshold; `one_sided_spike_score_margin_z` controls how
-clearly one curing endpoint must outperform another.
+Recovery is bounded by both `max_automatic_removal_points` and elapsed time. The
+interpolation residual remains evidence rather than a decision gate.
+`bridge_speed_warning_z` controls the atypical-bridge warning threshold;
+`endpoint_speed_score_margin_z` controls how clearly one conservative endpoint
+cure must outperform another.
 
 The optional deployment CSV must have these columns, in order:
 
@@ -249,7 +243,7 @@ panels:
    evidence highlighted;
 2. a local event map containing every displayed observation, raw geometry,
    surviving adjacency, trigger edges, bridge, anchors, decisions, and selection;
-3. a full-width legacy-style surviving-velocity view. A single steel-blue line
+3. a full-width surviving-velocity view. A single steel-blue line
    shows the current staged surviving adjacency and updates immediately after
    R/K. Each edge speed belongs to its later retained observation, so rejecting
    one point removes its incoming sample and places the recalculated bridge speed
@@ -367,7 +361,7 @@ reconciles surviving immutable event identities and then uses platform, earliest
 UTC time, and earliest source index as a deterministic chronological anchor.
 Config/review changes reconcile against the rebuilt queue. A source-hash mismatch
 rejects the saved cursor. The status line reports whether the session was resumed,
-reconciled, upgraded from the legacy `{event_id, point_index}` format, redirected
+reconciled, redirected
 from completed history, or ignored safely.
 
 Q and a normal window close commit all staged decisions, recompute each affected
@@ -438,8 +432,7 @@ preserves prior notes when changing them.
 
 The CSV is atomically replaced by N or Q. Each affected trajectory Parquet is then
 recomputed and atomically replaced independently. Unaffected files remain byte-for-
-byte unchanged. The legacy monolithic `position_qc.parquet` is ignored and never
-deleted or migrated automatically.
+byte unchanged.
 
 Algorithm version `native-position-qc-v2.5` adds the aggressive bounded automatic
 solver and policy-aware provenance. Switching between automatic and reviewer modes

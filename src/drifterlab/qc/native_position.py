@@ -36,15 +36,12 @@ class NativePositionConfig:
     max_local_gap_seconds: float = 1800.0
     gap_tolerance_seconds: float = 1.0
     speed_threshold_m_s: float = 3.0
-    max_bridge_skip_points: int = 3
     max_automatic_removal_points: int = 5
-    one_sided_spike_window_points: int = 15
-    one_sided_spike_min_samples: int = 8
-    one_sided_spike_residual_z_threshold: float = 6.0
-    one_sided_spike_residual_scale_floor_m: float = 10.0
-    one_sided_spike_bridge_z_max: float = 3.0
-    one_sided_spike_bridge_speed_scale_floor_m_s: float = .05
-    one_sided_spike_score_margin_z: float = 2.0
+    local_speed_window_points: int = 15
+    endpoint_speed_min_samples: int = 8
+    bridge_speed_warning_z: float = 3.0
+    local_speed_scale_floor_m_s: float = .05
+    endpoint_speed_score_margin_z: float = 2.0
 
 
 @dataclass(frozen=True)
@@ -535,8 +532,8 @@ def _recover(
             bridge_dt, bridge_distance, bridge_speed = values(anchor, reconnect)
             left = min(order_position[anchor], order_position[reconnect])
             right = max(order_position[anchor], order_position[reconnect])
-            lower = max(0, left - config.one_sided_spike_window_points)
-            upper = min(len(order) - 1, right + config.one_sided_spike_window_points)
+            lower = max(0, left - config.local_speed_window_points)
+            upper = min(len(order) - 1, right + config.local_speed_window_points)
             skipped = set(block["skipped"])
             samples = [
                 speed(order[position], order[position + 1])
@@ -548,7 +545,7 @@ def _recover(
             median = float(np.median(finite)) if len(finite) else np.nan
             mad = float(np.median(np.abs(finite - median))) if len(finite) else np.nan
             scale = (
-                max(1.4826 * mad, config.one_sided_spike_bridge_speed_scale_floor_m_s)
+                max(1.4826 * mad, config.local_speed_scale_floor_m_s)
                 if np.isfinite(mad) else np.nan
             )
             score = (
@@ -572,7 +569,7 @@ def _recover(
                 },
                 smoothness_score=score,
                 bridge_atypical_warning=bool(
-                    np.isfinite(score) and score > config.one_sided_spike_bridge_z_max
+                    np.isfinite(score) and score > config.bridge_speed_warning_z
                 ),
             )
 
@@ -658,7 +655,7 @@ def _endpoint_speed_cure_proposals(
         )
 
     proposals: list[tuple[tuple[int, tuple[int, ...], int], dict[str, Any], dict[str, Any]]] = []
-    window = config.one_sided_spike_window_points
+    window = config.local_speed_window_points
     for edge_position in range(2, len(order) - 3):
         u, v = order[edge_position:edge_position + 2]
         if not anomalous(u, v):
@@ -680,7 +677,7 @@ def _endpoint_speed_cure_proposals(
             local_speed = values(left, right)[2]
             if np.isfinite(local_speed):
                 local_speed_samples.append(float(local_speed))
-        if len(local_speed_samples) < config.one_sided_spike_min_samples:
+        if len(local_speed_samples) < config.endpoint_speed_min_samples:
             continue
 
         speed_values = np.asarray(local_speed_samples, dtype=float)
@@ -688,7 +685,7 @@ def _endpoint_speed_cure_proposals(
         speed_mad = float(np.median(np.abs(speed_values - speed_median)))
         speed_scale = max(
             1.4826 * speed_mad,
-            config.one_sided_spike_bridge_speed_scale_floor_m_s,
+            config.local_speed_scale_floor_m_s,
         )
         baseline = {
             "sample_count": len(local_speed_samples),
@@ -727,7 +724,7 @@ def _endpoint_speed_cure_proposals(
                 "smoothness_score": smoothness_score,
                 "bridge_atypical_warning": bool(
                     np.isfinite(smoothness_score)
-                    and smoothness_score > config.one_sided_spike_bridge_z_max
+                    and smoothness_score > config.bridge_speed_warning_z
                 ),
                 "cures": cures,
                 "selected": False,
@@ -745,7 +742,7 @@ def _endpoint_speed_cure_proposals(
             ordered_hypotheses = sorted(curing, key=lambda item: item["smoothness_score"])
             if (ordered_hypotheses[1]["smoothness_score"]
                     - ordered_hypotheses[0]["smoothness_score"]
-                    < config.one_sided_spike_score_margin_z):
+                    < config.endpoint_speed_score_margin_z):
                 continue
             chosen = ordered_hypotheses[0]
         competitor = right if chosen is left else left
@@ -963,7 +960,7 @@ def _aggressive_speed_cures(
                 if len(local_speeds) else np.nan
             )
             local_scale = (
-                max(1.4826 * local_mad, config.one_sided_spike_bridge_speed_scale_floor_m_s)
+                max(1.4826 * local_mad, config.local_speed_scale_floor_m_s)
                 if np.isfinite(local_mad) else np.nan
             )
             for edge_position in range(len(order) - 1):
@@ -1462,7 +1459,6 @@ def _local_qc(frame: pd.DataFrame, position: NativePositionConfig,
         accepted_endpoint_cure = bool((
             implicated_frame.human_position_decision.eq("keep")
             & implicated_frame.human_auto_reason_snapshot.isin([
-                "unique_one_sided_local_residual_with_ordinary_bridge",
                 "unique_endpoint_speed_cure",
             ])
         ).any())
