@@ -1,0 +1,40 @@
+input:
+  reader: microsvp_mat
+  # Copy to position_qc.local.yml and point this at the raw MicroSVP directory.
+  directory: ../../data/source/ARCTERX/Data/Raw/MicroSVP
+  pattern: "*.mat"
+  options:
+    missing_value: -999
+drogue:
+  automatic: ../../data/qc/drogue/auto_drogue_loss.parquet
+  review: ../../data/review/drogue/drogue_review.csv
+deployment:
+  metadata: null
+output:
+  directory: ../../data/qc/position
+  review: ../../data/review/position/position_review.csv
+temporal_segments:
+  segment_gap_hours: 6
+  fragment_max_observation_fraction: 0.10
+  fragment_max_duration_fraction: 0.10
+  minimum_main_duration_hours: 48
+  minimum_main_observations: 48
+position_qc:
+  nominal_interval_seconds: 300
+  nominal_interval_tolerance_seconds: 1
+  minimum_local_dt_seconds: 150
+  max_local_gap_seconds: 1800
+  gap_tolerance_seconds: 1
+  speed_threshold_m_s: 3.0
+  # Compatibility-only in v2.4; recovery is bounded by max_local_gap_seconds.
+  max_bridge_skip_points: 3
+  one_sided_spike_window_points: 15
+  one_sided_spike_min_samples: 8
+  one_sided_spike_residual_z_threshold: 6.0
+  one_sided_spike_residual_scale_floor_m: 10.0
+  one_sided_spike_bridge_z_max: 3.0
+  one_sided_spike_bridge_speed_scale_floor_m_s: 0.05
+  one_sided_spike_score_margin_z: 2.0
+review:
+  context_points: 12
+  merge_gap_edges: 2

@@ -5,7 +5,8 @@ Its modules follow an explicit raw → QC → reconstruction → trajectory → 
 workflow. See [the processing workflow](docs/workflow.md) for stage ownership and
 a concise distinction between what is implemented now and what is planned next.
 The standalone raw-signal drogue workflow is documented in
-[drogue-loss detection and review](docs/drogue_loss_review.md).
+[drogue-loss detection and review](docs/drogue_loss_review.md). The generic raw
+trajectory workflow is documented in [native-position QC v2](docs/native_position_qc.md).
 
 ARCTERX QC MicroSVP data are the first supported experiment. The current master
 product retains native QC positions and both supplied reconstructions, so later
@@ -61,9 +62,10 @@ ARCTERX/Data/
     SVP/
 ```
 
-The actual directory is **`Quality Controlled`**, including the space. Only QC
-MicroSVP MATLAB files are supported in this release. Raw data have not undergone
-the supplied QC. Raw-data QC and QC SVP ingestion are future work.
+The actual directory is **`Quality Controlled`**, including the space. Supplied-QC
+MicroSVP files remain supported by the ingestion pipeline. Raw MicroSVP files are
+now also supported by the independent drogue and native-position QC workflows;
+QC SVP ingestion remains future work.
 
 The supplied native QC already addresses land contamination, SST outliers, and
 GPS spikes. Ingestion performs a non-destructive audit: it retains suspicious
@@ -220,9 +222,9 @@ Without a review entry, a source loss estimate is used if present. A missing or
 unrepresentable source loss date yields `drogue_decision="unknown"`, with false
 drogue/analysis masks. No loss date is inferred.
 
-Copy the header-only `configs/arcterx/drogue_reviews.csv` to a local review file,
-then point `processing.drogue_review_table` at it. For example, these illustrative
-rows show the format (replace IDs with actual input platforms):
+For the optional supplied-QC ingestion override, create a local CSV and point
+`processing.drogue_review_table` at it. The required header and illustrative rows
+are shown below (replace IDs with actual input platforms):
 
 ```csv
 platform_code,decision,drogue_off_time_utc,note
@@ -290,24 +292,28 @@ population TTFF, strain, and hull-temperature behavior. Its per-drifter figures
 overlay the TTFF, strain, and final automatic change dates; it uses no reference
 loss date.
 
-## Manual position review
+## Native-position QC and review
 
-Review residual native-QC position excursions interactively, preserving the
-supplied master and coordinates:
+The normal position workflow starts from raw `ObsTimestamp`, `GpsLongitude`, and
+`GpsLatitude`, preserves source rows and coordinates, and uses one command:
 
 ```powershell
-python -m drifterlab.cli.review_arcterx_positions suggest
-python -m drifterlab.cli.review_arcterx_positions review
-# After saving and closing the reviewer:
-python -m drifterlab.cli.review_arcterx_positions apply
+drifterlab-position-qc configs/arcterx/position_qc.local.yml --automatic
+drifterlab-position-qc configs/arcterx/position_qc.local.yml --semiautomatic
+drifterlab-position-qc configs/arcterx/position_qc.local.yml --manual
 ```
 
-The reviewer uses the optional `diagnostics` extra. Decisions are saved separately;
-`apply` writes reviewed QC Parquet and recalculates the next queue using surviving
-valid points. `suggest` generates separate bidirectional recovery proposals for
-blocks of up to three points. In the reviewer, **A** explicitly accepts eligible
-high-confidence suggestions for the current region; individual decisions remain
-authoritative. See [controls, output files and the review loop](docs/manual_position_review.md).
+All modes share a directory of `<platform_code>.parquet` files and
+`position_review.csv`. R/K decisions are staged until N or Q, then only affected
+trajectory files are recalculated. No supplied reconstructed track is read or
+displayed. Manual and semiautomatic modes use the installed three-panel Matplotlib reviewer and resume automatically from the atomic
+`position_review.session.json` cursor. See [the algorithm, schemas, reviewer
+layout and controls, session recovery, smoke results, and full
+configuration](docs/native_position_qc.md).
+
+The former ARCTERX `suggest/review/apply` implementation and its existing artifacts
+remain available only as legacy/internal compatibility material; it is no longer an
+installed command and no migration is performed.
 
 ## Future workflow
 

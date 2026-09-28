@@ -24,8 +24,8 @@ belong in the generic modules.
 
 | Stage | Purpose | Input | Output | Owner | Status |
 | --- | --- | --- | --- | --- | --- |
-| Raw | Read source files without silently changing their meaning. | Campaign source files. | Normalized, provenance-preserving signals or trajectory records. | Generic MATLAB handling and drogue reader dispatch: `drifterlab.io`; supplied-QC ARCTERX reader: `drifterlab.experiments.arcterx.microsvp`. | Generic MicroSVP MAT TTFF/strain extraction and supplied-QC trajectory ingestion are implemented. |
-| QC | Calculate explicit validity masks and advisory flags; apply reviewed decisions separately from source data. | Normalized records/signals and review tables. | Transparent automatic results and separate reviewed decisions. | Generic drogue calculations/workflow/review: `drifterlab.qc`, `drifterlab.workflows`, and `drifterlab.review`; unrelated ARCTERX policy remains under `drifterlab.experiments.arcterx`. | Standalone drogue-loss detection/review and existing supplied-QC audits are implemented. Native position QC remains planned. |
+| Raw | Read source files without silently changing their meaning. | Campaign source files. | Normalized, provenance-preserving signals or trajectory records. | Generic MATLAB handling and raw reader dispatch: `drifterlab.io`; supplied-QC ARCTERX reader: `drifterlab.experiments.arcterx.microsvp`. | Generic MicroSVP MAT drogue-signal/native-position extraction and supplied-QC trajectory ingestion are implemented. |
+| QC | Calculate explicit validity masks and advisory flags; apply reviewed decisions separately from source data. | Normalized records/signals and review tables. | Transparent automatic results and separate reviewed decisions. | Generic drogue and native-position calculations/workflows/review: `drifterlab.qc`, `drifterlab.workflows`, and `drifterlab.review`; unrelated ARCTERX policy remains under `drifterlab.experiments.arcterx`. | Standalone drogue-loss and native-position QC/review plus existing supplied-QC audits are implemented. |
 | Reconstruction | Produce regular 30-minute and 60-minute trajectories from reviewed native positions. | Reviewed native trajectories. | Reconstructed position series with method provenance. | Future `drifterlab.reconstruction` package. | Planned. Current ARCTERX ingestion only preserves the reconstructions supplied by the campaign. |
 | Trajectory Zarr | Inventory trajectories and publish individual-trajectory arrays on explicit observation axes. | QC records and any available reconstructed series. | Inventory Parquet and trajectory Zarr. | `drifterlab.trajectories`, orchestrated for ARCTERX by `drifterlab.experiments.arcterx.pipeline`. | Implemented for supplied ARCTERX QC MicroSVP data. |
 | Deployment / cluster metadata | Record reviewed deployment membership without inferring it during I/O. | Trajectory product plus campaign deployment evidence. | A frozen deployment/group metadata table. | Future `drifterlab.grouping` package, with ARCTERX conventions under `drifterlab.experiments.arcterx`. | Planned. |
@@ -38,26 +38,26 @@ belong in the generic modules.
   and bounded-memory Zarr writing;
 - standalone raw-signal drogue-loss detection and manual review, without using
   supplied/reference drogue-loss dates;
+- generic raw native-position temporal/local QC, final resolution, and review,
+  without reconstructed-track evidence;
 - ARCTERX QC MicroSVP schema mapping and ingestion;
 - non-destructive time, position, speed, and drogue-validity calculations;
 - explicit ARCTERX drogue-review table handling;
 - preservation of the supplied 30-minute and 60-minute reconstructed tracks;
-- optional ARCTERX position-review utilities and investigative diagnostics,
-  separate from the normal preprocessing CLI.
+- legacy ARCTERX position-review utilities and investigative diagnostics,
+  retained outside the normal generic QC command.
 
-The position reviewer is preserved because it already contains useful work. It
-does not make the planned native position-QC stage complete, and its suggestions
-never change data without an explicit review decision.
+The legacy ARCTERX iteration artifacts are preserved without migration. The normal
+workflow is now `drifterlab-position-qc`; it uses one `<platform_code>.parquet`
+per native trajectory, `position_review.csv`, and an optional tiny resume file.
 
 ## Planned next
 
 1. separate downstream validation of finalized drogue estimates against supplied
    ARCTERX dates;
-2. native position QC;
-3. manual review integrated with that position-QC stage;
-4. 30-minute and 60-minute reconstruction;
-5. individual trajectory Zarr generated from those reviewed products;
-6. deployment-group metadata;
-7. grouped and pair Zarr products.
+2. 30-minute and 60-minute reconstruction from resolved native positions;
+3. individual trajectory Zarr generated from those reviewed products;
+4. deployment-group metadata;
+5. grouped and pair Zarr products.
 
 No reconstruction, grouping, or science algorithm is implemented yet.

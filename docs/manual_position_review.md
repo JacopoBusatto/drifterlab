@@ -1,5 +1,10 @@
 # Manual ARCTERX MicroSVP position review
 
+> Legacy reference only. This campaign-specific `suggest/review/apply` loop has
+> no installed entry point and is not the normal position-QC workflow. Existing
+> review/iteration artifacts are intentionally left untouched and are not migrated.
+> Use [native-position QC v2](native_position_qc.md) for current commands and products.
+
 Run these commands from the repository root with the environment activated.
 The existing `diagnostics` extra supplies Matplotlib. If needed, install it once:
 
