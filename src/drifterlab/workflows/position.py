@@ -33,7 +33,7 @@ from .drogue import load_drogue_detection
 
 
 POSITION_QC_SCHEMA_VERSION = "2.0"
-POSITION_QC_ALGORITHM_VERSION = "native-position-qc-v2.4"
+POSITION_QC_ALGORITHM_VERSION = "native-position-qc-v2.5"
 DEPLOYMENT_COLUMNS = [
     "platform_code", "deployment_time", "deployment_window_start",
     "deployment_window_end", "provenance", "note",
@@ -49,6 +49,8 @@ class PositionWorkflowResult:
     observation_count: int
     platform_count: int
     unresolved_count: int
+    summary_path: Path
+    decision_summary: dict[str, Any]
 
 
 def _safe_platform_filename(platform: str) -> str:
@@ -147,6 +149,11 @@ def load_position_config(path: str | Path) -> PositionWorkflowConfig:
                                {field.name for field in fields(TemporalSegmentConfig)}, "temporal_segments")
     position_values = _mapping(data.get("position_qc", {}),
                                {field.name for field in fields(NativePositionConfig)}, "position_qc")
+    if ("max_automatic_removal_points" not in position_values
+            and "max_bridge_skip_points" in position_values):
+        position_values["max_automatic_removal_points"] = position_values[
+            "max_bridge_skip_points"
+        ]
     review_values = _mapping(data.get("review", {}),
                              {field.name for field in fields(PositionReviewConfig)}, "review")
     temporal = TemporalSegmentConfig(**temporal_values)
@@ -161,7 +168,8 @@ def load_position_config(path: str | Path) -> PositionWorkflowConfig:
     if not 0 < temporal.fragment_max_observation_fraction <= 1 or not 0 < temporal.fragment_max_duration_fraction <= 1:
         raise ValueError("Fragment fractions must be in (0, 1]")
     position_integer_fields = {
-        "max_bridge_skip_points", "one_sided_spike_window_points",
+        "max_bridge_skip_points", "max_automatic_removal_points",
+        "one_sided_spike_window_points",
         "one_sided_spike_min_samples",
     }
     for name, value in asdict(position).items():
@@ -259,6 +267,132 @@ def _publish(table: pd.DataFrame, path: Path, provenance: dict[str, Any]) -> Non
         temporary.replace(path)
     finally:
         temporary.unlink(missing_ok=True)
+
+
+SUMMARY_NUMERIC_FIELDS = (
+    "observation_count", "final_valid_points", "final_rejected_points",
+    "exact_repeat_points_removed", "short_interval_points_removed",
+    "duplicate_time_points_removed", "single_point_speed_cure_events",
+    "single_point_speed_cure_points", "multi_point_speed_cure_events",
+    "multi_point_speed_cure_points", "automatic_geometry_points_removed",
+    "human_rejected_points", "retained_at_removal_limit_events",
+    "retained_at_removal_limit_points", "local_unresolved_points",
+    "upstream_uncertain_points",
+)
+
+
+def _decision_summary(frame: pd.DataFrame) -> dict[str, Any]:
+    """Return compact per-platform counts suitable for Parquet metadata."""
+    source = frame.position_decision_source.fillna("").astype(str)
+    final = frame.final_position_status.fillna("").astype(str)
+    reason = frame.point_auto_reason.fillna("").astype(str)
+    event = frame.local_event_id.fillna("").astype(str)
+    speed_reasons = {
+        "unique_endpoint_speed_cure",
+        "bidirectionally_confirmed_time_bounded_excursion_cure",
+        "automatic_iterative_endpoint_speed_cure",
+        "automatic_iterative_excursion_speed_cure",
+    }
+    speed_rows = frame.loc[
+        source.eq("automatic_geometry") & final.eq("rejected")
+        & reason.isin(speed_reasons)
+    ]
+    histogram: dict[str, dict[str, int]] = {}
+    single_events = single_points = multi_events = multi_points = 0
+    if not speed_rows.empty:
+        for event_id, group in speed_rows.groupby("local_event_id", sort=False):
+            if not str(event_id):
+                continue
+            size = int(len(group))
+            bucket = histogram.setdefault(str(size), {"events": 0, "points": 0})
+            bucket["events"] += 1
+            bucket["points"] += size
+            if size == 1:
+                single_events += 1
+                single_points += size
+            else:
+                multi_events += 1
+                multi_points += size
+    limit = reason.eq("automatic_keep_removal_limit_reached")
+    limit_events = int(event[limit & event.ne("")].nunique())
+    local_unresolved = final.isin(["unresolved", "uncertain"]) & source.eq(
+        "automatic_review_required"
+    )
+    all_unresolved = final.isin(["unresolved", "uncertain"])
+    return {
+        "observation_count": int(len(frame)),
+        "final_valid_points": int(final.eq("valid").sum()),
+        "final_rejected_points": int(final.eq("rejected").sum()),
+        "exact_repeat_points_removed": int(source.eq("automatic_repeat").sum()),
+        "short_interval_points_removed": int(source.eq("automatic_short_interval").sum()),
+        "duplicate_time_points_removed": int(source.eq("automatic_duplicate_time").sum()),
+        "single_point_speed_cure_events": single_events,
+        "single_point_speed_cure_points": single_points,
+        "multi_point_speed_cure_events": multi_events,
+        "multi_point_speed_cure_points": multi_points,
+        "automatic_geometry_points_removed": int(
+            (source.eq("automatic_geometry") & final.eq("rejected")).sum()
+        ),
+        "human_rejected_points": int((source.eq("human") & final.eq("rejected")).sum()),
+        "retained_at_removal_limit_events": limit_events,
+        "retained_at_removal_limit_points": int(limit.sum()),
+        "local_unresolved_points": int(local_unresolved.sum()),
+        "upstream_uncertain_points": int((all_unresolved & ~local_unresolved).sum()),
+        "speed_cure_block_size_counts": histogram,
+    }
+
+
+def _aggregate_decision_summaries(values: list[dict[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {
+        name: sum(int(value.get(name, 0)) for value in values)
+        for name in SUMMARY_NUMERIC_FIELDS
+    }
+    histogram: dict[str, dict[str, int]] = {}
+    for value in values:
+        for size, counts in value.get("speed_cure_block_size_counts", {}).items():
+            bucket = histogram.setdefault(str(size), {"events": 0, "points": 0})
+            bucket["events"] += int(counts.get("events", 0))
+            bucket["points"] += int(counts.get("points", 0))
+    result["speed_cure_block_size_counts"] = dict(
+        sorted(histogram.items(), key=lambda item: int(item[0]))
+    )
+    return result
+
+
+def _write_run_summary(
+    output_directory: Path, platform_metadata: list[dict[str, Any]],
+    resolution_policy: str,
+) -> tuple[Path, dict[str, Any]]:
+    summaries = [dict(value.get("decision_summary", {})) for value in platform_metadata]
+    aggregate = _aggregate_decision_summaries(summaries)
+    rows: list[dict[str, Any]] = []
+    for metadata, summary in zip(platform_metadata, summaries):
+        row = {
+            "platform_code": str(metadata.get("platform_code", "")),
+            "resolution_policy": str(metadata.get("resolution_policy", resolution_policy)),
+            **{name: int(summary.get(name, 0)) for name in SUMMARY_NUMERIC_FIELDS},
+            "speed_cure_block_size_counts_json": json.dumps(
+                summary.get("speed_cure_block_size_counts", {}), sort_keys=True,
+                separators=(",", ":"),
+            ),
+        }
+        rows.append(row)
+    rows.append({
+        "platform_code": "ALL_PLATFORMS", "resolution_policy": resolution_policy,
+        **{name: int(aggregate.get(name, 0)) for name in SUMMARY_NUMERIC_FIELDS},
+        "speed_cure_block_size_counts_json": json.dumps(
+            aggregate.get("speed_cure_block_size_counts", {}), sort_keys=True,
+            separators=(",", ":"),
+        ),
+    })
+    path = output_directory / "position_qc_run_summary.csv"
+    temporary = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
+    try:
+        pd.DataFrame(rows).to_csv(temporary, index=False)
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return path, aggregate
 
 
 def _run_monolithic_position_workflow_legacy(
@@ -404,6 +538,7 @@ def run_position_workflow(
     """Run native-position QC as independently reusable per-platform products."""
     if mode not in {"automatic", "semiautomatic", "manual"}:
         raise ValueError(f"Unsupported position workflow mode: {mode!r}")
+    resolution_policy = "aggressive" if mode == "automatic" else "conservative"
     report = progress or (lambda message: None)
     config = load_position_config(config_path)
     if not config.input_directory.is_dir():
@@ -494,6 +629,7 @@ def run_position_workflow(
             "algorithm_version": POSITION_QC_ALGORITHM_VERSION,
             "drifterlab_version": __version__,
             "product_layout": "per-trajectory-v1",
+            "resolution_policy": resolution_policy,
             "platform_code": code,
             "config_sha256": config_hash,
             "source_path": str(source_paths[code]),
@@ -510,6 +646,7 @@ def run_position_workflow(
 
     dependency_keys = {
         "schema_version", "algorithm_version", "product_layout", "platform_code",
+        "resolution_policy",
         "config_sha256", "source_path", "source_sha256", "platform_review_sha256",
         "drogue_input_sha256", "deployment_input_sha256",
     }
@@ -551,6 +688,7 @@ def run_position_workflow(
                 frame.final_position_status.isin(["uncertain", "unresolved"]).sum()
             ),
             "platform_qc_complete": bool(frame.platform_qc_complete.all()),
+            "decision_summary": _decision_summary(frame),
         })
         _publish(frame, output_path(code), metadata)
 
@@ -573,6 +711,7 @@ def run_position_workflow(
             trajectory_for(code), resolved, deployment=deployments.get(code),
             reviews=reviews.table(), temporal_config=config.temporal,
             position_config=config.position, review_config=config.review,
+            resolution_policy=resolution_policy,
         )
         publish_platform(code, frame)
         return remember(code, frame)
@@ -587,11 +726,15 @@ def run_position_workflow(
     def result_summary() -> PositionWorkflowResult:
         paths = tuple(output_path(code) for code in sorted(source_paths))
         metadata = [_metadata(path) for path in paths]
+        summary_path, decision_summary = _write_run_summary(
+            config.output_directory, metadata, resolution_policy,
+        )
         return PositionWorkflowResult(
             config.output_directory, paths,
             sum(int(value.get("observation_count", 0)) for value in metadata),
             len(paths),
             sum(int(value.get("unresolved_count", 0)) for value in metadata),
+            summary_path, decision_summary,
         )
 
     if mode == "automatic":

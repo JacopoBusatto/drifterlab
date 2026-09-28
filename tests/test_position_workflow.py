@@ -110,10 +110,12 @@ def test_automatic_writes_one_platform_file_with_complete_metadata_and_reuses(po
     assert not {"source_lon", "source_lat", "lon", "lat"} & set(frame)
     provenance = metadata(output)
     assert provenance["product_layout"] == "per-trajectory-v1"
+    assert provenance["resolution_policy"] == "aggressive"
     assert provenance["platform_code"] == "1001"
     assert provenance["observation_count"] == 10
     assert isinstance(provenance["event_catalog"], list)
     assert provenance["algorithm_version"] == POSITION_QC_ALGORITHM_VERSION
+    assert isinstance(provenance["decision_summary"], dict)
     assert all(
         "manual_confirmation_required" in event
         for event in provenance["event_catalog"]
@@ -130,6 +132,11 @@ def test_automatic_writes_one_platform_file_with_complete_metadata_and_reuses(po
     assert effective["one_sided_spike_bridge_z_max"] == 3.0
     assert effective["one_sided_spike_bridge_speed_scale_floor_m_s"] == .05
     assert effective["one_sided_spike_score_margin_z"] == 2.0
+    assert effective["max_automatic_removal_points"] == 5
+    assert result.summary_path.exists()
+    summary = pd.read_csv(result.summary_path)
+    assert summary.platform_code.astype(str).tolist() == ["1001", "ALL_PLATFORMS"]
+    assert result.decision_summary["observation_count"] == 10
     before = file_sha256(output)
     messages.clear()
     reused = run_position_workflow(config_path, "automatic", progress=messages.append)
@@ -270,7 +277,14 @@ def test_manual_workflow_passes_lazy_callbacks_and_does_not_materialize_all_fram
 
 def test_manual_commit_rewrites_only_changed_trajectory(tmp_path):
     _, _, config_path = make_inputs(tmp_path, ("1001", "1002"))
-    initial = run_position_workflow(config_path, "automatic")
+    class NoopReviewer:
+        close_handled = True
+        def __init__(self, *_args, **_kwargs):
+            pass
+        def show(self):
+            pass
+
+    initial = run_position_workflow(config_path, "manual", reviewer_factory=NoopReviewer)
     unchanged_before = file_sha256(initial.output_directory / "1002.parquet")
 
     class CommitOneReviewer:
@@ -286,6 +300,28 @@ def test_manual_commit_rewrites_only_changed_trajectory(tmp_path):
 
     run_position_workflow(config_path, "manual", reviewer_factory=CommitOneReviewer)
     assert file_sha256(initial.output_directory / "1002.parquet") == unchanged_before
+
+
+def test_resolution_policy_change_rebuilds_products_before_review(tmp_path):
+    _, _, config_path = make_inputs(tmp_path, ("1001", "1002"))
+    automatic = run_position_workflow(config_path, "automatic")
+    automatic_hashes = {path.name: file_sha256(path) for path in automatic.files}
+
+    class NoopReviewer:
+        close_handled = True
+        def __init__(self, *_args, **_kwargs):
+            pass
+        def show(self):
+            pass
+
+    messages = []
+    conservative = run_position_workflow(
+        config_path, "semiautomatic", progress=messages.append,
+        reviewer_factory=NoopReviewer,
+    )
+    assert all(metadata(path)["resolution_policy"] == "conservative" for path in conservative.files)
+    assert all(file_sha256(path) != automatic_hashes[path.name] for path in conservative.files)
+    assert sum("Published position QC" in message for message in messages) == 2
 
 
 def test_position_cli_reports_directory_summary(position_inputs, capsys):

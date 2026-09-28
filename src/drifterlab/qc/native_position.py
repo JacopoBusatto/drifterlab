@@ -37,6 +37,7 @@ class NativePositionConfig:
     gap_tolerance_seconds: float = 1.0
     speed_threshold_m_s: float = 3.0
     max_bridge_skip_points: int = 3
+    max_automatic_removal_points: int = 5
     one_sided_spike_window_points: int = 15
     one_sided_spike_min_samples: int = 8
     one_sided_spike_residual_z_threshold: float = 6.0
@@ -156,6 +157,37 @@ def _edge_arrays(
     distance = _distance(lon[a], lat[a], lon[b], lat[b])
     speed = distance / dt if np.isfinite(distance) and dt > 0 else np.nan
     return dt, distance, speed
+
+
+def _edge_velocity_vector(
+    time: np.ndarray, lon: np.ndarray, lat: np.ndarray, a: int, b: int,
+) -> tuple[float, float, float]:
+    """Return elapsed seconds and local east/north velocity for one edge."""
+    dt, _distance_m, speed = _edge_arrays(time, lon, lat, a, b)
+    if not np.isfinite(dt) or dt <= 0 or not np.isfinite(speed):
+        return dt, np.nan, np.nan
+    lon1, lon2 = math.radians(float(lon[a])), math.radians(float(lon[b]))
+    lat1, lat2 = math.radians(float(lat[a])), math.radians(float(lat[b]))
+    delta_lon = (lon2 - lon1 + math.pi) % (2 * math.pi) - math.pi
+    bearing = math.atan2(
+        math.sin(delta_lon) * math.cos(lat2),
+        math.cos(lat1) * math.sin(lat2)
+        - math.sin(lat1) * math.cos(lat2) * math.cos(delta_lon),
+    )
+    return dt, speed * math.sin(bearing), speed * math.cos(bearing)
+
+
+def _vertex_acceleration(
+    time: np.ndarray, lon: np.ndarray, lat: np.ndarray, a: int, b: int, c: int,
+) -> float:
+    """Vector acceleration at B using the separation of the edge midpoints."""
+    left_dt, left_east, left_north = _edge_velocity_vector(time, lon, lat, a, b)
+    right_dt, right_east, right_north = _edge_velocity_vector(time, lon, lat, b, c)
+    midpoint_dt = (left_dt + right_dt) / 2
+    if (not np.isfinite(midpoint_dt) or midpoint_dt <= 0
+            or not np.isfinite([left_east, left_north, right_east, right_north]).all()):
+        return np.nan
+    return float(math.hypot(right_east - left_east, right_north - left_north) / midpoint_dt)
 
 
 def _edge(frame: pd.DataFrame, a: int, b: int) -> tuple[float, float, float]:
@@ -388,6 +420,7 @@ def _segments(frame: pd.DataFrame, source_sha256: str, config: TemporalSegmentCo
 def _walk(
     order: list[int], plausible, speed, anomalous, elapsed,
     protected: np.ndarray, maximum_elapsed_seconds: float,
+    maximum_removal_points: int,
 ):
     blocks: dict[tuple[int, tuple[int, ...], int], dict[str, Any]] = {}
     retained: set[int] = set()
@@ -413,7 +446,7 @@ def _walk(
         recovered = False
         if anomalous(a, b):
             attempts: list[dict[str, Any]] = []
-            for count in range(1, len(order) - i - 1):
+            for count in range(1, min(maximum_removal_points, len(order) - i - 2) + 1):
                 if i + count + 1 >= len(order):
                     break
                 skipped_order = order[i + 1:i + count + 1]
@@ -487,9 +520,11 @@ def _recover(
     maximum_elapsed = config.max_local_gap_seconds + config.gap_tolerance_seconds
     forward, fretained = _walk(
         order, plausible, speed, anomalous, elapsed, protected, maximum_elapsed,
+        config.max_automatic_removal_points,
     )
     backward, bretained = _walk(
         order[::-1], plausible, speed, anomalous, elapsed, protected, maximum_elapsed,
+        config.max_automatic_removal_points,
     )
 
     order_position = {row: position for position, row in enumerate(order)}
@@ -527,6 +562,7 @@ def _recover(
                 bridge_distance_m=bridge_distance,
                 bridge_speed=bridge_speed,
                 skipped_count=len(block["skipped"]),
+                maximum_removal_points=config.max_automatic_removal_points,
                 search_limit_seconds=maximum_elapsed,
                 baseline={
                     "sample_count": int(len(finite)),
@@ -746,7 +782,13 @@ def _candidate_runs(
         order = segment.index.to_numpy()
         order = order[np.argsort(time[order], kind="stable")]
         # Duplicate timestamps and human uncertainties are hard context barriers.
-        duplicate = pd.Series(time[order]).duplicated(keep=False).to_numpy()
+        surviving = np.asarray([
+            not rejected[j] and human[j] != "reject" for j in order
+        ], dtype=bool)
+        duplicate = np.zeros(len(order), dtype=bool)
+        duplicate[surviving] = pd.Series(
+            time[order[surviving]],
+        ).duplicated(keep=False).to_numpy()
         current: list[int] = []
         for position, j in enumerate(order):
             # Automatic repeat rejection is unconditional, including when an
@@ -762,6 +804,312 @@ def _candidate_runs(
         if current:
             runs.append(current)
     return runs
+
+
+def _automatic_duplicate_rejections(
+    frame: pd.DataFrame, rejected: np.ndarray, config: NativePositionConfig,
+) -> tuple[np.ndarray, dict[int, dict[str, Any]]]:
+    """Keep the duplicate-time representative with the smoothest local motion."""
+    result = np.zeros(len(frame), dtype=bool)
+    evidence: dict[int, dict[str, Any]] = {}
+    time = frame.time_value.to_numpy(dtype="datetime64[ns]")
+    lon = frame.source_lon.to_numpy(dtype=float)
+    lat = frame.source_lat.to_numpy(dtype=float)
+    source = frame.source_obs_index.to_numpy(dtype=np.int64)
+    human = frame.human_position_decision.fillna("").astype(str).to_numpy()
+    eligible = (
+        frame.segment_status.eq("retained").to_numpy()
+        & frame.valid_timestamp.to_numpy(dtype=bool)
+        & frame.source_position_valid.to_numpy(dtype=bool)
+        & frame.drogue_eligible.to_numpy(dtype=bool)
+        & frame.deployment_eligible.to_numpy(dtype=bool)
+        & ~frame.deployment_uncertain.to_numpy(dtype=bool)
+        & ~rejected
+        & (human != "reject")
+    )
+    maximum_elapsed = config.max_local_gap_seconds + config.gap_tolerance_seconds
+
+    for segment_id, segment in frame.loc[eligible].groupby("segment_id", sort=False):
+        segment_order = segment.index.to_numpy(dtype=np.int64)
+        segment_order = segment_order[np.argsort(time[segment_order], kind="stable")]
+        if len(segment_order) < 2:
+            continue
+        values = pd.Series(time[segment_order])
+        duplicate_positions = values.duplicated(keep=False).to_numpy()
+        for stamp in pd.unique(values[duplicate_positions]):
+            members = segment_order[values.eq(stamp).to_numpy()]
+            if len(members) < 2:
+                continue
+            first_position = int(np.flatnonzero(np.isin(segment_order, members))[0])
+            last_position = int(np.flatnonzero(np.isin(segment_order, members))[-1])
+            previous = int(segment_order[first_position - 1]) if first_position else None
+            following = (
+                int(segment_order[last_position + 1])
+                if last_position + 1 < len(segment_order) else None
+            )
+
+            def representative_score(candidate: int) -> tuple[tuple[Any, ...], dict[str, Any]]:
+                edge_values: list[dict[str, Any]] = []
+                high_count = 0
+                total_excess = 0.0
+                for left, right in ((previous, candidate), (candidate, following)):
+                    if left is None or right is None:
+                        continue
+                    dt, distance, speed = _edge_arrays(time, lon, lat, left, right)
+                    usable = bool(
+                        config.minimum_local_dt_seconds <= dt <= maximum_elapsed
+                        and np.isfinite(speed)
+                    )
+                    excess = (
+                        max(0.0, float(speed) - config.speed_threshold_m_s)
+                        if usable else math.inf
+                    )
+                    high_count += int(not usable or excess > 0)
+                    total_excess += excess
+                    edge_values.append({
+                        "left_source_obs_index": int(source[left]),
+                        "right_source_obs_index": int(source[right]),
+                        "dt_seconds": dt, "distance_m": distance,
+                        "speed_m_s": speed, "usable": usable,
+                    })
+                acceleration = (
+                    _vertex_acceleration(time, lon, lat, previous, candidate, following)
+                    if previous is not None and following is not None else np.nan
+                )
+                acceleration_score = acceleration if np.isfinite(acceleration) else math.inf
+                # An explicit keep is the preferred representative; immutable
+                # source identity makes the remaining tie deterministic.
+                score = (
+                    0 if human[candidate] == "keep" else 1,
+                    high_count, total_excess, acceleration_score, int(source[candidate]),
+                )
+                return score, {
+                    "candidate_source_obs_index": int(source[candidate]),
+                    "high_speed_edge_count": high_count,
+                    "total_speed_excess_m_s": total_excess,
+                    "vector_acceleration_m_s2": acceleration,
+                    "edges": edge_values,
+                }
+
+            scored = [(representative_score(int(j)), int(j)) for j in members]
+            scored.sort(key=lambda item: item[0][0])
+            representative = scored[0][1]
+            rejected_members = [int(j) for j in members if int(j) != representative]
+            if not rejected_members:
+                continue
+            event_id = _event_id(
+                str(frame.platform_code.iloc[0]), "duplicate_timestamp",
+                sorted(int(source[j]) for j in members),
+            )
+            detail = {
+                "method": "automatic_duplicate_time_resolution",
+                "segment_id": str(segment_id),
+                "timestamp": str(pd.Timestamp(stamp)),
+                "representative_source_obs_index": int(source[representative]),
+                "rejected_source_obs_indices": [int(source[j]) for j in rejected_members],
+                "hypotheses": [item[0][1] for item in scored],
+            }
+            for j in rejected_members:
+                result[j] = True
+                evidence[j] = {"event_id": event_id, "detail": detail}
+    return result, evidence
+
+
+def _aggressive_speed_cures(
+    frame: pd.DataFrame, base_rejected: np.ndarray, config: NativePositionConfig,
+    protected: np.ndarray, *, first_iteration: int,
+) -> tuple[np.ndarray, dict[int, dict[str, Any]], int]:
+    """Apply deterministic bounded speed cures without changing review semantics."""
+    n = len(frame)
+    result = np.zeros(n, dtype=bool)
+    evidence: dict[int, dict[str, Any]] = {}
+    time = frame.time_value.to_numpy(dtype="datetime64[ns]")
+    lon = frame.source_lon.to_numpy(dtype=float)
+    lat = frame.source_lat.to_numpy(dtype=float)
+    source = frame.source_obs_index.to_numpy(dtype=np.int64)
+    maximum_elapsed = config.max_local_gap_seconds + config.gap_tolerance_seconds
+    iteration = first_iteration
+
+    @lru_cache(None)
+    def values(a: int, b: int) -> tuple[float, float, float]:
+        if time[a] > time[b]:
+            a, b = b, a
+        return _edge_arrays(time, lon, lat, a, b)
+
+    def usable_high(a: int, b: int) -> bool:
+        dt, _distance, speed = values(a, b)
+        return bool(
+            config.minimum_local_dt_seconds <= dt <= maximum_elapsed
+            and np.isfinite(speed) and speed > config.speed_threshold_m_s
+        )
+
+    while True:
+        rejected = base_rejected | result
+        proposals: dict[tuple[int, ...], dict[str, Any]] = {}
+        for order in _candidate_runs(frame, rejected):
+            if len(order) < 3:
+                continue
+            local_speeds = np.asarray([
+                values(order[k], order[k + 1])[2]
+                for k in range(len(order) - 1)
+                if (config.minimum_local_dt_seconds
+                    <= values(order[k], order[k + 1])[0] <= maximum_elapsed)
+                and np.isfinite(values(order[k], order[k + 1])[2])
+                and values(order[k], order[k + 1])[2] <= config.speed_threshold_m_s
+            ], dtype=float)
+            local_median = float(np.median(local_speeds)) if len(local_speeds) else np.nan
+            local_mad = (
+                float(np.median(np.abs(local_speeds - local_median)))
+                if len(local_speeds) else np.nan
+            )
+            local_scale = (
+                max(1.4826 * local_mad, config.one_sided_spike_bridge_speed_scale_floor_m_s)
+                if np.isfinite(local_mad) else np.nan
+            )
+            for edge_position in range(len(order) - 1):
+                u, v = order[edge_position:edge_position + 2]
+                if not usable_high(u, v):
+                    continue
+                attempts: list[dict[str, Any]] = []
+                curing: list[dict[str, Any]] = []
+                for direction in ("left", "right"):
+                    for count in range(1, config.max_automatic_removal_points + 1):
+                        if direction == "right":
+                            block_start, block_end = edge_position + 1, edge_position + 1 + count
+                            anchor_position, reconnect_position = edge_position, block_end
+                        else:
+                            block_start, block_end = edge_position - count + 1, edge_position + 1
+                            anchor_position, reconnect_position = edge_position - count, edge_position + 1
+                        if (block_start < 0 or block_end > len(order)
+                                or anchor_position < 0 or reconnect_position >= len(order)):
+                            break
+                        block = tuple(int(j) for j in order[block_start:block_end])
+                        if any(protected[j] for j in block):
+                            break
+                        anchor = int(order[anchor_position])
+                        reconnect = int(order[reconnect_position])
+                        bridge_dt, bridge_distance, bridge_speed = values(anchor, reconnect)
+                        within_time = bool(
+                            np.isfinite(bridge_dt) and bridge_dt > 0
+                            and bridge_dt <= maximum_elapsed
+                        )
+                        if not within_time:
+                            break
+                        cures = bool(
+                            bridge_dt >= config.minimum_local_dt_seconds
+                            and np.isfinite(bridge_speed)
+                            and bridge_speed <= config.speed_threshold_m_s
+                        )
+                        survivors = order[:block_start] + order[block_end:]
+                        bridge_position = survivors.index(anchor)
+                        boundary_accelerations: list[float] = []
+                        if bridge_position > 0:
+                            boundary_accelerations.append(_vertex_acceleration(
+                                time, lon, lat, survivors[bridge_position - 1], anchor, reconnect,
+                            ))
+                        if bridge_position + 2 < len(survivors):
+                            boundary_accelerations.append(_vertex_acceleration(
+                                time, lon, lat, anchor, reconnect, survivors[bridge_position + 2],
+                            ))
+                        finite_accelerations = [
+                            float(value) for value in boundary_accelerations if np.isfinite(value)
+                        ]
+                        maximum_acceleration = (
+                            max(finite_accelerations) if finite_accelerations else math.inf
+                        )
+                        smoothness = (
+                            abs(float(bridge_speed) - local_median) / local_scale
+                            if np.isfinite([bridge_speed, local_median, local_scale]).all()
+                            and local_scale > 0 else math.inf
+                        )
+                        attempt = {
+                            "method": "bounded_iterative_speed_cure",
+                            "direction": direction,
+                            "anchor": anchor, "reconnect": reconnect,
+                            "anchor_source_obs_index": int(source[anchor]),
+                            "reconnect_source_obs_index": int(source[reconnect]),
+                            "skipped": list(block),
+                            "skipped_source_obs_indices": [int(source[j]) for j in block],
+                            "skipped_count": len(block),
+                            "bridge_dt_seconds": bridge_dt,
+                            "bridge_distance_m": bridge_distance,
+                            "bridge_speed": bridge_speed,
+                            "speed_threshold_m_s": config.speed_threshold_m_s,
+                            "maximum_boundary_acceleration_m_s2": (
+                                maximum_acceleration if np.isfinite(maximum_acceleration) else np.nan
+                            ),
+                            "boundary_accelerations_m_s2": boundary_accelerations,
+                            "local_speed_median_m_s": local_median,
+                            "local_speed_mad_m_s": local_mad,
+                            "local_speed_scale_m_s": local_scale,
+                            "smoothness_score": smoothness if np.isfinite(smoothness) else np.nan,
+                            "maximum_removal_points": config.max_automatic_removal_points,
+                            "search_limit_seconds": maximum_elapsed,
+                            "cures": cures,
+                        }
+                        attempts.append(attempt)
+                        if cures:
+                            curing.append(attempt)
+                            # This direction contributes only its smallest cure.
+                            break
+                if not curing:
+                    continue
+                for item in curing:
+                    first_time = int(time[item["skipped"][0]].astype(np.int64))
+                    item["rank"] = (
+                        int(item["skipped_count"]),
+                        float(item["maximum_boundary_acceleration_m_s2"])
+                        if np.isfinite(item["maximum_boundary_acceleration_m_s2"]) else math.inf,
+                        float(item["smoothness_score"])
+                        if np.isfinite(item["smoothness_score"]) else math.inf,
+                        -first_time,
+                        tuple(item["skipped_source_obs_indices"]),
+                    )
+                item = min(curing, key=lambda value: value["rank"])
+                item["tested_hypotheses"] = [
+                    {key: value for key, value in attempt.items() if key != "rank"}
+                    for attempt in attempts
+                ]
+                block_key = tuple(sorted(int(j) for j in item["skipped"]))
+                if block_key not in proposals or item["rank"] < proposals[block_key]["rank"]:
+                    proposals[block_key] = item
+
+        if not proposals:
+            break
+        accepted: list[tuple[tuple[int, ...], dict[str, Any]]] = []
+        occupied: set[int] = set()
+        for block, proposal in sorted(
+            proposals.items(), key=lambda item: (item[1]["rank"], item[0]),
+        ):
+            if occupied.intersection(block):
+                continue
+            accepted.append((block, proposal))
+            occupied.update(block)
+        if not accepted:
+            break
+        iteration += 1
+        for block, proposal in accepted:
+            event_id = _event_id(
+                str(frame.platform_code.iloc[0]), "automatic_speed_cure",
+                [int(source[j]) for j in block],
+            )
+            reason = (
+                "automatic_iterative_endpoint_speed_cure" if len(block) == 1
+                else "automatic_iterative_excursion_speed_cure"
+            )
+            competitor = {
+                "method": "competing_speed_cure_hypotheses",
+                "tested_hypotheses": proposal.get("tested_hypotheses", []),
+                "selected_skipped_source_obs_indices": proposal["skipped_source_obs_indices"],
+            }
+            for j in block:
+                result[j] = True
+                evidence[j] = {
+                    "event_id": event_id, "iteration": iteration,
+                    "implicated": [int(source[value]) for value in block],
+                    "forward": proposal, "backward": competitor, "reason": reason,
+                }
+    return result, evidence, iteration
 
 
 def _repeat_rejections(frame: pd.DataFrame) -> np.ndarray:
@@ -862,12 +1210,18 @@ def _short_interval_rejections(
 
 
 def _local_qc(frame: pd.DataFrame, position: NativePositionConfig,
-              review: PositionReviewConfig) -> tuple[np.ndarray, np.ndarray]:
+              review: PositionReviewConfig, *, resolution_policy: str) -> tuple[np.ndarray, np.ndarray]:
     n = len(frame)
     repeat_reject = _repeat_rejections(frame)
     short_reject, short_evidence = _short_interval_rejections(
         frame, repeat_reject, position,
     )
+    duplicate_reject = np.zeros(n, dtype=bool)
+    duplicate_evidence: dict[int, dict[str, Any]] = {}
+    if resolution_policy == "aggressive":
+        duplicate_reject, duplicate_evidence = _automatic_duplicate_rejections(
+            frame, repeat_reject | short_reject, position,
+        )
     geometry_reject = np.zeros(n, dtype=bool)
     evidence: dict[int, dict[str, Any]] = {}
     protected = frame.human_position_decision.isin(["keep", "uncertain"]).to_numpy()
@@ -877,7 +1231,7 @@ def _local_qc(frame: pd.DataFrame, position: NativePositionConfig,
     iteration = 0
     while True:
         iteration += 1
-        rejected = repeat_reject | short_reject | geometry_reject
+        rejected = repeat_reject | short_reject | duplicate_reject | geometry_reject
         runs = _candidate_runs(frame, rejected)
         proposed: list[tuple[tuple, dict, dict, str]] = []
         for order in runs:
@@ -918,6 +1272,15 @@ def _local_qc(frame: pd.DataFrame, position: NativePositionConfig,
                     "forward": forward, "backward": backward, "reason": reason,
                 }
         geometry_reject[list(new_points)] = True
+
+    if resolution_policy == "aggressive":
+        aggressive_reject, aggressive_evidence, iteration = _aggressive_speed_cures(
+            frame,
+            repeat_reject | short_reject | duplicate_reject | geometry_reject,
+            position, protected, first_iteration=iteration,
+        )
+        geometry_reject |= aggressive_reject
+        evidence.update(aggressive_evidence)
 
     # Final surviving edge evidence.
     columns: dict[str, Any] = {
@@ -963,6 +1326,18 @@ def _local_qc(frame: pd.DataFrame, position: NativePositionConfig,
         ]
         frame.at[j, "forward_result_json"] = json.dumps(detail, sort_keys=True)
 
+    for j, item in duplicate_evidence.items():
+        detail = item["detail"]
+        frame.at[j, "local_event_id"] = item["event_id"]
+        frame.at[j, "local_event_type"] = "duplicate_timestamp"
+        frame.at[j, "local_event_implicated_source_obs_indices"] = json.dumps(
+            detail["rejected_source_obs_indices"]
+        )
+        frame.at[j, "point_auto_status"] = "duplicate_timestamp_reject"
+        frame.at[j, "point_auto_decision"] = "reject"
+        frame.at[j, "point_auto_reason"] = "automatic_duplicate_time_resolution"
+        frame.at[j, "forward_result_json"] = json.dumps(detail, default=float, sort_keys=True)
+
     for j, item in evidence.items():
         forward, backward = item["forward"], item["backward"]
         frame.at[j, "local_event_id"] = item["event_id"]
@@ -978,7 +1353,7 @@ def _local_qc(frame: pd.DataFrame, position: NativePositionConfig,
         frame.at[j, "forward_result_json"] = json.dumps(forward, default=float, sort_keys=True)
         frame.at[j, "backward_result_json"] = json.dumps(backward, default=float, sort_keys=True)
 
-    rejected = repeat_reject | short_reject | geometry_reject
+    rejected = repeat_reject | short_reject | duplicate_reject | geometry_reject
     high_edges: list[dict[str, Any]] = []
     predecessor = np.full(n, np.nan)
     edge_dt = np.full(n, np.nan)
@@ -1038,7 +1413,8 @@ def _local_qc(frame: pd.DataFrame, position: NativePositionConfig,
     frame["high_speed_flag"] = fast
 
     unresolved = np.zeros(n, dtype=bool)
-    # Duplicate timestamps are always unresolved events.
+    # Conservative modes review duplicate timestamps. Aggressive automatic mode
+    # has already selected one deterministic representative above.
     eligible = (
         frame.segment_status.isin(["retained", "pending"])
         & frame.valid_timestamp & frame.source_position_valid
@@ -1047,6 +1423,16 @@ def _local_qc(frame: pd.DataFrame, position: NativePositionConfig,
     duplicate_rows = duplicate_rows[duplicate_rows.time_value.duplicated(keep=False)]
     for stamp, group in duplicate_rows.groupby("time_value", sort=False):
         indices = group.index.to_numpy()
+        frame.loc[indices, "nonpositive_dt_flag"] = True
+        if resolution_policy == "aggressive":
+            representative = indices[~duplicate_reject[indices]]
+            free_representative = representative[
+                frame.loc[representative, "point_auto_status"].eq("").to_numpy()
+            ]
+            frame.loc[free_representative, "point_auto_status"] = "duplicate_timestamp_representative"
+            frame.loc[free_representative, "point_auto_decision"] = "keep"
+            frame.loc[free_representative, "point_auto_reason"] = "automatic_duplicate_time_resolution"
+            continue
         implicated = frame.loc[indices, "source_obs_index"].astype(int).tolist()
         event = _event_id(str(frame.platform_code.iloc[0]), "boundary_or_insufficient_context", implicated)
         free = indices[frame.loc[indices, "local_event_id"].eq("").to_numpy()]
@@ -1057,7 +1443,6 @@ def _local_qc(frame: pd.DataFrame, position: NativePositionConfig,
         frame.loc[free, "point_auto_reason"] = "duplicate_or_nonpositive_timestamp"
         frame.loc[indices, "local_review_required"] = True
         frame.loc[indices, "local_review_reason"] = "duplicate_or_nonpositive_timestamp"
-        frame.loc[indices, "nonpositive_dt_flag"] = True
         undecided = ~frame.loc[indices, "human_position_decision"].isin(["keep", "reject"]).to_numpy()
         unresolved[indices[undecided]] = True
 
@@ -1086,7 +1471,10 @@ def _local_qc(frame: pd.DataFrame, position: NativePositionConfig,
             # real motion.  Retain the raw high-speed diagnostic, but do not turn
             # the same edge back into a new ambiguous event on its other endpoint.
             continue
-        if any(not item["usable"] for item in group):
+        if resolution_policy == "aggressive":
+            event_type = "automatic_retained_anomaly"
+            reason = "automatic_keep_removal_limit_reached"
+        elif any(not item["usable"] for item in group):
             event_type = "boundary_or_insufficient_context"
             reason = "high_speed_edge_has_untrusted_timing"
         elif len(group) == 1:
@@ -1098,6 +1486,16 @@ def _local_qc(frame: pd.DataFrame, position: NativePositionConfig,
         event = _event_id(str(frame.platform_code.iloc[0]), event_type, implicated)
         edge_json = json.dumps([{k: value for k, value in item.items() if k != "run"} for item in group])
         for j in implicated_rows:
+            if resolution_policy == "aggressive":
+                if not frame.at[j, "local_event_id"]:
+                    frame.at[j, "local_event_id"] = event
+                    frame.at[j, "local_event_type"] = event_type
+                    frame.at[j, "local_event_implicated_source_obs_indices"] = json.dumps(implicated)
+                    frame.at[j, "point_auto_status"] = "automatic_retained_anomaly"
+                    frame.at[j, "point_auto_decision"] = "keep"
+                    frame.at[j, "point_auto_reason"] = reason
+                    frame.at[j, "forward_result_json"] = edge_json
+                continue
             # Human decisions resolve their own point, but undecided implicated points remain blocked.
             if not frame.at[j, "human_position_decision"]:
                 unresolved[j] = True
@@ -1110,7 +1508,7 @@ def _local_qc(frame: pd.DataFrame, position: NativePositionConfig,
                 frame.at[j, "point_auto_status"] = "review_required"
                 frame.at[j, "point_auto_reason"] = reason
                 frame.at[j, "forward_result_json"] = edge_json
-    return repeat_reject | short_reject | geometry_reject, unresolved
+    return repeat_reject | short_reject | duplicate_reject | geometry_reject, unresolved
 
 
 def _resolve(frame: pd.DataFrame, drogue: ResolvedDrogueDecision,
@@ -1147,10 +1545,17 @@ def _resolve(frame: pd.DataFrame, drogue: ResolvedDrogueDecision,
             & frame.point_auto_status.eq("short_interval_reject").to_numpy()
         )
         status[short_interval], source[short_interval] = "rejected", "automatic_short_interval"
+        duplicate_timestamp = (
+            eligible & ~repeat & ~short_interval & auto_reject
+            & frame.point_auto_status.eq("duplicate_timestamp_reject").to_numpy()
+        )
+        status[duplicate_timestamp], source[duplicate_timestamp] = (
+            "rejected", "automatic_duplicate_time"
+        )
         for decision, value in (("reject", "rejected"), ("keep", "valid"), ("uncertain", "uncertain")):
-            mask = eligible & ~repeat & ~short_interval & (decisions == decision)
+            mask = eligible & ~repeat & ~short_interval & ~duplicate_timestamp & (decisions == decision)
             status[mask], source[mask] = value, "human"
-        undecided = eligible & ~repeat & ~short_interval & (decisions == "")
+        undecided = eligible & ~repeat & ~short_interval & ~duplicate_timestamp & (decisions == "")
         geometry = undecided & ~repeat & auto_reject
         status[geometry], source[geometry] = "rejected", "automatic_geometry"
         unresolved = undecided & ~auto_reject & unresolved_event
@@ -1169,12 +1574,15 @@ def run_native_position_qc(
     temporal_config: TemporalSegmentConfig | None = None,
     position_config: NativePositionConfig | None = None,
     review_config: PositionReviewConfig | None = None,
+    resolution_policy: str = "conservative",
 ) -> pd.DataFrame:
     """Return one QC row per immutable source observation."""
     deployment = deployment or DeploymentBoundary()
     temporal_config = temporal_config or TemporalSegmentConfig()
     position_config = position_config or NativePositionConfig()
     review_config = review_config or PositionReviewConfig()
+    if resolution_policy not in {"conservative", "aggressive"}:
+        raise ValueError(f"Unsupported position resolution policy: {resolution_policy!r}")
     point_reviews, segment_reviews = _review_maps(reviews, trajectory.platform_code)
     frame = _base_frame(trajectory, drogue, deployment, point_reviews)
     _segments(frame, trajectory.source_sha256, temporal_config, segment_reviews)
@@ -1200,7 +1608,9 @@ def run_native_position_qc(
         auto_reject = np.zeros(len(frame), dtype=bool)
         unresolved = np.zeros(len(frame), dtype=bool)
     else:
-        auto_reject, unresolved = _local_qc(frame, position_config, review_config)
+        auto_reject, unresolved = _local_qc(
+            frame, position_config, review_config, resolution_policy=resolution_policy,
+        )
     resolution = _resolve(frame, drogue, auto_reject, unresolved)
     frame["final_position_status"] = resolution.final_position_status
     frame["final_position_valid"] = resolution.final_position_valid

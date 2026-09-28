@@ -29,6 +29,36 @@ def main(argv: list[str] | None = None) -> int:
         f"{result.platform_count} platforms; {result.unresolved_count} "
         f"unresolved/uncertain observations in {result.output_directory}."
     )
+    summary = result.decision_summary
+    print("Position-QC decision summary")
+    print(f"  Exact repeats removed:           {summary['exact_repeat_points_removed']:,}")
+    print(f"  Short-interval points removed:   {summary['short_interval_points_removed']:,}")
+    print(f"  Duplicate-time points removed:   {summary['duplicate_time_points_removed']:,}")
+    print(
+        "  One-point speed cures:          "
+        f"{summary['single_point_speed_cure_events']:,} events / "
+        f"{summary['single_point_speed_cure_points']:,} points"
+    )
+    print("  Multi-point speed cures:")
+    histogram = summary.get("speed_cure_block_size_counts", {})
+    multi = [(size, counts) for size, counts in histogram.items() if int(size) > 1]
+    if multi:
+        for size, counts in multi:
+            print(
+                f"    {int(size)} points: {int(counts['events']):,} events / "
+                f"{int(counts['points']):,} points"
+            )
+    else:
+        print("    none")
+    print(
+        "  Retained at removal limit:      "
+        f"{summary['retained_at_removal_limit_events']:,} events"
+    )
+    print(f"  Human-rejected observations:    {summary['human_rejected_points']:,}")
+    print(f"  Local unresolved observations:  {summary['local_unresolved_points']:,}")
+    print(f"  Upstream uncertain observations:{summary['upstream_uncertain_points']:>8,}")
+    print(f"  Total rejected observations:    {summary['final_rejected_points']:,}")
+    print(f"  Detailed summary: {result.summary_path}")
     return 0
 
 

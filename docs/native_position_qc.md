@@ -57,6 +57,7 @@ position_qc:
   gap_tolerance_seconds: 1
   speed_threshold_m_s: 3.0
   max_bridge_skip_points: 3
+  max_automatic_removal_points: 5
   one_sided_spike_window_points: 15
   one_sided_spike_min_samples: 8
   one_sided_spike_residual_z_threshold: 6.0
@@ -71,9 +72,11 @@ review:
 ```
 
 The `one_sided_spike_residual_*` names and `max_bridge_skip_points` remain accepted
-so existing configuration files continue to load. In v2.4 the interpolation
-residual is evidence rather than a decision gate, and bridge search is bounded by
-elapsed time rather than point count. `one_sided_spike_bridge_z_max` controls the
+so existing configuration files continue to load. When the new key is absent, an
+explicit legacy `max_bridge_skip_points` value supplies
+`max_automatic_removal_points`; otherwise the new key takes precedence. Recovery
+is bounded by both this point count and elapsed time. The interpolation residual
+is evidence rather than a decision gate. `one_sided_spike_bridge_z_max` controls the
 atypical-bridge warning threshold; `one_sided_spike_score_margin_z` controls how
 clearly one curing endpoint must outperform another.
 
@@ -158,8 +161,9 @@ speed <= speed_threshold_m_s
 Nominal, short, large-gap, nonpositive, and high-speed flags remain in the output.
 A strictly positive short interval creates a resolved, hidden automatic removal;
 an excessive gap remains diagnostic-only. High-speed geometry with unusable
-timing is `boundary_or_insufficient_context`; duplicate/nonpositive time is always
-marked review-required and is never handled by short-interval thinning.
+timing is `boundary_or_insufficient_context`; duplicate/nonpositive time is never
+handled by short-interval thinning. Conservative modes mark duplicate time for
+review, while aggressive automatic mode chooses one deterministic representative.
 
 A directional pass becomes trusted only after two consecutive plausible retained
 edges. From a trusted anchor followed by a locally usable high-speed edge, it
@@ -167,8 +171,9 @@ expands the skipped block until the first bridge satisfying the same time and
 speed limits. Search stops when anchor-to-reconnection elapsed time exceeds
 `max_local_gap_seconds + gap_tolerance_seconds`; the permitted distance therefore
 grows naturally with elapsed time. Forward and backward passes are independent.
-`max_bridge_skip_points` remains readable for configuration compatibility but no
-longer truncates this time-bounded search.
+`max_automatic_removal_points` also stops expansion. A candidate block is applied
+only after the complete block cures its triggering edge, so fixed-point processing
+cannot bypass the cap through a sequence of partial deletions.
 
 `high_confidence_reject` requires the exact same skipped source observations and
 compatible endpoints in both directions, a plausible bridge, retained continuation
@@ -188,7 +193,7 @@ ambiguous. The spherical interpolation residual and direction remain supporting
 evidence, not hard gates. A bridge more than three robust deviations from local
 speed is explicitly warned about but remains physically valid.
 
-Bidirectional excursion recovery chooses the smallest curing block within the
+Conservative bidirectional excursion recovery chooses the smallest curing block within the
 elapsed-time limit. Both directions must identify identical immutable source
 observations with plausible continuation. Single edges without a clear winner,
 directional disagreement, insufficient local context, non-returning excursions,
@@ -196,9 +201,28 @@ hard boundaries, timing-blocked geometry, duplicate time, and multiple substanti
 segments remain review-required. Connected flagged edges are grouped with up to
 `merge_gap_edges` plausible intervening edges.
 
+In aggressive automatic mode, every remaining usable high-speed edge tests
+left- and right-expanding contiguous blocks. Equal-size cures are ranked by the
+maximum vector acceleration at their bridge boundaries, then local speed
+smoothness, with an immutable chronological tie-breaker. Vector acceleration uses
+the change between incoming and outgoing east/north velocity divided by the
+separation of the edge midpoints. It therefore recognizes both abrupt speed
+changes and reversals, but never makes an over-threshold bridge acceptable. All
+nonoverlapping winners are applied together and adjacency is rebuilt to a fixed
+point. If no cure exists within either configured limit, the observations are
+retained as a resolved `automatic_keep_removal_limit_reached` anomaly rather than
+being deleted indefinitely.
+
+Automatic mode also resolves duplicate timestamps by retaining the representative
+with the best surrounding speed/acceleration score and rejecting the others.
+Conservative modes continue to review duplicate timestamps.
+
 ## Modes, decisions, and final resolution
 
-- `--automatic` has no GUI and publishes automatic decisions plus unresolved cases.
+- `--automatic` has no GUI and uses the aggressive deterministic policy. It leaves
+  no unresolved eligible local-geometry event; capped non-cures remain explicitly
+  flagged but valid. Upstream drogue, deployment, temporal, or human uncertainty is
+  reported separately and is never disguised as solved geometry.
 - `--semiautomatic` queues pending temporal segments, unresolved local events,
   timing-blocked anomalies, persistent/ambiguous geometry, and human/automatic
   conflicts. Exact-repeat and automatic short-interval events are always hidden;
@@ -394,7 +418,8 @@ coordinate copy. Its columns are grouped as follows:
 Compact event details exist only on implicated rows. Every footer stores schema,
 algorithm and product-layout versions, effective configuration, platform-specific
 review/drogue/deployment/source hashes, a compact event catalog, and observation/
-unresolved counts. Event summaries include event type, earliest UTC time, and
+unresolved counts. It also stores the resolution policy and per-case decision
+counts. Event summaries include event type, earliest UTC time, and
 earliest source index for deterministic navigation. The reviewer constructs its queue from these footers without
 materializing all trajectory rows.
 
@@ -416,9 +441,18 @@ recomputed and atomically replaced independently. Unaffected files remain byte-f
 byte unchanged. The legacy monolithic `position_qc.parquet` is ignored and never
 deleted or migrated automatically.
 
-Algorithm version `native-position-qc-v2.4` introduces endpoint speed-cure ranking
-and time-bounded bidirectional excursion recovery. The first run rebuilds older
-per-platform products once; subsequent compatible runs reuse them normally.
+Algorithm version `native-position-qc-v2.5` adds the aggressive bounded automatic
+solver and policy-aware provenance. Switching between automatic and reviewer modes
+causes the per-platform products to rebuild under the appropriate policy; later
+runs with the same policy reuse them normally.
+
+After every successful command, `position_qc_run_summary.csv` is atomically written
+in the trajectory output directory. It has one row per platform plus an
+`ALL_PLATFORMS` row and counts repeat, short-interval, duplicate-time, one-point and
+multi-point speed-cure removals, block sizes, human rejections, capped retained
+anomalies, local unresolved observations, upstream uncertainty, and final valid/
+rejected observations. The CLI prints the aggregate counts. The summary is derived
+from Parquet footers and does not load or concatenate all trajectory rows.
 
 ## Raw-data smoke check
 

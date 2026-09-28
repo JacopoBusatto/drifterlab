@@ -304,7 +304,11 @@ drifterlab-position-qc configs/arcterx/position_qc.local.yml --manual
 ```
 
 All modes share a directory of `<platform_code>.parquet` files and
-`position_review.csv`. R/K decisions are staged until N or Q, then only affected
+`position_review.csv`. Automatic mode uses a bounded deterministic speed/acceleration
+solver; semiautomatic and manual modes retain the conservative review policy. The
+policy is stored in each footer, so switching modes rebuilds incompatible products.
+Every successful run also writes an atomic `position_qc_run_summary.csv` with
+per-platform and aggregate removal counts. R/K decisions are staged until N or Q, then only affected
 trajectory files are recalculated. No supplied reconstructed track is read or
 displayed. Manual and semiautomatic modes use the installed three-panel Matplotlib reviewer and resume automatically from the atomic
 `position_review.session.json` cursor. See [the algorithm, schemas, reviewer

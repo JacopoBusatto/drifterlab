@@ -81,6 +81,82 @@ def test_block_beyond_elapsed_time_limit_and_uncured_single_edge_remain_unresolv
     assert not single.final_position_status.eq("rejected").any()
 
 
+def test_aggressive_solver_expands_only_to_configured_removal_limit():
+    values = [0, .001, .002, .20, .201, .202, .203, .204, .205, .003, .004, .005]
+    limited = run_native_position_qc(
+        trajectory(values), drogue(),
+        position_config=NativePositionConfig(
+            speed_threshold_m_s=2, max_local_gap_seconds=3000,
+            max_automatic_removal_points=5,
+        ),
+        resolution_policy="aggressive",
+    )
+    assert not limited.final_position_status.eq("rejected").any()
+    assert limited.point_auto_reason.eq("automatic_keep_removal_limit_reached").any()
+    assert not limited.final_position_status.isin(["unresolved", "uncertain"]).any()
+
+    cured = run_native_position_qc(
+        trajectory(values), drogue(),
+        position_config=NativePositionConfig(
+            speed_threshold_m_s=2, max_local_gap_seconds=3000,
+            max_automatic_removal_points=6,
+        ),
+        resolution_policy="aggressive",
+    )
+    assert cured.loc[cured.final_position_status.eq("rejected"), "source_obs_index"].tolist() == list(
+        range(3, 9)
+    )
+
+
+def test_aggressive_equal_size_cures_use_vector_acceleration_and_are_deterministic():
+    result = run_native_position_qc(
+        trajectory([-.004, 0, .004, .010, .014, .018]), drogue(),
+        position_config=NativePositionConfig(speed_threshold_m_s=2),
+        resolution_policy="aggressive",
+    )
+    rejected = result.loc[result.final_position_status.eq("rejected")]
+    assert len(rejected) == 1
+    evidence = json.loads(rejected.iloc[0].forward_result_json)
+    cures = [item for item in evidence["tested_hypotheses"] if item["cures"]]
+    assert len(cures) == 2
+    selected_acceleration = evidence["maximum_boundary_acceleration_m_s2"]
+    assert selected_acceleration == pytest.approx(min(
+        item["maximum_boundary_acceleration_m_s2"] for item in cures
+    ))
+    rerun = run_native_position_qc(
+        trajectory([-.004, 0, .004, .010, .014, .018]), drogue(),
+        position_config=NativePositionConfig(speed_threshold_m_s=2),
+        resolution_policy="aggressive",
+    )
+    assert rerun.loc[rerun.final_position_status.eq("rejected"), "source_obs_index"].tolist() == (
+        rejected.source_obs_index.tolist()
+    )
+
+
+def test_aggressive_duplicate_time_keeps_smoothest_representative():
+    result = run_native_position_qc(
+        trajectory([0, .001, .002, .2, .003, .004], seconds=[0, 300, 600, 600, 900, 1200]),
+        drogue(), resolution_policy="aggressive",
+    )
+    kept = result.loc[result.source_obs_index == 2].iloc[0]
+    rejected = result.loc[result.source_obs_index == 3].iloc[0]
+    assert kept.point_auto_status == "duplicate_timestamp_representative"
+    assert kept.final_position_status == "valid"
+    assert rejected.final_position_status == "rejected"
+    assert rejected.position_decision_source == "automatic_duplicate_time"
+    assert not result.final_position_status.isin(["unresolved", "uncertain"]).any()
+
+
+def test_conservative_policy_preserves_ambiguous_review_event():
+    result = run_native_position_qc(
+        trajectory([0, .001, .002, .03, .031, .032]), drogue(),
+        position_config=NativePositionConfig(speed_threshold_m_s=2),
+        resolution_policy="conservative",
+    )
+    assert result.local_event_type.eq("single_edge_ambiguous").any()
+    assert result.final_position_status.eq("unresolved").any()
+
+
 def test_arcterx_18554_excerpt_has_one_unique_speed_cure():
     source = np.arange(18564, 18543, -1)
     seconds = [

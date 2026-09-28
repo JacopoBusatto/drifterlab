@@ -26,8 +26,9 @@ position_qc:
   max_local_gap_seconds: 1800
   gap_tolerance_seconds: 1
   speed_threshold_m_s: 3.0
-  # Compatibility-only in v2.4; recovery is bounded by max_local_gap_seconds.
+  # Deprecated compatibility alias; the explicit automatic limit is used below.
   max_bridge_skip_points: 3
+  max_automatic_removal_points: 5
   one_sided_spike_window_points: 15
   one_sided_spike_min_samples: 8
   one_sided_spike_residual_z_threshold: 6.0
