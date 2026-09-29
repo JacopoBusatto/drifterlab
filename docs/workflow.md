@@ -1,63 +1,44 @@
 # Processing workflow
 
-`drifterlab` is organized around this scientific data flow:
-
 ```text
-RAW
+RAW MAT
   ↓
-QC
+DROGUE DETECTION + REVIEW
   ↓
-RECONSTRUCTION
+NATIVE-POSITION QC + REVIEW
   ↓
-TRAJECTORY ZARR
+PER-PLATFORM QC PARQUETS
   ↓
-DEPLOYMENT / CLUSTER METADATA
+COMMON-GRID RECONSTRUCTION
   ↓
-GROUPED / PAIR ZARR
+LEAN CANDIDATE TRAJECTORY ZARR + GAP REPORT
+  â†“ (optional, read-only)
+TRAJECTORY OVERVIEW / EXACT-START / RECONSTRUCTION-CHECK FIGURES
+  ↓
+DEPLOYMENT / GROUP PRODUCTS (future)
   ↓
 SCIENCE
 ```
 
-The stages are intentionally explicit. Campaign-specific schemas and policies
-belong under `drifterlab.experiments`; reusable calculations and product models
-belong in the generic modules.
+| Stage | Input | Output | Owner | Status |
+|---|---|---|---|---|
+| Raw | Campaign source MAT files | Immutable normalized signals/positions | `drifterlab.io` | Implemented |
+| Drogue QC | Raw TTFF/strain | Automatic Parquet plus explicit review CSV | `drifterlab.qc`, `drifterlab.workflows`, `drifterlab.review` | Implemented |
+| Position QC | Raw positions and resolved drogue decision | Schema-3 per-platform QC Parquets plus review CSV | same generic packages | Implemented |
+| Reconstruction | Finalized position-QC Parquets only | Shared-grid linear and phase-ensemble spline tracks | `drifterlab.reconstruction` and reconstruction workflow | Implemented |
+| Trajectory product | Reconstructed rows | Lean candidate Zarr and per-platform build report | reconstruction workflow | Implemented |
+| Plotting | Validated trajectory Zarr | Overview, exact-start, and optional reconstruction-check PNGs | reconstruction command | Implemented |
+| Grouping/science | Reviewed trajectory product | Deployment, pair, and analysis products | future packages | Planned |
 
-| Stage | Purpose | Input | Output | Owner | Status |
-| --- | --- | --- | --- | --- | --- |
-| Raw | Read source files without silently changing their meaning. | Campaign source files. | Normalized, provenance-preserving signals or trajectory records. | Generic MATLAB handling and raw reader dispatch: `drifterlab.io`; supplied-QC ARCTERX reader: `drifterlab.experiments.arcterx.microsvp`. | Generic MicroSVP MAT drogue-signal/native-position extraction and supplied-QC trajectory ingestion are implemented. |
-| QC | Calculate explicit validity masks and advisory flags; apply reviewed decisions separately from source data. | Normalized records/signals and review tables. | Transparent automatic results and separate reviewed decisions. | Generic drogue and native-position calculations/workflows/review: `drifterlab.qc`, `drifterlab.workflows`, and `drifterlab.review`; unrelated ARCTERX policy remains under `drifterlab.experiments.arcterx`. | Standalone drogue-loss and native-position QC/review plus existing supplied-QC audits are implemented. |
-| Reconstruction | Produce regular 30-minute and 60-minute trajectories from reviewed native positions. | Reviewed native trajectories. | Reconstructed position series with method provenance. | Future `drifterlab.reconstruction` package. | Planned. Current ARCTERX ingestion only preserves the reconstructions supplied by the campaign. |
-| Trajectory Zarr | Inventory trajectories and publish individual-trajectory arrays on explicit observation axes. | QC records and any available reconstructed series. | Inventory Parquet and trajectory Zarr. | `drifterlab.trajectories`, orchestrated for ARCTERX by `drifterlab.experiments.arcterx.pipeline`. | Implemented for supplied ARCTERX QC MicroSVP data. |
-| Deployment / cluster metadata | Record reviewed deployment membership without inferring it during I/O. | Trajectory product plus campaign deployment evidence. | A frozen deployment/group metadata table. | Future `drifterlab.grouping` package, with ARCTERX conventions under `drifterlab.experiments.arcterx`. | Planned. |
-| Grouped / pair Zarr | Synchronize group members and construct explicit physical pairs. | Trajectory Zarr and frozen group metadata. | Group and pair Zarr products. | Future `drifterlab.grouping` package. | Planned. |
-| Science | Compute diagnostics such as relative dispersion, FSLE, and structure functions. | Versioned grouped/pair products. | Reproducible scientific results. | Downstream analysis code; not preprocessing. | Planned and outside the current package scope. |
+The position Parquets are the detailed QC audit record. The trajectory Zarr does
+not copy their flags or sensor data. Reconstruction trusts `drogue_eligible` and
+the recorded analysis cutoff, including its upstream margin; it never reads the
+drogue signals or estimates loss again.
 
-## Implemented now
+The former production path from delivered campaign-QC MAT files to a padded master
+Zarr has been removed. Its supplied-QC reader and independent diagnostic scripts
+remain for historical investigation only. In particular, the delivered
+`drifter_interp` tracks are not inputs to the production reconstruction stage.
 
-- generic MATLAB time conversion, normalized trajectory records, inventories,
-  and bounded-memory Zarr writing;
-- standalone raw-signal drogue-loss detection and manual review, without using
-  supplied/reference drogue-loss dates;
-- generic raw native-position temporal/local QC, final resolution, and review,
-  without reconstructed-track evidence;
-- ARCTERX QC MicroSVP schema mapping and ingestion;
-- non-destructive time, position, speed, and drogue-validity calculations;
-- explicit ARCTERX drogue-review table handling;
-- preservation of the supplied 30-minute and 60-minute reconstructed tracks;
-- legacy ARCTERX position-review utilities and investigative diagnostics,
-  retained outside the normal generic QC command.
-
-The legacy ARCTERX iteration artifacts are preserved without migration. The normal
-workflow is now `drifterlab-position-qc`; it uses one `<platform_code>.parquet`
-per native trajectory, `position_review.csv`, and an optional tiny resume file.
-
-## Planned next
-
-1. separate downstream validation of finalized drogue estimates against supplied
-   ARCTERX dates;
-2. 30-minute and 60-minute reconstruction from resolved native positions;
-3. individual trajectory Zarr generated from those reviewed products;
-4. deployment-group metadata;
-5. grouped and pair Zarr products.
-
-No reconstruction, grouping, or science algorithm is implemented yet.
+See [trajectory reconstruction](trajectory_reconstruction.md) for the numerical
+policy and [native-position QC](native_position_qc.md) for the upstream schema.

@@ -224,7 +224,8 @@ def _base_frame(trajectory: NativeTrajectory, drogue: ResolvedDrogueDecision,
         "source_sha256": np.repeat(trajectory.source_sha256, n),
         "time": pd.to_datetime(time, utc=True),
         "time_value": time,
-        # Private working columns are removed before publication.
+        # Coordinates are immutable source values and are part of the published
+        # audit record.  Only ``time_value`` is a private working column.
         "source_lon": lon,
         "source_lat": lat,
         "valid_timestamp": valid_time,
@@ -1613,7 +1614,7 @@ def run_native_position_qc(
     frame["position_decision_source"] = resolution.decision_source
     frame["platform_qc_complete"] = resolution.platform_qc_complete
     frame["reconstruction_available"] = resolution.reconstruction_available
-    return frame.drop(columns=["source_lon", "source_lat", "time_value"])
+    return frame.drop(columns=["time_value"])
 
 
 def resolved_position_trajectory(

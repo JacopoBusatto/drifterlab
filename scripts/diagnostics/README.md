@@ -2,15 +2,17 @@
 
 These repository scripts preserve timing, sustained-start, and residual-jump
 checks for troubleshooting unrelated ARCTERX processing. They are outside the
-installed `drifterlab` package and are not invoked by the preprocessing or
-drogue CLIs.
+installed production workflow and are not invoked by the drogue, position-QC, or
+reconstruction CLIs. Diagnostics that consume the historical master Zarr require
+an existing store; the removed MAT-to-Zarr producer is not restored here.
 
 Activate the repository environment and run from the repository root:
 
 ```powershell
 python scripts/diagnostics/timing_diagnostic.py `
-  --config configs/arcterx/microsvp_preprocessing.local.yml `
+  --qc-directory "C:/path/to/ARCTERX/Data/Quality Controlled/MicroSVP" `
   --raw-directory "C:/path/to/ARCTERX/Data/Raw/MicroSVP" `
+  --inventory data/microsvp_inventory.parquet `
   --output-directory data/diagnostics
 
 python scripts/diagnostics/sustained_start.py

@@ -9,7 +9,6 @@ import pandas as pd
 import pytest
 import xarray as xr
 
-from drifterlab.experiments.arcterx import preprocess
 from drifterlab.experiments.arcterx.position_review import (
     Decisions, apply_decisions, build_iteration, candidates, edge_arrays, load_queue,
     native_frame, validate_paths,
@@ -153,7 +152,7 @@ def test_invalid_rows_and_nonpositive_intervals(tmp_path):
 
 
 @pytest.fixture
-def review_project(mat_factory, config_factory, tmp_path):
+def review_project(mat_factory, legacy_master_factory, tmp_path):
     n = 6
     native = {"time": 719529 + np.arange(n)[::-1] * 300 / 86400,
               "longitude": [0.004, 0.003, 0.002, .03, .001, 0], "latitude": np.zeros(n),
@@ -165,8 +164,8 @@ def review_project(mat_factory, config_factory, tmp_path):
                   "latitude_60min": np.arange(5) * .0003}
     source, _ = mat_factory(native_changes=native, interp_changes=references)
     mat_factory("1002")  # Mixed lengths, real padding, different source hashes.
-    preprocess(config_factory())
-    return (tmp_path / "out/master.zarr", tmp_path / "review/decisions.csv",
+    master = legacy_master_factory()
+    return (master, tmp_path / "review/decisions.csv",
             tmp_path / "review/queues", tmp_path / "processed/reviewed.parquet", source)
 
 

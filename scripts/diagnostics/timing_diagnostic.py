@@ -15,7 +15,6 @@ import pandas as pd
 
 from drifterlab.io.matlab import normalize_missing, read_matlab
 from drifterlab.qc.position import position_valid
-from drifterlab.experiments.arcterx.config import load_config
 from drifterlab.experiments.arcterx.microsvp import _identifier, read_microsvp
 
 TOLERANCE_SECONDS = 1.0  # Comparison tolerance only; saved times are never rounded.
@@ -472,23 +471,31 @@ def plot_timelines(frame: pd.DataFrame, output: Path) -> None:
         plt.close(fig)
 
 
-def run(config_path: Path, raw_directory: Path, output: Path, *, figures: bool = True) -> dict:
-    config = load_config(config_path)
+def run(qc_directory: Path, raw_directory: Path, inventory: Path, output: Path, *,
+        pattern: str = "*.mat", missing_value: float = -999,
+        figures: bool = True) -> dict:
+    qc_directory = qc_directory.resolve()
+    raw_directory = raw_directory.resolve()
+    inventory = inventory.resolve()
     output = output.resolve()
-    for protected in (config.input_directory, raw_directory.resolve(), config.zarr):
+    for protected in (qc_directory, raw_directory):
         if output == protected or protected in output.parents:
-            raise ValueError("Diagnostic output directory must be outside source directories and the master Zarr")
+            raise ValueError("Diagnostic output directory must be outside source directories")
+    if output == inventory:
+        raise ValueError("Diagnostic output must not overwrite the inventory")
     if not raw_directory.is_dir():
         raise ValueError(f"Raw directory does not exist: {raw_directory}")
-    if not config.input_directory.is_dir():
-        raise ValueError(f"QC directory does not exist: {config.input_directory}")
+    if not qc_directory.is_dir():
+        raise ValueError(f"QC directory does not exist: {qc_directory}")
+    if not inventory.is_file():
+        raise ValueError(f"Inventory does not exist: {inventory}")
     raw, raw_errors = catalog(raw_directory, "raw")
-    qc, qc_errors = catalog(config.input_directory, "qc", config.pattern)
+    qc, qc_errors = catalog(qc_directory, "qc", pattern)
     matching = matching_report(raw, qc, raw_errors, qc_errors)
     output.mkdir(parents=True, exist_ok=True)
     (output / "microsvp_source_matching.json").write_text(json.dumps(matching, indent=2) + "\n", encoding="utf-8")
     print(f"ID matching: {matching['matched_pairs']} unique raw/QC pairs; {len(matching['ambiguous_platform_ids'])} ambiguous IDs", flush=True)
-    frame = build_table(raw, qc, pd.read_parquet(config.inventory), config.missing_value)
+    frame = build_table(raw, qc, pd.read_parquet(inventory), missing_value)
     frame.to_parquet(output / "microsvp_timing_diagnostic.parquet", index=False)
     csv = frame.copy()
     for name in csv:
@@ -496,7 +503,10 @@ def run(config_path: Path, raw_directory: Path, output: Path, *, figures: bool =
             csv[name] = csv[name].map(lambda t: "" if pd.isna(t) else t.isoformat())
     csv.to_csv(output / "microsvp_timing_diagnostic.csv", index=False)
     summary = summarize(frame, matching)
-    summary["configuration"] = {"qc_directory": str(config.input_directory), "raw_directory": str(raw_directory.resolve()), "inventory": str(config.inventory), "missing_value": config.missing_value}
+    summary["configuration"] = {
+        "qc_directory": str(qc_directory), "raw_directory": str(raw_directory),
+        "inventory": str(inventory), "pattern": pattern, "missing_value": missing_value,
+    }
     (output / "microsvp_timing_summary.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
     write_report(frame, summary, output)
     if figures:
@@ -508,12 +518,19 @@ def run(config_path: Path, raw_directory: Path, output: Path, *, figures: bool =
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--config", type=Path, required=True, help="Existing ARCTERX preprocessing YAML (read only)")
+    parser.add_argument("--qc-directory", type=Path, required=True, help="Delivered QC MicroSVP MAT directory")
     parser.add_argument("--raw-directory", type=Path, required=True, help="Raw/MicroSVP directory")
+    parser.add_argument("--inventory", type=Path, required=True, help="Existing legacy inventory used for comparison")
+    parser.add_argument("--pattern", default="*.mat")
+    parser.add_argument("--missing-value", type=float, default=-999)
     parser.add_argument("--output-directory", type=Path, default=Path("data/diagnostics"))
     parser.add_argument("--no-figures", action="store_true")
     args = parser.parse_args(argv)
-    run(args.config, args.raw_directory, args.output_directory, figures=not args.no_figures)
+    run(
+        args.qc_directory, args.raw_directory, args.inventory, args.output_directory,
+        pattern=args.pattern, missing_value=args.missing_value,
+        figures=not args.no_figures,
+    )
     return 0
 
 

@@ -4,7 +4,6 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from drifterlab.experiments.arcterx import preprocess
 from drifterlab.qc.flags import consecutive_speed
 from drifterlab.qc.position import position_valid
 from scripts.diagnostics.residual_jumps import Track, duration_counts, flagged_pairs, run, summarize
@@ -72,14 +71,13 @@ def test_empty_flag_table_has_a_valid_summary():
     assert summary["affected_drifters"] == 0
 
 
-def test_complete_diagnostic_preserves_inputs_and_verifies_source(mat_factory, config_factory, tmp_path):
+def test_complete_diagnostic_preserves_inputs_and_verifies_source(mat_factory, legacy_master_factory, tmp_path):
     seconds = np.array([0, 300, 600, 660, 3000])
     changes = {"time": (719529 + seconds / 86400)[::-1],
                "longitude": np.array([0, -999, 1, 1.01, 1.08])[::-1], "latitude": np.zeros(5),
                **{name: np.ones(5) for name in ["SST", "SLP", "battery", "drogue", "speed"]}}
     source, _ = mat_factory(native_changes=changes, no_interp=True)
-    preprocess(config_factory())
-    master = tmp_path / "out/master.zarr"
+    master = legacy_master_factory()
     protected = [source, tmp_path / "out/inventory.parquet", *[p for p in master.rglob("*") if p.is_file()]]
     before = {p: sha256(p.read_bytes()).hexdigest() for p in protected}
     output = tmp_path / "jump_diagnostic"

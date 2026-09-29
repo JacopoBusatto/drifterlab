@@ -32,7 +32,7 @@ from drifterlab.review.position import (
 from .drogue import load_drogue_detection
 
 
-POSITION_QC_SCHEMA_VERSION = "2.0"
+POSITION_QC_SCHEMA_VERSION = "3.0"
 POSITION_QC_ALGORITHM_VERSION = "native-position-qc-v2.5"
 DEPLOYMENT_COLUMNS = [
     "platform_code", "deployment_time", "deployment_window_start",
@@ -487,7 +487,7 @@ def run_position_workflow(
             "schema_version": POSITION_QC_SCHEMA_VERSION,
             "algorithm_version": POSITION_QC_ALGORITHM_VERSION,
             "drifterlab_version": __version__,
-            "product_layout": "per-trajectory-v1",
+            "product_layout": "per-trajectory-v2",
             "resolution_policy": resolution_policy,
             "platform_code": code,
             "config_sha256": config_hash,
@@ -514,9 +514,16 @@ def run_position_workflow(
         return config.output_directory / _safe_platform_filename(code)
 
     def compatible(code: str) -> bool:
-        actual = _metadata(output_path(code))
+        path = output_path(code)
+        actual = _metadata(path)
         expected = platform_dependencies(code)
-        return bool(actual) and all(actual.get(key) == expected[key] for key in dependency_keys)
+        if not actual or not all(actual.get(key) == expected[key] for key in dependency_keys):
+            return False
+        try:
+            columns = set(pq.read_schema(path).names)
+        except Exception:
+            return False
+        return {"source_lon", "source_lat"} <= columns
 
     def publish_platform(code: str, frame: pd.DataFrame) -> None:
         catalog = position_event_catalog(frame, config_hash)

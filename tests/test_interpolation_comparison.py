@@ -4,7 +4,6 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from drifterlab.experiments.arcterx import preprocess
 from drifterlab.qc.position import position_valid
 from scripts.diagnostics.interpolation_comparison import (
     ReconstructionTrack,
@@ -88,7 +87,7 @@ def test_reconstruction_scan_uses_adjacent_rows_and_separates_new_events():
     assert scan_reconstructed_flags(masked, "interp30", native).empty
 
 
-def test_focused_synthetic_run_writes_outputs_without_modifying_master(mat_factory, config_factory, tmp_path):
+def test_focused_synthetic_run_writes_outputs_without_modifying_master(mat_factory, legacy_master_factory, tmp_path):
     n = 5
     matlab_time = 719529 + np.arange(n) * 300 / 86400
     native = {
@@ -103,8 +102,7 @@ def test_focused_synthetic_run_writes_outputs_without_modifying_master(mat_facto
         "speed_30min": np.ones(n), "speed_60min": np.ones(n),
     }
     mat_factory(native_changes=native, interp_changes=interp)
-    preprocess(config_factory())
-    master = tmp_path / "out/master.zarr"
+    master = legacy_master_factory()
     local = tmp_path / "local"
     classify_local_jumps(master, local, figures=False)
     protected = [p for p in master.rglob("*") if p.is_file()]

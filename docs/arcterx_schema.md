@@ -1,4 +1,9 @@
-# Inspected ARCTERX QC MicroSVP schema
+# Inspected legacy ARCTERX supplied-QC MicroSVP schema
+
+This document describes delivered campaign-QC MATLAB files for historical and
+diagnostic use. The production reconstruction workflow does not read these files
+or their `drifter_interp` tracks; it reads finalized position-QC Parquets instead.
+The former MAT-to-master-Zarr producer has been removed.
 
 The first implementation was grounded in all 150 local QC MicroSVP files and the
 supplied **Arcterx Data Guide.docx**. The workflow prompt's `QualityControlled`
@@ -12,7 +17,7 @@ The two field-name sets are consistent across all files.
 
 ## Field mappings
 
-| Source field | Shape | Master variable |
+| Source field | Shape | Historical diagnostic variable |
 |---|---|---|
 | `drifter.PlatformId` | scalar integer | `platform_code` (exact string) |
 | `drifter.ID` | scalar integer | `source_id` (exact string) |

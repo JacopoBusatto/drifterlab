@@ -1,7 +1,7 @@
 # ARCTERX raw/QC timing diagnostic
 
-Optional troubleshooting only. The production preprocessing CLI and package API
-do not run or expose this script. Outputs remain in `data/diagnostics/`.
+Optional troubleshooting only. Production commands do not run or expose this
+script. Outputs remain in `data/diagnostics/`.
 
 The February 6 first-valid-QC-time cohort is not explained by a common three-day
 cut at ingestion or upstream QC: **61 of its 65 primary raw observation series
@@ -16,14 +16,16 @@ Activate the repository environment, then run from the repository root:
 ```powershell
 python -m pip install -e ".[diagnostics]"
 python scripts/diagnostics/timing_diagnostic.py `
-  --config configs/arcterx/microsvp_preprocessing.local.yml `
+  --qc-directory "C:/path/to/ARCTERX/Data/Quality Controlled/MicroSVP" `
   --raw-directory "C:/path/to/ARCTERX/Data/Raw/MicroSVP" `
+  --inventory data/microsvp_inventory.parquet `
   --output-directory data/diagnostics
 ```
 
-The existing YAML supplies the QC input directory, pattern, inventory path, and
-missing-value sentinel. The diagnostic does not invoke preprocessing or write the
-master. `--no-figures` runs the data comparison without requiring Matplotlib.
+The paths are explicit because the former production preprocessing configuration
+has been removed. Optional `--pattern` and `--missing-value` arguments retain the
+historical defaults. The diagnostic does not write a master.
+`--no-figures` runs the data comparison without requiring Matplotlib.
 Repeated runs replace the diagnostic artifacts in the chosen output directory.
 
 Raw files contain `dataset.drifter_<ID>`, `meta_<ID>`, and `diagnostic_<ID>`.

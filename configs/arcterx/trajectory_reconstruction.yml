@@ -1,0 +1,48 @@
+input:
+  # Finalized schema-3 position-QC Parquets, one file per platform.
+  directory: ../../data/qc/position
+  pattern: "*.parquet"
+grid:
+  # Validation boundary and phase anchor. Globally empty leading cells are omitted.
+  start_time: "2025-01-12T00:00:00Z"
+  end_time: null
+  dt_minutes: 5
+spline:
+  period_minutes: [15, 30, 60]
+  long_gap_threshold_minutes:
+    15: 15
+    30: 30
+    60: 60
+output:
+  # Atomically published bundle containing trajectories.zarr and build_report.csv.
+  directory: ../../data/reconstruction/arcterx_trajectories_candidate
+  chunks:
+    platform: 1
+    time: 2016
+
+plotting:
+  # Plotting is optional and never changes the reconstructed trajectory product.
+  enabled: false
+  output_directory: ../../data/reconstruction/arcterx_trajectory_figures
+  dataset_label: MicroSVP
+  method: spline_30
+  time:
+    start: null
+    end: null
+  # Empty means every platform. Entries are keyed by dataset label to avoid ambiguity.
+  platforms: []
+  # Each selected platform receives one linear-versus-splines check figure.
+  check_platforms: []
+  map:
+    projection: PlateCarree
+    central_longitude: 0
+    extent: null
+    figsize: [12, 8]
+    dpi: 150
+    land: true
+    coastlines: true
+    gridlines: true
+    label_starts: false
+  # Additional stores use the same lean trajectory schema but may have their own
+  # time grid and available reconstruction methods.
+  additional_stores: []

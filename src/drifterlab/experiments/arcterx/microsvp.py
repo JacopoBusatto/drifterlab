@@ -70,7 +70,8 @@ def read_microsvp(path: str | Path, *, missing_value: float = -999) -> Trajector
     """Read and sort each source time axis, without applying an analysis policy.
 
     Returned datetimes represent UTC by the ARCTERX campaign convention.
-    Audit and drogue decisions are added by ``preprocess``.
+    This adapter is retained for read-only diagnostics of the delivered campaign
+    files.  Production trajectory reconstruction reads position-QC Parquets.
     """
     path = Path(path)
     loaded = read_matlab(path)

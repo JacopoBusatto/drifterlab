@@ -1,1 +1,1 @@
-"""Trajectory records, inventory tables, and Zarr products."""
+"""Legacy normalized records retained for supplied-QC diagnostics."""

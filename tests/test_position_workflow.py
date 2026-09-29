@@ -107,9 +107,13 @@ def test_automatic_writes_one_platform_file_with_complete_metadata_and_reuses(po
     assert result.files == (output,) and output.exists()
     frame = pd.read_parquet(output)
     assert len(frame) == 10 and frame.source_obs_index.tolist() == list(range(10))
-    assert not {"source_lon", "source_lat", "lon", "lat"} & set(frame)
+    assert {"source_lon", "source_lat"} <= set(frame)
+    assert not {"lon", "lat"} & set(frame)
+    np.testing.assert_array_equal(frame.source_lon, [.009, .008, .007, .006, .2, .004, .2, .002, .001, 0])
+    np.testing.assert_array_equal(frame.source_lat, np.zeros(10))
     provenance = metadata(output)
-    assert provenance["product_layout"] == "per-trajectory-v1"
+    assert provenance["schema_version"] == "3.0"
+    assert provenance["product_layout"] == "per-trajectory-v2"
     assert provenance["resolution_policy"] == "aggressive"
     assert provenance["platform_code"] == "1001"
     assert provenance["observation_count"] == 10
@@ -193,6 +197,38 @@ def test_overwrite_preserves_reviews_and_existing_notes(position_inputs):
     before = file_sha256(reviews.path)
     run_position_workflow(config_path, "automatic", overwrite=True)
     assert file_sha256(reviews.path) == before
+
+
+def test_schema_two_product_rebuilds_with_coordinates_and_preserves_review(position_inputs):
+    _, _, config_path = position_inputs
+    result = run_position_workflow(config_path, "automatic")
+    output = result.files[0]
+    frame = pd.read_parquet(output)
+    source = int(frame.source_obs_index.iloc[0])
+    reviews = PositionReviews(load_position_config(config_path).review_output)
+    reviews.set_observations(
+        frame, [source], "reject", decision_source="manual",
+        config_sha256="review-before-schema-migration", note="retain this decision",
+    )
+    reviews.save()
+    review_hash = file_sha256(reviews.path)
+    run_position_workflow(config_path, "automatic")
+
+    arrow = pq.read_table(output).drop(["source_lon", "source_lat"])
+    footer = metadata(output)
+    footer.update(schema_version="2.0", product_layout="per-trajectory-v1")
+    arrow_metadata = dict(arrow.schema.metadata or {})
+    arrow_metadata[b"drifterlab_position_qc"] = json.dumps(footer, sort_keys=True).encode()
+    pq.write_table(arrow.replace_schema_metadata(arrow_metadata), output)
+
+    messages = []
+    run_position_workflow(config_path, "automatic", progress=messages.append)
+    rebuilt = pd.read_parquet(output)
+    reviewed = rebuilt.loc[rebuilt.source_obs_index == source].iloc[0]
+    assert {"source_lon", "source_lat"} <= set(rebuilt)
+    assert reviewed.human_position_decision == "reject"
+    assert file_sha256(reviews.path) == review_hash
+    assert any("Published position QC" in message for message in messages)
 
 
 def test_hash_mismatch_unsafe_platform_and_shared_paths_fail_fast(position_inputs, tmp_path):

@@ -9,7 +9,6 @@ import pytest
 import xarray as xr
 
 from drifterlab.cli.review_arcterx_positions import main
-from drifterlab.experiments.arcterx import preprocess
 from drifterlab.experiments.arcterx.jump_recovery import recover_region, suggest_regions
 from drifterlab.experiments.arcterx.position_review import (
     Decisions, apply_decisions, build_iteration, candidates, load_queue, load_suggestions, native_frame,
@@ -121,15 +120,15 @@ def test_native_missing_fix_is_not_skipped_but_surviving_adjacency_is_supported(
 
 
 @pytest.fixture
-def recovery_project(mat_factory, config_factory, tmp_path, request):
+def recovery_project(mat_factory, legacy_master_factory, tmp_path, request):
     lon = getattr(request, "param", [0, .001, .002, .2, .003, .2, .004, .005, .006])
     n = len(lon)
     changes = {"time": 719529 + np.arange(n) * 300 / 86400,
                "longitude": lon, "latitude": np.zeros(n),
                **{name: np.ones(n) for name in ("SST", "SLP", "battery", "drogue", "speed")}}
     source, _ = mat_factory(native_changes=changes, no_interp=True)
-    preprocess(config_factory())
-    return (tmp_path / "out/master.zarr", tmp_path / "review/decisions.csv",
+    master = legacy_master_factory()
+    return (master, tmp_path / "review/decisions.csv",
             tmp_path / "review/queues", tmp_path / "processed/reviewed.parquet", source)
 
 

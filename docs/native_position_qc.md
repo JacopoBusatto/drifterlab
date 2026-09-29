@@ -382,11 +382,12 @@ caller explicitly opts in.
 ## Product schemas and persistence
 
 The configured position directory contains `<platform_code>.parquet`, one file per
-native trajectory. Each file contains one row per source observation and no
-coordinate copy. Its columns are grouped as follows:
+native trajectory. Schema `3.0` contains one row per immutable source observation,
+including the original coordinates needed by reconstruction. Its columns are
+grouped as follows:
 
 - identity/validity: `platform_code`, `source_obs_index`, `source_path`,
-  `source_sha256`, `time`, `valid_timestamp`, `source_position_valid`,
+  `source_sha256`, `time`, `source_lon`, `source_lat`, `valid_timestamp`, `source_position_valid`,
   `source_invalid_reason`;
 - drogue/deployment: `final_drogue_status`, `final_drogue_loss_time`,
   `analysis_cutoff_time`, `drogue_decision_source`, `drogue_eligible`,
@@ -409,7 +410,10 @@ coordinate copy. Its columns are grouped as follows:
 - resolution: `final_position_status`, `final_position_valid`,
   `position_decision_source`, `platform_qc_complete`, `reconstruction_available`.
 
-Compact event details exist only on implicated rows. Every footer stores schema,
+`source_lon` and `source_lat` are copied without normalization or wrapping and are
+never modified by review. Invalid values may remain on rejected audit rows; every
+final-valid row must have a finite in-range coordinate. Compact event details exist
+only on implicated rows. Every footer stores schema,
 algorithm and product-layout versions, effective configuration, platform-specific
 review/drogue/deployment/source hashes, a compact event catalog, and observation/
 unresolved counts. It also stores the resolution policy and per-case decision
@@ -438,6 +442,11 @@ Algorithm version `native-position-qc-v2.5` adds the aggressive bounded automati
 solver and policy-aware provenance. Switching between automatic and reviewer modes
 causes the per-platform products to rebuild under the appropriate policy; later
 runs with the same policy reuse them normally.
+
+The product schema is `3.0` and layout is `per-trajectory-v2`. The compatibility
+check requires both coordinate columns, so older products rebuild independently.
+Human decisions are retained because the authoritative review CSV is separate and
+is reapplied during that rebuild.
 
 After every successful command, `position_qc_run_summary.csv` is atomically written
 in the trajectory output directory. It has one row per platform plus an

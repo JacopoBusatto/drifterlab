@@ -10,17 +10,18 @@ readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     "numpy>=1.24", "scipy>=1.10", "pandas>=2.0", "xarray>=2025.1",
-    "zarr>=2.18,<3", "pyarrow>=14", "PyYAML>=6", "matplotlib>=3.8",
+    "zarr>=2.18,<3", "numcodecs>=0.12", "pyarrow>=14", "PyYAML>=6", "matplotlib>=3.8",
 ]
 
 [project.optional-dependencies]
-test = ["pytest>=8"]
+test = ["pytest>=8", "cartopy>=0.22"]
 diagnostics = ["matplotlib>=3.8"]
+plotting = ["cartopy>=0.22"]
 
 [project.scripts]
-drifterlab-preprocess-arcterx-microsvp = "drifterlab.cli.preprocess_arcterx_microsvp:main"
 drifterlab-drogue = "drifterlab.cli.drogue:main"
 drifterlab-position-qc = "drifterlab.cli.position_qc:main"
+drifterlab-reconstruct-trajectories = "drifterlab.cli.reconstruct_trajectories:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

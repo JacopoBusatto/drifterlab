@@ -5,7 +5,6 @@ import pandas as pd
 import pytest
 import xarray as xr
 
-from drifterlab.experiments.arcterx import preprocess
 from drifterlab.qc.flags import consecutive_speed
 from drifterlab.qc.position import position_valid
 from scripts.diagnostics.residual_jumps import Track, flagged_pairs, load_track
@@ -109,14 +108,13 @@ def test_precision_experiments_preserve_clear_case_and_detect_threshold_case():
     assert any(row["changed_flags"] for row in results[1:])
 
 
-def test_run_outputs_preserve_master_and_previous_diagnostic(mat_factory, config_factory, tmp_path):
+def test_run_outputs_preserve_master_and_previous_diagnostic(mat_factory, legacy_master_factory, tmp_path):
     n = 5
     changes = {"time": 719529 + np.arange(n) * 300 / 86400,
                "longitude": [0, .001, .02, .002, .003], "latitude": np.zeros(n),
                **{key: np.ones(n) for key in ["SST", "SLP", "battery", "drogue", "speed"]}}
     source, _ = mat_factory(native_changes=changes, no_interp=True)
-    preprocess(config_factory())
-    master = tmp_path / "out/master.zarr"
+    master = legacy_master_factory()
     previous = tmp_path / "previous.parquet"
     with xr.open_zarr(master, chunks=None) as ds:
         flagged_pairs(load_track(ds, 0))[0].to_parquet(previous, index=False)
@@ -138,9 +136,9 @@ def test_run_outputs_preserve_master_and_previous_diagnostic(mat_factory, config
         run(master, master / "diagnostics", figures=False)
 
 
-def test_no_flags_produces_empty_tables(mat_factory, config_factory, tmp_path):
+def test_no_flags_produces_empty_tables(mat_factory, legacy_master_factory, tmp_path):
     mat_factory(no_interp=True)
-    preprocess(config_factory())
-    summary = run(tmp_path / "out/master.zarr", tmp_path / "diagnostic", figures=False)
+    master = legacy_master_factory()
+    summary = run(master, tmp_path / "diagnostic", figures=False)
     assert summary["total_flagged_edges"] == summary["total_flagged_runs"] == 0
     assert summary["isolated_run_edge_fraction"] == 0

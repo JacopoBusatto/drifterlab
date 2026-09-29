@@ -104,7 +104,7 @@ def test_inventory_first_valid_definition_recomputed(mat_factory):
     assert table.raw_n_rows_before_qc_first_valid_date.dtype.kind == "f"
 
 
-def test_complete_diagnostic_writes_report_without_changing_inventory(mat_factory, config_factory, tmp_path):
+def test_complete_diagnostic_writes_report_without_changing_inventory(mat_factory, tmp_path):
     path, payload = mat_factory()
     raw_dir = tmp_path / "raw"
     raw_dir.mkdir()
@@ -118,8 +118,7 @@ def test_complete_diagnostic_writes_report_without_changing_inventory(mat_factor
     inv_path.parent.mkdir()
     inventory.to_parquet(inv_path)
     before = sha256(inv_path.read_bytes()).hexdigest()
-    config = config_factory()
-    summary = run(config, raw_dir, tmp_path / "diagnostic", figures=False)
+    summary = run(path.parent, raw_dir, inv_path, tmp_path / "diagnostic", figures=False)
     assert summary["matching"]["matched_pairs"] == 1
     assert summary["inventory_check"]["first_valid_time_mismatches"] == 0
     assert sha256(inv_path.read_bytes()).hexdigest() == before
