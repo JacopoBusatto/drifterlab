@@ -31,6 +31,7 @@ class _Dataset:
     platform_ids: tuple[str, ...]
     platform_index: dict[str, int]
     methods: dict[str, tuple[str, str]]
+    array_ids: tuple[int, ...] | None
 
 
 def split_longitude_wrapped_path(
@@ -112,9 +113,19 @@ def _open_dataset(stack: ExitStack, label: str, path: Path, method: str) -> _Dat
             or np.any((start_lon < -180) | (start_lon > 180))
             or np.any((start_lat < -90) | (start_lat > 90))):
         raise ValueError(f"Plotting dataset {label!r} contains invalid exact starts")
+    array_ids: tuple[int, ...] | None = None
+    if "array_id" in dataset.variables:
+        if dataset.array_id.dims != ("platform",):
+            raise ValueError(f"Plotting dataset {label!r} has invalid array_id dimensions")
+        values = dataset.array_id.values
+        if not np.issubdtype(values.dtype, np.integer):
+            raise ValueError(f"Plotting dataset {label!r} array_id must be integer")
+        array_ids = tuple(int(value) for value in values)
+        if any(value < 1 for value in array_ids):
+            raise ValueError(f"Plotting dataset {label!r} has invalid array_id values")
     return _Dataset(
         label, path, method, dataset, platform_ids,
-        {platform: index for index, platform in enumerate(platform_ids)}, methods,
+        {platform: index for index, platform in enumerate(platform_ids)}, methods, array_ids,
     )
 
 
@@ -132,6 +143,14 @@ def _selected_platforms(source: _Dataset, selected: set[tuple[str, str]] | None)
         return source.platform_ids
     return tuple(
         platform for platform in source.platform_ids if (source.label, platform) in selected
+    )
+
+
+def _start_in_window(source: _Dataset, index: int, config: Any) -> bool:
+    start = source.dataset.start_time.isel(platform=index).values.astype("datetime64[ns]")
+    return bool(
+        (np.isnat(config.start_time) or start >= config.start_time)
+        and (np.isnat(config.end_time) or start <= config.end_time)
     )
 
 
@@ -197,12 +216,7 @@ def _plot_overview(
                     linewidth=.8, alpha=.75, zorder=2,
                 )
             if segments:
-                start_time = source.dataset.start_time.isel(platform=index).values.astype("datetime64[ns]")
-                in_window = (
-                    (np.isnat(config.start_time) or start_time >= config.start_time)
-                    and (np.isnat(config.end_time) or start_time <= config.end_time)
-                )
-                if in_window:
+                if _start_in_window(source, index, config):
                     start_lon = float(source.dataset.start_lon.isel(platform=index).values)
                     start_lat = float(source.dataset.start_lat.isel(platform=index).values)
                     axes.scatter(
@@ -232,12 +246,25 @@ def _plot_starts(
 ) -> None:
     figure, axes = _new_map(config)
     transform = ccrs.PlateCarree()
-    handles: list[Line2D] = []
+    handles: dict[tuple[str, int | None], Line2D] = {}
     plotted = 0
+    array_keys = [
+        (source.label, array_id)
+        for source in sources if source.array_ids is not None
+        for array_id in sorted(set(source.array_ids))
+    ]
+    palette = plt.get_cmap("tab20")
+    array_colors = {
+        key: palette(index % 20) for index, key in enumerate(array_keys)
+    }
     for source in sources:
-        color = colors[source.label]
         for platform in _selected_platforms(source, selected):
             index = source.platform_index[platform]
+            if not _start_in_window(source, index, config):
+                continue
+            array_id = None if source.array_ids is None else source.array_ids[index]
+            key = (source.label, array_id)
+            color = array_colors.get(key, colors[source.label])
             longitude = float(source.dataset.start_lon.isel(platform=index).values)
             latitude = float(source.dataset.start_lat.isel(platform=index).values)
             axes.scatter(
@@ -250,24 +277,62 @@ def _plot_starts(
                     textcoords="offset points", fontsize=6, transform=transform, zorder=5,
                 )
             plotted += 1
-        handles.append(Line2D(
-            [0], [0], linestyle="none", marker="*", markersize=9,
-            markerfacecolor=color, markeredgecolor="black", label=source.label,
-        ))
+            label = source.label if array_id is None else f"{source.label}: Array {array_id}"
+            handles.setdefault(key, Line2D(
+                [0], [0], linestyle="none", marker="*", markersize=9,
+                markerfacecolor=color, markeredgecolor="black", label=label,
+            ))
     if not plotted:
         plt.close(figure)
         raise ValueError("No starting positions remain after platform selection")
-    axes.legend(handles=handles, title="Dataset", loc="best", frameon=True)
+    axes.legend(handles=list(handles.values()), title="Deployment array", loc="best", frameon=True)
     axes.set_title("First retained QC positions")
     axes.autoscale_view()
     _save_figure(figure, path, dpi=config.map.dpi)
 
 
+def _plot_array_starts(
+    source: _Dataset, array_id: int, platforms: tuple[str, ...], config: Any, path: Path,
+) -> None:
+    figure, axes = _new_map(config)
+    transform = ccrs.PlateCarree()
+    indices = [source.platform_index[platform] for platform in platforms]
+    indices = [index for index in indices if _start_in_window(source, index, config)]
+    if not indices:
+        plt.close(figure)
+        raise ValueError(f"No starting positions remain for {source.label}:Array {array_id}")
+    longitude = source.dataset.start_lon.isel(platform=indices).values.astype(float)
+    latitude = source.dataset.start_lat.isel(platform=indices).values.astype(float)
+    times = source.dataset.start_time.isel(platform=indices).values.astype("datetime64[ns]")
+    elapsed_hours = (times - times.min()) / np.timedelta64(1, "h")
+    maximum = max(1.0, float(np.max(elapsed_hours)))
+    points = axes.scatter(
+        longitude, latitude, c=elapsed_hours, cmap="viridis", vmin=0, vmax=maximum,
+        transform=transform, marker="*", s=62, edgecolor="black", linewidth=.5, zorder=4,
+    )
+    if config.map.label_starts:
+        for index, platform in enumerate(platforms):
+            if source.platform_index[platform] not in indices:
+                continue
+            position = indices.index(source.platform_index[platform])
+            axes.annotate(
+                platform, (longitude[position], latitude[position]), xytext=(4, 4),
+                textcoords="offset points", fontsize=6, transform=transform, zorder=5,
+            )
+    colorbar = figure.colorbar(points, ax=axes, pad=.04, shrink=.8)
+    colorbar.set_label("Hours after first start in array")
+    axes.set_title(f"{source.label} — Array {array_id}: first retained QC positions")
+    axes.autoscale_view()
+    _save_figure(figure, path, dpi=config.map.dpi)
+
+
 def _method_order(name: str) -> tuple[int, int | str]:
-    if name == "linear":
+    if name == "native":
         return 0, 0
+    if name == "linear":
+        return 1, 0
     match = re.fullmatch(r"spline_(\d+)", name)
-    return (1, int(match.group(1))) if match else (2, name)
+    return (2, int(match.group(1))) if match else (3, name)
 
 
 def _safe_filename(value: str) -> str:
@@ -354,6 +419,24 @@ def generate_trajectory_figures(
         report(f"Created figure: {paths[0]}")
         _plot_starts(sources, selected, config, colors, paths[1])
         report(f"Created figure: {paths[1]}")
+        current = sources[0]
+        if current.array_ids is None:
+            raise ValueError(
+                f"Current reconstruction dataset {current.label!r} has no array_id variable"
+            )
+        current_platforms = _selected_platforms(current, selected)
+        for array_id in sorted(set(current.array_ids)):
+            members = tuple(
+                platform for platform in current_platforms
+                if current.array_ids[current.platform_index[platform]] == array_id
+                and _start_in_window(current, current.platform_index[platform], config)
+            )
+            if not members:
+                continue
+            path = output / f"starting_positions__array_{array_id:02d}.png"
+            _plot_array_starts(current, array_id, members, config, path)
+            paths.append(path)
+            report(f"Created figure: {path}")
         for item in config.check_platforms:
             source = by_label[item.dataset]
             path = output / (

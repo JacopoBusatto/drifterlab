@@ -37,12 +37,85 @@ class PlatformReconstruction:
     fallback: dict[int, SplineFallbackStats]
 
 
+@dataclass(frozen=True)
+class LinearGridTrack:
+    """One source trajectory linearly resampled onto a bounded common grid."""
+
+    longitude: np.ndarray
+    latitude: np.ndarray
+    source_gap_minutes: np.ndarray
+    exact_grid_points: int
+    filled_grid_points: int
+
+
 def wrap_longitude(longitude: np.ndarray) -> np.ndarray:
     """Wrap finite longitude to the half-open interval [-180, 180)."""
     result = np.asarray(longitude, dtype=float).copy()
     finite = np.isfinite(result)
     result[finite] = (result[finite] + 180.0) % 360.0 - 180.0
     return result
+
+
+def resample_linear_track(
+    time: np.ndarray,
+    longitude: np.ndarray,
+    latitude: np.ndarray,
+    grid: np.ndarray,
+    *,
+    coverage_start: np.datetime64,
+    coverage_end: np.datetime64,
+) -> LinearGridTrack:
+    """Linearly resample fixes only inside an explicit, source-bracketed span."""
+    time = np.asarray(time, dtype="datetime64[ns]")
+    longitude = np.asarray(longitude, dtype=float)
+    latitude = np.asarray(latitude, dtype=float)
+    grid = np.asarray(grid, dtype="datetime64[ns]")
+    coverage_start = np.datetime64(coverage_start, "ns")
+    coverage_end = np.datetime64(coverage_end, "ns")
+    if not (time.ndim == longitude.ndim == latitude.ndim == grid.ndim == 1):
+        raise ValueError("Linear resampling inputs must be one-dimensional")
+    if len({len(time), len(longitude), len(latitude)}) != 1 or len(time) < 2:
+        raise ValueError("At least two equally sized source fixes are required")
+    time_ns = time.astype(np.int64)
+    if np.any(np.diff(time_ns) <= 0):
+        raise ValueError("Source fix times must be strictly increasing")
+    if (not np.isfinite(longitude).all() or not np.isfinite(latitude).all()
+            or np.any((longitude < -180) | (longitude > 180))
+            or np.any((latitude < -90) | (latitude > 90))):
+        raise ValueError("Source coordinates must be finite and geographically valid")
+    if (np.isnat(coverage_start) or np.isnat(coverage_end)
+            or coverage_start > coverage_end
+            or coverage_start < time[0] or coverage_end > time[-1]):
+        raise ValueError("Linear coverage must be ordered and bracketed by source fixes")
+
+    grid_ns = grid.astype(np.int64)
+    inside = (grid >= coverage_start) & (grid <= coverage_end)
+    unwrapped = np.rad2deg(np.unwrap(np.deg2rad(longitude)))
+    relative_time = (time_ns - time_ns[0]) / 1e9
+    relative_grid = (grid_ns[inside] - time_ns[0]) / 1e9
+    result_lon = np.full(len(grid), np.nan, dtype=np.float64)
+    result_lat = np.full(len(grid), np.nan, dtype=np.float64)
+    result_lon[inside] = np.interp(relative_grid, relative_time, unwrapped)
+    result_lat[inside] = np.interp(relative_grid, relative_time, latitude)
+
+    gap = np.full(len(grid), np.nan, dtype=np.float64)
+    exact = np.zeros(len(grid), dtype=bool)
+    inside_indices = np.flatnonzero(inside)
+    if len(inside_indices):
+        values = grid_ns[inside]
+        right = np.searchsorted(time_ns, values, side="left")
+        clipped = np.minimum(right, len(time_ns) - 1)
+        is_exact = (right < len(time_ns)) & (time_ns[clipped] == values)
+        exact[inside_indices[is_exact]] = True
+        gap[inside_indices[is_exact]] = 0.0
+        between = ~is_exact
+        if between.any():
+            gap_ns = time_ns[right[between]] - time_ns[right[between] - 1]
+            gap[inside_indices[between]] = gap_ns * MINUTES_PER_NS
+    return LinearGridTrack(
+        wrap_longitude(result_lon), result_lat, gap,
+        int(exact.sum()), int(inside.sum()),
+    )
 
 
 def _unique_knots(

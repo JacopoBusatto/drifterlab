@@ -31,6 +31,8 @@ def main(argv: list[str] | None = None) -> int:
     )
     summary = result.decision_summary
     print("Position-QC decision summary")
+    print(f"  Observations saved in valid span:{summary['exported_observation_count']:>10,}")
+    print(f"  Observations trimmed from export:{summary['trimmed_observation_count']:>10,}")
     print(f"  Exact repeats removed:           {summary['exact_repeat_points_removed']:,}")
     print(f"  Short-interval points removed:   {summary['short_interval_points_removed']:,}")
     print(f"  Duplicate-time points removed:   {summary['duplicate_time_points_removed']:,}")

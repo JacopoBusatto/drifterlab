@@ -32,7 +32,8 @@ from drifterlab.review.position import (
 from .drogue import load_drogue_detection
 
 
-POSITION_QC_SCHEMA_VERSION = "3.0"
+POSITION_QC_SCHEMA_VERSION = "4.0"
+POSITION_QC_PRODUCT_LAYOUT = "per-trajectory-v3"
 POSITION_QC_ALGORITHM_VERSION = "native-position-qc-v2.6"
 DEPLOYMENT_COLUMNS = [
     "platform_code", "deployment_time", "deployment_window_start",
@@ -264,7 +265,8 @@ def _publish(table: pd.DataFrame, path: Path, provenance: dict[str, Any]) -> Non
 
 
 SUMMARY_NUMERIC_FIELDS = (
-    "observation_count", "final_valid_points", "final_rejected_points",
+    "observation_count", "exported_observation_count", "trimmed_observation_count",
+    "final_valid_points", "final_rejected_points",
     "exact_repeat_points_removed", "short_interval_points_removed",
     "duplicate_time_points_removed", "single_point_speed_cure_events",
     "single_point_speed_cure_points", "multi_point_speed_cure_events",
@@ -352,6 +354,23 @@ def _aggregate_decision_summaries(values: list[dict[str, Any]]) -> dict[str, Any
         sorted(histogram.items(), key=lambda item: int(item[0]))
     )
     return result
+
+
+def _valid_span_product(frame: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, Any]]:
+    """Crop publication only; keep the full QC frame for decisions and review."""
+    valid_times = frame.loc[frame.final_position_valid, "time"].dropna()
+    start, end = valid_times.min(), valid_times.max()
+    if valid_times.empty:
+        product = frame.iloc[:0].copy()
+    else:
+        product = frame.loc[frame.time.between(start, end, inclusive="both")].copy()
+    return product, {
+        "source_observation_count": int(len(frame)),
+        "observation_count": int(len(product)),
+        "trimmed_observation_count": int(len(frame) - len(product)),
+        "valid_time_start_utc": None if valid_times.empty else start.isoformat(),
+        "valid_time_end_utc": None if valid_times.empty else end.isoformat(),
+    }
 
 
 def _write_run_summary(
@@ -488,7 +507,7 @@ def run_position_workflow(
             "schema_version": POSITION_QC_SCHEMA_VERSION,
             "algorithm_version": POSITION_QC_ALGORITHM_VERSION,
             "drifterlab_version": __version__,
-            "product_layout": "per-trajectory-v2",
+            "product_layout": POSITION_QC_PRODUCT_LAYOUT,
             "resolution_policy": resolution_policy,
             "platform_code": code,
             "config_sha256": config_hash,
@@ -527,9 +546,16 @@ def run_position_workflow(
         return {"source_lon", "source_lat"} <= columns
 
     def publish_platform(code: str, frame: pd.DataFrame) -> None:
+        product, span_metadata = _valid_span_product(frame)
         catalog = position_event_catalog(frame, config_hash)
+        summary = _decision_summary(frame)
+        summary.update(
+            exported_observation_count=len(product),
+            trimmed_observation_count=len(frame) - len(product),
+        )
         metadata = platform_dependencies(code)
         metadata.update({
+            **span_metadata,
             "effective_configuration": config.effective(),
             "source_provenance": {
                 code: {"path": str(source_paths[code]), "sha256": source_hashes[code]},
@@ -550,14 +576,14 @@ def run_position_workflow(
                 }
                 for row in catalog.itertuples(index=False)
             ],
-            "observation_count": int(len(frame)),
             "unresolved_count": int(
                 frame.final_position_status.isin(["uncertain", "unresolved"]).sum()
             ),
             "platform_qc_complete": bool(frame.platform_qc_complete.all()),
-            "decision_summary": _decision_summary(frame),
+            "reconstruction_available": bool(frame.reconstruction_available.any()),
+            "decision_summary": summary,
         })
-        _publish(frame, output_path(code), metadata)
+        _publish(product, output_path(code), metadata)
 
     frame_cache: OrderedDict[str, pd.DataFrame] = OrderedDict()
 
@@ -568,18 +594,21 @@ def run_position_workflow(
             frame_cache.popitem(last=False)
         return frame
 
-    def compute(code: str) -> pd.DataFrame:
+    def calculate(code: str) -> pd.DataFrame:
         auto = automatic_rows[code]
         resolved = resolve_drogue_decision(
             auto, drogue_reviews.rows.get(code),
             default_margin_hours=float(auto.default_analysis_cutoff_margin_hours),
         )
-        frame = run_native_position_qc(
+        return run_native_position_qc(
             trajectory_for(code), resolved, deployment=deployments.get(code),
             reviews=reviews.table(), temporal_config=config.temporal,
             position_config=config.position, review_config=config.review,
             resolution_policy=resolution_policy,
         )
+
+    def compute(code: str) -> pd.DataFrame:
+        frame = calculate(code)
         publish_platform(code, frame)
         return remember(code, frame)
 
@@ -598,7 +627,7 @@ def run_position_workflow(
         )
         return PositionWorkflowResult(
             config.output_directory, paths,
-            sum(int(value.get("observation_count", 0)) for value in metadata),
+            sum(int(value["source_observation_count"]) for value in metadata),
             len(paths),
             sum(int(value.get("unresolved_count", 0)) for value in metadata),
             summary_path, decision_summary,
@@ -612,6 +641,11 @@ def run_position_workflow(
         if code in frame_cache:
             frame_cache.move_to_end(code)
             return frame_cache[code]
+        metadata = _metadata(output_path(code))
+        if metadata["trimmed_observation_count"]:
+            # Pending or historical events can lie outside the published span.
+            # Restore the full frame lazily, without publishing during navigation.
+            return remember(code, calculate(code))
         return remember(code, pd.read_parquet(output_path(code)))
 
     def recompute_platform(code: str) -> pd.DataFrame:

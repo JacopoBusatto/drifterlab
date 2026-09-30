@@ -23,18 +23,22 @@ import yaml
 import zarr
 
 from drifterlab import __version__
-from drifterlab.reconstruction import PlatformReconstruction, reconstruct_platform
-from drifterlab.workflows.position import POSITION_QC_SCHEMA_VERSION
+from drifterlab.reconstruction import (
+    ArrayAssignment, LinearGridTrack, PlatformReconstruction, assign_start_arrays,
+    reconstruct_platform, resample_linear_track,
+)
+from drifterlab.workflows.position import POSITION_QC_PRODUCT_LAYOUT, POSITION_QC_SCHEMA_VERSION
 
 
-RECONSTRUCTION_SCHEMA_VERSION = "1.1"
-RECONSTRUCTION_ALGORITHM_VERSION = "phase-ensemble-natural-cubic-v1"
+RECONSTRUCTION_SCHEMA_VERSION = "1.3"
+RECONSTRUCTION_ALGORITHM_VERSION = "phase-ensemble-natural-cubic-native-grid-arrays-v3"
 POSITION_QC_METADATA_KEY = b"drifterlab_position_qc"
 ZARR_NAME = "trajectories.zarr"
 REPORT_NAME = "build_report.csv"
 REQUIRED_COLUMNS = {
     "platform_code", "source_sha256", "time", "source_lon", "source_lat",
     "final_position_status", "final_position_valid", "drogue_eligible",
+    "valid_timestamp", "source_position_valid", "deployment_eligible", "segment_status",
     "final_drogue_status", "analysis_cutoff_time", "platform_qc_complete",
 }
 SUPPORTED_MAP_PROJECTIONS = {
@@ -92,6 +96,7 @@ class ReconstructionWorkflowConfig:
     dt_minutes: float
     periods_minutes: tuple[int, ...]
     long_gap_threshold_minutes: dict[int, float]
+    maximum_adjacent_start_gap_hours: float
     output_directory: Path
     chunk_platform: int
     chunk_time: int
@@ -114,6 +119,9 @@ class ReconstructionWorkflowConfig:
                     str(key): value for key, value in self.long_gap_threshold_minutes.items()
                 },
             },
+            "arrays": {
+                "maximum_adjacent_start_gap_hours": self.maximum_adjacent_start_gap_hours,
+            },
             "output": {
                 "directory": str(self.output_directory),
                 "chunks": {"platform": self.chunk_platform, "time": self.chunk_time},
@@ -133,10 +141,12 @@ class ReconstructionWorkflowResult:
     end_time: np.datetime64
     action: str
     figure_paths: tuple[Path, ...]
+    array_count: int
 
     def format(self) -> str:
         return "\n".join([
             f"Candidate trajectories ({self.action}): {self.platform_count} platforms x {self.time_count} times",
+            f"Deployment arrays: {self.array_count}",
             f"Published UTC grid: {_format_utc(self.published_start_time)} to {_format_utc(self.end_time)}",
             f"Zarr: {self.zarr_path}", f"Build report: {self.report_path}",
             *( [f"Figures: {len(self.figure_paths)} in {self.figure_paths[0].parent}"]
@@ -154,6 +164,7 @@ class QCInventory:
     first_time: np.datetime64
     last_time: np.datetime64
     accepted_count: int
+    native_count: int
     first_longitude: float
     first_latitude: float
     metadata: dict[str, Any]
@@ -165,6 +176,9 @@ class AcceptedTrack:
     time: np.ndarray
     longitude: np.ndarray
     latitude: np.ndarray
+    native_time: np.ndarray
+    native_longitude: np.ndarray
+    native_latitude: np.ndarray
 
 
 def _mapping(value: Any, allowed: set[str], name: str) -> dict[str, Any]:
@@ -226,12 +240,15 @@ def load_reconstruction_config(path: str | Path) -> ReconstructionWorkflowConfig
     with source_path.open(encoding="utf-8-sig") as stream:
         data = yaml.safe_load(stream)
     data = _mapping(
-        data, {"input", "grid", "spline", "output", "plotting"}, "configuration",
+        data, {"input", "grid", "spline", "arrays", "output", "plotting"}, "configuration",
     )
     source = _mapping(data.get("input", {}), {"directory", "pattern"}, "input")
     grid = _mapping(data.get("grid", {}), {"start_time", "end_time", "dt_minutes"}, "grid")
     spline = _mapping(
         data.get("spline", {}), {"period_minutes", "long_gap_threshold_minutes"}, "spline",
+    )
+    arrays = _mapping(
+        data.get("arrays", {}), {"maximum_adjacent_start_gap_hours"}, "arrays",
     )
     output = _mapping(data.get("output", {}), {"directory", "chunks"}, "output")
     chunks = _mapping(output.get("chunks", {}), {"platform", "time"}, "output.chunks")
@@ -298,6 +315,10 @@ def load_reconstruction_config(path: str | Path) -> ReconstructionWorkflowConfig
         thresholds[key] = _positive_number(
             raw_value, f"spline.long_gap_threshold_minutes.{key}",
         )
+    maximum_adjacent_start_gap_hours = _positive_number(
+        arrays.get("maximum_adjacent_start_gap_hours", 24),
+        "arrays.maximum_adjacent_start_gap_hours",
+    )
 
     chunk_values: list[int] = []
     for name, default in (("platform", 1), ("time", 2016)):
@@ -407,7 +428,7 @@ def load_reconstruction_config(path: str | Path) -> ReconstructionWorkflowConfig
     )
     return ReconstructionWorkflowConfig(
         input_directory, pattern, start, end, dt_minutes, tuple(periods), thresholds,
-        output_directory, *chunk_values, plotting_config,
+        maximum_adjacent_start_gap_hours, output_directory, *chunk_values, plotting_config,
     )
 
 
@@ -444,7 +465,7 @@ def _load_track(path: Path) -> AcceptedTrack:
         raise ValueError(
             f"Position QC footer is missing fields {sorted(missing_footer)}: {path.name}"
         )
-    if metadata.get("product_layout") != "per-trajectory-v2":
+    if metadata.get("product_layout") != POSITION_QC_PRODUCT_LAYOUT:
         raise ValueError(f"Position QC file has unsupported product layout: {path.name}")
     for name in ("algorithm_version", "config_sha256", "resolution_policy", "source_sha256"):
         if not isinstance(metadata.get(name), str) or not metadata[name].strip():
@@ -479,7 +500,11 @@ def _load_track(path: Path) -> AcceptedTrack:
     unresolved = status.isin(["unresolved", "uncertain"])
     if unresolved.any() or not bool(metadata.get("platform_qc_complete", False)):
         raise ValueError(f"Position QC is unresolved for platform {platform}")
-    if frame.final_position_valid.isna().any() or frame.drogue_eligible.isna().any():
+    boolean_columns = (
+        "final_position_valid", "drogue_eligible", "valid_timestamp",
+        "source_position_valid", "deployment_eligible", "platform_qc_complete",
+    )
+    if any(frame[name].isna().any() for name in boolean_columns):
         raise ValueError(f"Position QC validity contains missing values for platform {platform}")
     final_valid = frame.final_position_valid.to_numpy(dtype=bool)
     if not np.array_equal(final_valid, status.eq("valid").to_numpy()):
@@ -507,6 +532,49 @@ def _load_track(path: Path) -> AcceptedTrack:
             or np.any((lon < -180) | (lon > 180)) or np.any((lat < -90) | (lat > 90))):
         raise ValueError(f"Accepted QC positions contain invalid coordinates for platform {platform}")
     time = selected.time.dt.tz_convert(None).to_numpy(dtype="datetime64[ns]")
+
+    # Native comparison coordinates precede individual point decisions, while
+    # remaining inside the same retained temporal/drogue/deployment scope and
+    # exact first-to-last accepted-QC lifespan.
+    native_mask = (
+        frame.valid_timestamp.to_numpy(dtype=bool)
+        & frame.source_position_valid.to_numpy(dtype=bool)
+        & frame.drogue_eligible.to_numpy(dtype=bool)
+        & frame.deployment_eligible.to_numpy(dtype=bool)
+        & frame.segment_status.fillna("").astype(str).eq("retained").to_numpy()
+    )
+    native = frame.loc[native_mask, ["time", "source_lon", "source_lat"]].copy()
+    native_parsed = pd.to_datetime(native.time, errors="coerce", utc=True)
+    if native_parsed.isna().any():
+        raise ValueError(
+            f"Source-valid native positions have missing timestamps for platform {platform}"
+        )
+    native["time"] = native_parsed
+    first_stamp = pd.Timestamp(time[0], tz="UTC")
+    last_stamp = pd.Timestamp(time[-1], tz="UTC")
+    native = native.loc[native.time.between(first_stamp, last_stamp, inclusive="both")]
+    native = native.sort_values("time", kind="stable")
+    if native.time.duplicated().any():
+        raise ValueError(
+            f"Native pre-point-QC positions have duplicate timestamps for platform {platform}"
+        )
+    if len(native) < 2:
+        raise ValueError(
+            f"Platform {platform} has fewer than two native fixes in its accepted-QC lifespan"
+        )
+    native_lon = native.source_lon.to_numpy(dtype=float)
+    native_lat = native.source_lat.to_numpy(dtype=float)
+    if (not np.isfinite(native_lon).all() or not np.isfinite(native_lat).all()
+            or np.any((native_lon < -180) | (native_lon > 180))
+            or np.any((native_lat < -90) | (native_lat > 90))):
+        raise ValueError(
+            f"Source-valid native positions contain invalid coordinates for platform {platform}"
+        )
+    native_time = native.time.dt.tz_convert(None).to_numpy(dtype="datetime64[ns]")
+    if native_time[0] != time[0] or native_time[-1] != time[-1]:
+        raise ValueError(
+            f"Native positions do not bracket the accepted-QC lifespan for platform {platform}"
+        )
     if drogue_states[0] == "lost":
         cutoffs = pd.to_datetime(frame.analysis_cutoff_time, errors="coerce", utc=True).dropna().unique()
         if len(cutoffs) != 1:
@@ -516,9 +584,11 @@ def _load_track(path: Path) -> AcceptedTrack:
             raise ValueError(f"Accepted QC position reaches or exceeds the drogue cutoff for {platform}")
     inventory = QCInventory(
         path.resolve(), before, platform, source_hashes[0], time[0], time[-1], len(time),
-        float(lon[0]), float(lat[0]), metadata,
+        len(native_time), float(lon[0]), float(lat[0]), metadata,
     )
-    return AcceptedTrack(inventory, time, lon, lat)
+    return AcceptedTrack(
+        inventory, time, lon, lat, native_time, native_lon, native_lat,
+    )
 
 
 def _discover(config: ReconstructionWorkflowConfig) -> tuple[Path, ...]:
@@ -595,9 +665,65 @@ def _position_attrs(method: str, coordinate: str) -> dict[str, Any]:
     }
 
 
+def _assign_arrays(
+    inventories: list[QCInventory], config: ReconstructionWorkflowConfig,
+) -> tuple[ArrayAssignment, ...]:
+    assignments = assign_start_arrays(
+        [item.platform_id for item in inventories],
+        [item.first_time for item in inventories],
+        maximum_adjacent_start_gap_hours=config.maximum_adjacent_start_gap_hours,
+    )
+    if tuple(item.platform_id for item in assignments) != tuple(
+        item.platform_id for item in inventories
+    ):
+        raise ValueError("Array assignments are not aligned with the platform dimension")
+    if any(item.array_id < 1 for item in assignments):
+        raise ValueError("Every platform must have one positive array identifier")
+    return assignments
+
+
+def _array_metadata(
+    inventories: list[QCInventory], assignments: tuple[ArrayAssignment, ...],
+    config: ReconstructionWorkflowConfig,
+) -> dict[str, Any]:
+    records = [
+        {
+            "platform_id": inventory.platform_id,
+            "array_id": assignment.array_id,
+            "start_time": _format_utc(inventory.first_time),
+        }
+        for inventory, assignment in zip(inventories, assignments, strict=True)
+    ]
+    canonical = json.dumps(records, sort_keys=True, separators=(",", ":")).encode()
+    summaries: list[dict[str, Any]] = []
+    for array_id in sorted({item.array_id for item in assignments}):
+        members = [
+            inventory for inventory, assignment in zip(inventories, assignments, strict=True)
+            if assignment.array_id == array_id
+        ]
+        summaries.append({
+            "array_id": array_id,
+            "platform_count": len(members),
+            "first_start_time": _format_utc(min(item.first_time for item in members)),
+            "last_start_time": _format_utc(max(item.first_time for item in members)),
+        })
+    return {
+        "array_assignment_policy": {
+            "identifier": "1-based contiguous integer in chronological array order",
+            "source": "exact first retained QC timestamp per platform",
+            "ordering": "start timestamp ascending, then platform_id ascending for ties",
+            "new_array_rule": "adjacent start-time gap strictly greater than threshold",
+            "maximum_adjacent_start_gap_hours": config.maximum_adjacent_start_gap_hours,
+        },
+        "array_assignment_sha256": sha256(canonical).hexdigest(),
+        "array_summary": summaries,
+    }
+
+
 def _create_store(
     path: Path, inventories: list[QCInventory], grid: np.ndarray,
     config: ReconstructionWorkflowConfig, attributes: dict[str, Any],
+    assignments: tuple[ArrayAssignment, ...],
 ) -> zarr.Group:
     platforms = [item.platform_id for item in inventories]
     root = zarr.open_group(str(path), mode="w")
@@ -609,6 +735,16 @@ def _create_store(
         chunks=(min(config.chunk_platform, len(platforms)),), compressor=compressor,
     )
     platform.attrs.update({"_ARRAY_DIMENSIONS": ["platform"], "cf_role": "trajectory_id"})
+    array_id = root.create_dataset(
+        "array_id", data=np.asarray([item.array_id for item in assignments], dtype=np.int32),
+        chunks=(min(config.chunk_platform, len(platforms)),), compressor=compressor,
+        fill_value=None,
+    )
+    array_id.attrs.update({
+        "_ARRAY_DIMENSIONS": ["platform"],
+        "long_name": "deployment array identifier",
+        "comment": "Display as 'Array X'; unique only within this trajectory dataset",
+    })
     time = root.create_dataset(
         "time", data=grid.astype("datetime64[ns]"),
         chunks=(min(config.chunk_time, len(grid)),), compressor=compressor,
@@ -643,7 +779,10 @@ def _create_store(
     chunks = (
         min(config.chunk_platform, len(platforms)), min(config.chunk_time, len(grid)),
     )
-    variables = ["longitude_linear", "latitude_linear", "source_gap_minutes"]
+    variables = [
+        "longitude_native", "latitude_native", "native_source_gap_minutes",
+        "longitude_linear", "latitude_linear", "source_gap_minutes",
+    ]
     for period in config.periods_minutes:
         variables.extend([f"longitude_spline_{period}", f"latitude_spline_{period}"])
     for name in variables:
@@ -651,11 +790,16 @@ def _create_store(
             name, shape=(len(platforms), len(grid)), chunks=chunks,
             dtype="f8", fill_value=np.nan, compressor=compressor,
         )
-        if name == "source_gap_minutes":
+        if name in {"source_gap_minutes", "native_source_gap_minutes"}:
+            native = name.startswith("native_")
             array.attrs.update({
                 "_ARRAY_DIMENSIONS": ["platform", "time"], "coordinates": "platform_id",
                 "units": "minutes",
-                "long_name": "Separation of accepted QC fixes bracketing each reconstructed point; zero at an exact accepted fix",
+                "long_name": (
+                    "Separation of source-valid pre-point-QC fixes bracketing each native-grid point; zero at an exact source fix"
+                    if native else
+                    "Separation of accepted QC fixes bracketing each reconstructed point; zero at an exact accepted fix"
+                ),
             })
         else:
             coordinate, method = name.split("_", 1)
@@ -684,7 +828,8 @@ def _gap_fields(track: AcceptedTrack, config: ReconstructionWorkflowConfig) -> d
 
 def _report_row(
     track: AcceptedTrack, result: PlatformReconstruction, grid: np.ndarray,
-    config: ReconstructionWorkflowConfig,
+    config: ReconstructionWorkflowConfig, native: LinearGridTrack,
+    assignment: ArrayAssignment,
 ) -> dict[str, Any]:
     first_grid = grid[(grid >= track.time[0]) & (grid <= track.time[-1])][0]
     last_grid = grid[(grid >= track.time[0]) & (grid <= track.time[-1])][-1]
@@ -697,9 +842,14 @@ def _report_row(
         warnings.append("shared grid continues after this platform; trailing cells are NaN")
     row: dict[str, Any] = {
         "platform_id": track.inventory.platform_id,
+        "array_id": assignment.array_id,
+        "gap_from_previous_start_hours": assignment.gap_from_previous_start_hours,
+        "gap_to_next_start_hours": assignment.gap_to_next_start_hours,
         "qc_filename": track.inventory.path.name,
         "qc_input_sha256": track.inventory.sha256,
         "accepted_fix_count": track.inventory.accepted_count,
+        "native_fix_count": track.inventory.native_count,
+        "native_only_fix_count": track.inventory.native_count - track.inventory.accepted_count,
         "eligible_start_utc": _format_utc(track.time[0]),
         "eligible_end_utc": _format_utc(track.time[-1]),
         "first_filled_grid_utc": _format_utc(first_grid),
@@ -707,6 +857,8 @@ def _report_row(
         "filled_grid_points": result.filled_grid_points,
         "exact_fix_grid_points": result.exact_grid_points,
         "interpolated_grid_points": result.filled_grid_points - result.exact_grid_points,
+        "native_exact_fix_grid_points": native.exact_grid_points,
+        "native_interpolated_grid_points": native.filled_grid_points - native.exact_grid_points,
         **_gap_fields(track, config),
     }
     for period in config.periods_minutes:
@@ -716,7 +868,12 @@ def _report_row(
     return row
 
 
-def _write_platform(root: zarr.Group, index: int, result: PlatformReconstruction) -> None:
+def _write_platform(
+    root: zarr.Group, index: int, result: PlatformReconstruction, native: LinearGridTrack,
+) -> None:
+    root["longitude_native"][index, :] = native.longitude
+    root["latitude_native"][index, :] = native.latitude
+    root["native_source_gap_minutes"][index, :] = native.source_gap_minutes
     root["longitude_linear"][index, :] = result.longitude_linear
     root["latitude_linear"][index, :] = result.latitude_linear
     root["source_gap_minutes"][index, :] = result.source_gap_minutes
@@ -727,11 +884,13 @@ def _write_platform(root: zarr.Group, index: int, result: PlatformReconstruction
 
 def _verify(
     path: Path, platforms: list[str], grid: np.ndarray, inventories: list[QCInventory],
-    config: ReconstructionWorkflowConfig,
+    config: ReconstructionWorkflowConfig, assignments: tuple[ArrayAssignment, ...],
 ) -> None:
     required = {
+        "longitude_native", "latitude_native", "native_source_gap_minutes",
         "longitude_linear", "latitude_linear", "source_gap_minutes",
         "start_time", "start_lon", "start_lat",
+        "array_id",
         *(f"longitude_spline_{period}" for period in config.periods_minutes),
         *(f"latitude_spline_{period}" for period in config.periods_minutes),
     }
@@ -744,9 +903,15 @@ def _verify(
             raise ValueError("Zarr readback changed the common time coordinate")
         if set(dataset.data_vars) != required:
             raise ValueError("Zarr readback found an unexpected lean-product schema")
+        expected_arrays = np.asarray([item.array_id for item in assignments], dtype=np.int32)
+        if not np.array_equal(dataset.array_id.values.astype(np.int32), expected_arrays):
+            raise ValueError("Zarr readback changed deployment-array assignments")
     root = zarr.open_group(str(path), mode="r")
     position_names = sorted(
-        required - {"source_gap_minutes", "start_time", "start_lon", "start_lat"}
+        required - {
+            "source_gap_minutes", "native_source_gap_minutes",
+            "start_time", "start_lon", "start_lat", "array_id",
+        }
     )
     for index, inventory in enumerate(inventories):
         if np.asarray(root["start_time"][index]).astype("datetime64[ns]") != inventory.first_time:
@@ -758,6 +923,12 @@ def _verify(
         gap = np.asarray(root["source_gap_minutes"][index, :], dtype=float)
         if not np.isfinite(gap[inside]).all() or not np.isnan(gap[~inside]).all():
             raise ValueError(f"Zarr readback found invalid source-gap coverage for {inventory.platform_id}")
+        native_gap = np.asarray(root["native_source_gap_minutes"][index, :], dtype=float)
+        if (not np.isfinite(native_gap[inside]).all()
+                or not np.isnan(native_gap[~inside]).all()):
+            raise ValueError(
+                f"Zarr readback found invalid native source-gap coverage for {inventory.platform_id}"
+            )
         for name in position_names:
             values = np.asarray(root[name][index, :], dtype=float)
             if not np.isfinite(values[inside]).all() or not np.isnan(values[~inside]).all():
@@ -805,7 +976,7 @@ def _input_hash_metadata(inventories: list[QCInventory]) -> list[dict[str, str]]
 
 def _existing_problem(
     config: ReconstructionWorkflowConfig, inventories: list[QCInventory],
-    grid: np.ndarray, platforms: list[str],
+    grid: np.ndarray, platforms: list[str], assignments: tuple[ArrayAssignment, ...],
 ) -> str | None:
     zarr_path = config.output_directory / ZARR_NAME
     report_path = config.output_directory / REPORT_NAME
@@ -827,7 +998,10 @@ def _existing_problem(
             return "the recorded QC input provenance differs"
         if attrs.get("build_report_sha256") != _file_sha256(report_path):
             return "the build report hash differs"
-        _verify(zarr_path, platforms, grid, inventories, config)
+        expected_array_metadata = _array_metadata(inventories, assignments, config)
+        if any(attrs.get(key) != value for key, value in expected_array_metadata.items()):
+            return "the recorded deployment-array assignment differs"
+        _verify(zarr_path, platforms, grid, inventories, config, assignments)
     except (OSError, ValueError, KeyError, TypeError) as exc:
         return f"schema/readback validation failed: {exc}"
     return None
@@ -866,7 +1040,7 @@ def _publish_bundle(
 def _build_bundle(
     config: ReconstructionWorkflowConfig, inventories: list[QCInventory], paths: tuple[Path, ...],
     grid: np.ndarray, grid_indices: np.ndarray, published_start: np.datetime64,
-    report: Callable[[str], None], *, overwrite: bool,
+    assignments: tuple[ArrayAssignment, ...], report: Callable[[str], None], *, overwrite: bool,
 ) -> None:
     platforms = [item.platform_id for item in inventories]
 
@@ -890,6 +1064,7 @@ def _build_bundle(
             "published_start_time": _format_utc(published_start),
             "end_time": _format_utc(grid[-1]),
             "interpolation_policy": {
+                "native": "Source-valid positions from retained temporal/drogue/deployment scope before individual point decisions; unwrapped-longitude linear resampling only over the accepted-QC lifespan",
                 "linear": "Unwrapped-longitude linear interpolation between consecutive accepted QC fixes; all internal gaps filled; no endpoint extrapolation",
                 "spline": "Every grid phase for each period; exact portion endpoints added; natural cubic interpolation; equal phase mean",
                 "long_gap": "Accepted-fix gaps strictly greater than the configured per-period threshold use the linear track",
@@ -900,8 +1075,9 @@ def _build_bundle(
             },
             "effective_configuration": config.effective(),
             "qc_input_hashes": _input_hash_metadata(inventories),
+            **_array_metadata(inventories, assignments, config),
         }
-        root = _create_store(zarr_path, inventories, grid, config, attributes)
+        root = _create_store(zarr_path, inventories, grid, config, attributes, assignments)
         rows: list[dict[str, Any]] = []
         for index, inventory in enumerate(inventories):
             if _file_sha256(inventory.path) != inventory.sha256:
@@ -914,8 +1090,14 @@ def _build_bundle(
                 dt_minutes=config.dt_minutes, periods_minutes=config.periods_minutes,
                 long_gap_threshold_minutes=config.long_gap_threshold_minutes,
             )
-            _write_platform(root, index, reconstructed)
-            rows.append(_report_row(track, reconstructed, grid, config))
+            native = resample_linear_track(
+                track.native_time, track.native_longitude, track.native_latitude, grid,
+                coverage_start=track.time[0], coverage_end=track.time[-1],
+            )
+            _write_platform(root, index, reconstructed, native)
+            rows.append(_report_row(
+                track, reconstructed, grid, config, native, assignments[index],
+            ))
             report(f"Reconstructed {index + 1}/{len(inventories)}: {inventory.platform_id}")
         pd.DataFrame(rows).to_csv(report_path, index=False)
         root.attrs["build_report_sha256"] = _file_sha256(report_path)
@@ -927,7 +1109,7 @@ def _build_bundle(
         if changed:
             raise ValueError(f"Position-QC inputs changed during reconstruction: {changed}")
         zarr.consolidate_metadata(str(zarr_path))
-        _verify(zarr_path, platforms, grid, inventories, config)
+        _verify(zarr_path, platforms, grid, inventories, config, assignments)
         _publish_bundle(
             temporary, config.output_directory, token=token, overwrite=overwrite,
         )
@@ -947,11 +1129,16 @@ def run_reconstruction_workflow(
     config = load_reconstruction_config(config_path)
     report = progress or (lambda message: None)
     inventories, paths = _inventory_inputs(config, report)
+    assignments = _assign_arrays(inventories, config)
+    report(
+        f"Assigned {len(inventories)} platforms to "
+        f"{max(item.array_id for item in assignments)} deployment arrays"
+    )
     grid, grid_indices, published_start = _grid(config, inventories)
     platforms = [item.platform_id for item in inventories]
     action = "built"
     if config.output_directory.exists() and not overwrite:
-        problem = _existing_problem(config, inventories, grid, platforms)
+        problem = _existing_problem(config, inventories, grid, platforms, assignments)
         if problem is not None:
             raise ValueError(
                 f"Existing trajectory product cannot be reused because {problem}; "
@@ -961,8 +1148,8 @@ def run_reconstruction_workflow(
         report("Validated and reused existing candidate trajectory bundle")
     else:
         _build_bundle(
-            config, inventories, paths, grid, grid_indices, published_start, report,
-            overwrite=overwrite,
+            config, inventories, paths, grid, grid_indices, published_start,
+            assignments, report, overwrite=overwrite,
         )
         report("Verified and published candidate trajectory bundle")
 
@@ -982,5 +1169,6 @@ def run_reconstruction_workflow(
         config.output_directory, config.output_directory / ZARR_NAME,
         config.output_directory / REPORT_NAME, len(platforms), len(grid),
         config.start_time, published_start, grid[-1], action, figure_paths,
+        max(item.array_id for item in assignments),
     )
     return result

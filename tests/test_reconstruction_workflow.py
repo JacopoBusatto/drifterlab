@@ -17,6 +17,7 @@ import zarr
 import drifterlab.experiments.arcterx as arcterx
 from drifterlab.cli.reconstruct_trajectories import main
 from drifterlab.plotting.trajectories import split_longitude_wrapped_path
+from drifterlab.reconstruction import assign_start_arrays
 import drifterlab.workflows.reconstruction as reconstruction_workflow
 from drifterlab.workflows.reconstruction import (
     REPORT_NAME, ZARR_NAME, load_reconstruction_config, run_reconstruction_workflow,
@@ -24,15 +25,22 @@ from drifterlab.workflows.reconstruction import (
 
 
 def write_qc(
-    path: Path, platform: str, minutes, lon=None, lat=None, *, schema="3.0",
+    path: Path, platform: str, minutes, lon=None, lat=None, *, schema="4.0",
     drogue_status="not_lost", cutoff_minute=None, statuses=None, eligible=None,
-    footer_changes=None,
+    source_valid=None, deployment_eligible=None, segments=None, footer_changes=None,
 ):
     minutes = np.asarray(minutes)
     n = len(minutes)
     status = np.asarray(statuses if statuses is not None else ["valid"] * n)
     valid = status == "valid"
     drogue = np.asarray(eligible if eligible is not None else [True] * n, dtype=bool)
+    source_valid = np.asarray(
+        source_valid if source_valid is not None else [True] * n, dtype=bool,
+    )
+    deployment_eligible = np.asarray(
+        deployment_eligible if deployment_eligible is not None else [True] * n,
+        dtype=bool,
+    )
     cutoff = (
         pd.NaT if cutoff_minute is None
         else pd.Timestamp("2025-01-12T00:00:00Z") + pd.Timedelta(minutes=cutoff_minute)
@@ -46,13 +54,19 @@ def write_qc(
         "final_position_status": status,
         "final_position_valid": valid,
         "drogue_eligible": drogue,
+        "valid_timestamp": [True] * n,
+        "source_position_valid": source_valid,
+        "deployment_eligible": deployment_eligible,
+        "segment_status": np.asarray(
+            segments if segments is not None else ["retained"] * n,
+        ),
         "final_drogue_status": [drogue_status] * n,
         "analysis_cutoff_time": [cutoff] * n,
         "platform_qc_complete": [not np.isin(status, ["unresolved", "uncertain"]).any()] * n,
     })
     metadata = {
         "schema_version": schema, "algorithm_version": "native-position-qc-v2.5",
-        "product_layout": "per-trajectory-v2", "platform_code": platform,
+        "product_layout": "per-trajectory-v3", "platform_code": platform,
         "config_sha256": "qc-config", "resolution_policy": "aggressive",
         "source_sha256": f"source-{platform}", "platform_qc_complete": True,
     }
@@ -66,6 +80,7 @@ def write_qc(
 
 def write_config(
     tmp_path: Path, *, end=None, periods=(15,), thresholds=None, plotting=None,
+    array_gap_hours=24,
 ):
     values = {
         "input": {"directory": "qc", "pattern": "*.parquet"},
@@ -74,6 +89,7 @@ def write_config(
             "period_minutes": list(periods),
             "long_gap_threshold_minutes": thresholds or {period: period for period in periods},
         },
+        "arrays": {"maximum_adjacent_start_gap_hours": array_gap_hours},
         "output": {"directory": "candidate", "chunks": {"platform": 1, "time": 4}},
     }
     if plotting is not None:
@@ -98,10 +114,13 @@ def test_common_grid_leading_trim_report_and_readback(tmp_path):
         assert dict(dataset.sizes) == {"platform": 2, "time": 14}
         assert dataset.platform_id.values.tolist() == ["1001", "1002"]
         assert set(dataset.data_vars) == {
+            "longitude_native", "latitude_native", "native_source_gap_minutes",
             "longitude_linear", "latitude_linear", "source_gap_minutes",
             "longitude_spline_15", "latitude_spline_15",
             "start_time", "start_lon", "start_lat",
+            "array_id",
         }
+        np.testing.assert_array_equal(dataset.array_id, [1, 1])
         np.testing.assert_array_equal(dataset.start_time.values, np.asarray([
             "2025-01-12T00:07:00", "2025-01-12T00:15:00",
         ], dtype="datetime64[ns]"))
@@ -109,9 +128,63 @@ def test_common_grid_leading_trim_report_and_readback(tmp_path):
         np.testing.assert_allclose(dataset.start_lat, [.035, .075])
         assert dataset.attrs["product_status"] == "candidate_pending_gap_review"
         assert dataset.attrs["configured_start_time"] == "2025-01-12T00:00:00Z"
+        assert dataset.attrs["array_assignment_policy"]["maximum_adjacent_start_gap_hours"] == 24
+        assert dataset.attrs["array_summary"][0]["platform_count"] == 2
+    assert report.array_id.tolist() == [1, 1]
+    assert {"gap_from_previous_start_hours", "gap_to_next_start_hours"} <= set(report)
     root = zarr.open_group(result.zarr_path, mode="r")
     assert root["longitude_linear"].chunks == (1, 4)
     assert np.isnan(root["longitude_linear"][0, -2:]).all()
+    assert np.array_equal(
+        np.isfinite(root["longitude_native"][:]),
+        np.isfinite(root["longitude_linear"][:]),
+    )
+
+
+def test_native_uses_pre_point_qc_fixes_on_exact_qc_grid_span(tmp_path):
+    write_qc(
+        tmp_path / "qc/1001.parquet", "1001", [2, 7, 12, 17, 22],
+        lon=[0, 50, .1, 60, .2], lat=[0, 10, .1, 20, .2],
+        statuses=["valid", "rejected", "valid", "rejected", "valid"],
+    )
+    result = run_reconstruction_workflow(write_config(tmp_path))
+    report = pd.read_csv(result.report_path).iloc[0]
+    assert report.accepted_fix_count == 3
+    assert report.native_fix_count == 5
+    assert report.native_only_fix_count == 2
+    with xr.open_zarr(result.zarr_path, consolidated=True, chunks=None) as dataset:
+        native_lon = dataset.longitude_native.isel(platform=0).values
+        linear_lon = dataset.longitude_linear.isel(platform=0).values
+        np.testing.assert_array_equal(np.isfinite(native_lon), np.isfinite(linear_lon))
+        # The common cells are 00:05 through 00:20; rejected native fixes at
+        # 00:07 and 00:17 affect only the before-point-QC representation.
+        assert not np.allclose(native_lon, linear_lon, equal_nan=True)
+        np.testing.assert_allclose(dataset.native_source_gap_minutes, [[5, 5, 5, 5]])
+        np.testing.assert_allclose(dataset.source_gap_minutes, [[10, 10, 10, 10]])
+
+
+def test_native_excludes_nonretained_and_source_invalid_rows(tmp_path):
+    write_qc(
+        tmp_path / "qc/1001.parquet", "1001", [0, 5, 10, 15, 20],
+        lon=[0, 100, .1, 120, .2],
+        statuses=["valid", "rejected", "valid", "rejected", "valid"],
+        source_valid=[True, False, True, True, True],
+        segments=["retained", "retained", "retained", "excluded", "retained"],
+    )
+    result = run_reconstruction_workflow(write_config(tmp_path))
+    with xr.open_zarr(result.zarr_path, consolidated=True, chunks=None) as dataset:
+        # Only retained, source-valid fixes 0/10/20 enter native resampling.
+        np.testing.assert_allclose(dataset.longitude_native, [[0, .05, .1, .15, .2]])
+        np.testing.assert_allclose(dataset.longitude_native, dataset.longitude_linear)
+
+
+def test_duplicate_native_timestamp_is_rejected_even_when_accepted_times_are_unique(tmp_path):
+    write_qc(
+        tmp_path / "qc/1001.parquet", "1001", [0, 10, 10, 20],
+        statuses=["valid", "valid", "rejected", "valid"],
+    )
+    with pytest.raises(ValueError, match="Native pre-point-QC.*duplicate timestamps"):
+        run_reconstruction_workflow(write_config(tmp_path))
 
 
 def test_prestart_reports_every_affected_platform_before_writing(tmp_path):
@@ -242,6 +315,12 @@ def test_old_mat_to_zarr_api_is_removed():
     assert importlib.util.find_spec("drifterlab.trajectories.zarr") is None
 
 
+def test_obsolete_cluster_command_and_api_are_removed():
+    assert importlib.util.find_spec("drifterlab.cli.clusters") is None
+    assert importlib.util.find_spec("drifterlab.workflows.clusters") is None
+    assert importlib.util.find_spec("drifterlab.clustering.core") is None
+
+
 def test_config_requires_period_multiple_and_utc(tmp_path):
     config = write_config(tmp_path, periods=(12,))
     with pytest.raises(ValueError, match="integer multiple"):
@@ -286,6 +365,7 @@ def test_plotting_after_build_then_regenerates_on_reuse(tmp_path):
     assert first.action == "built"
     assert [path.name for path in first.figure_paths] == [
         "trajectory_overview.png", "starting_positions.png",
+        "starting_positions__array_01.png",
         "reconstruction_check__MicroSVP__1001.png",
     ]
     assert all(path.is_file() and path.stat().st_size > 1000 for path in first.figure_paths)
@@ -297,6 +377,18 @@ def test_plotting_after_build_then_regenerates_on_reuse(tmp_path):
     assert second.action == "reused"
     assert digest(second.zarr_path / ".zmetadata") == zarr_metadata
     assert digest(second.figure_paths[0]) != overview
+
+
+def test_plotting_can_select_current_products_native_grid_method(tmp_path):
+    write_qc(
+        tmp_path / "qc/1001.parquet", "1001", [0, 5, 10, 15, 20],
+        lon=[0, .01, .02, .03, .04],
+        statuses=["valid", "rejected", "valid", "rejected", "valid"],
+    )
+    plotting = plotting_config(method="native", checks=True)
+    result = run_reconstruction_workflow(write_config(tmp_path, plotting=plotting))
+    assert len(result.figure_paths) == 4
+    assert all(path.is_file() and path.stat().st_size > 1000 for path in result.figure_paths)
 
 
 def test_plotting_failure_leaves_new_valid_zarr_for_later_reuse(tmp_path):
@@ -374,9 +466,67 @@ def test_additional_store_may_have_distinct_grid_method_and_overlapping_id(tmp_p
         {"dataset": "SVP", "platform_id": "1001"},
     ]
     result = run_reconstruction_workflow(write_config(tmp_path, plotting=plotting))
-    assert len(result.figure_paths) == 2
+    assert len(result.figure_paths) == 3
     assert all(path.stat().st_size > 1000 for path in result.figure_paths)
     assert digest(tmp_path / "svp.zarr/.zmetadata") == other_metadata
+
+
+def test_array_assignment_uses_strict_gap_and_stable_ties():
+    platforms = ["b", "a", "c", "d"]
+    starts = np.asarray([
+        "2025-01-12T01:00:00", "2025-01-12T01:00:00",
+        "2025-01-13T01:00:00", "2025-01-14T01:00:01",
+    ], dtype="datetime64[ns]")
+    assignments = assign_start_arrays(
+        platforms, starts, maximum_adjacent_start_gap_hours=24,
+    )
+    by_platform = {item.platform_id: item for item in assignments}
+    assert [item.platform_id for item in assignments] == platforms
+    assert {platform: item.array_id for platform, item in by_platform.items()} == {
+        "a": 1, "b": 1, "c": 1, "d": 2,
+    }
+    assert by_platform["a"].gap_from_previous_start_hours is None
+    assert by_platform["a"].gap_to_next_start_hours == 0
+    assert by_platform["b"].gap_from_previous_start_hours == 0
+    assert by_platform["c"].gap_from_previous_start_hours == 24
+
+
+def test_array_threshold_is_reconstruction_provenance(tmp_path):
+    write_qc(tmp_path / "qc/1001.parquet", "1001", [0, 15, 30, 45])
+    config = write_config(tmp_path, array_gap_hours=24)
+    run_reconstruction_workflow(config)
+    write_config(tmp_path, array_gap_hours=12)
+    with pytest.raises(ValueError, match=r"configuration differs.*--overwrite"):
+        run_reconstruction_workflow(config)
+
+
+def test_array_ids_follow_exact_start_times_and_are_in_report(tmp_path):
+    write_qc(tmp_path / "qc/1001.parquet", "1001", [7, 22, 37, 52])
+    write_qc(tmp_path / "qc/1002.parquet", "1002", [67, 82, 97, 112])
+    write_qc(tmp_path / "qc/1003.parquet", "1003", [127, 142, 157, 172])
+    result = run_reconstruction_workflow(write_config(tmp_path, array_gap_hours=1))
+    with xr.open_zarr(result.zarr_path, consolidated=True, chunks=None) as dataset:
+        np.testing.assert_array_equal(dataset.array_id, [1, 1, 1])
+        np.testing.assert_array_equal(dataset.start_time.values, np.asarray([
+            "2025-01-12T00:07:00", "2025-01-12T01:07:00", "2025-01-12T02:07:00",
+        ], dtype="datetime64[ns]"))
+    report = pd.read_csv(result.report_path)
+    assert report.array_id.tolist() == [1, 1, 1]
+
+
+def test_plotting_writes_one_exact_start_map_per_array(tmp_path):
+    write_qc(tmp_path / "qc/1001.parquet", "1001", [7, 22, 37, 52])
+    write_qc(tmp_path / "qc/1002.parquet", "1002", [1507, 1522, 1537, 1552])
+    plotting = plotting_config(checks=False)
+    result = run_reconstruction_workflow(
+        write_config(tmp_path, plotting=plotting, array_gap_hours=24),
+    )
+    assert [path.name for path in result.figure_paths] == [
+        "trajectory_overview.png", "starting_positions.png",
+        "starting_positions__array_01.png", "starting_positions__array_02.png",
+    ]
+    with xr.open_zarr(result.zarr_path, consolidated=True, chunks=None) as dataset:
+        np.testing.assert_array_equal(dataset.array_id, [1, 2])
 
 
 def test_longitude_wrap_and_missing_values_split_paths_without_bridge():

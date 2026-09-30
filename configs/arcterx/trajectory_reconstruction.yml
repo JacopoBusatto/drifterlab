@@ -1,5 +1,5 @@
 input:
-  # Finalized schema-3 position-QC Parquets, one file per platform.
+  # Finalized schema-4 position-QC Parquets, one file per platform.
   directory: ../../data/qc/position
   pattern: "*.parquet"
 grid:
@@ -13,6 +13,10 @@ spline:
     15: 15
     30: 30
     60: 60
+arrays:
+  # Starts are sorted chronologically; a strictly larger adjacent gap starts
+  # the next 1-based deployment array.
+  maximum_adjacent_start_gap_hours: 24
 output:
   # Atomically published bundle containing trajectories.zarr and build_report.csv.
   directory: ../../data/reconstruction/arcterx_trajectories_candidate
@@ -25,13 +29,13 @@ plotting:
   enabled: false
   output_directory: ../../data/reconstruction/arcterx_trajectory_figures
   dataset_label: MicroSVP
-  method: spline_30
+  method: spline_30  # native, linear, spline_15, spline_30, or spline_60
   time:
     start: null
     end: null
   # Empty means every platform. Entries are keyed by dataset label to avoid ambiguity.
   platforms: []
-  # Each selected platform receives one linear-versus-splines check figure.
+  # Each selected platform receives one native/linear/splines check figure.
   check_platforms: []
   map:
     projection: PlateCarree

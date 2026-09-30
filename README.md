@@ -30,12 +30,6 @@ drifterlab-position-qc configs/arcterx/position_qc.local.yml --automatic
 drifterlab-reconstruct-trajectories configs/arcterx/trajectory_reconstruction.local.yml
 # Add --overwrite only when intentionally replacing a stale reconstruction.
 
-drifterlab-clusters configs/arcterx/clusters.local.yml --inspection
-# Review inspection/cohort_review.csv, configure its path and the two thresholds,
-# then build candidate clusters:
-drifterlab-clusters configs/arcterx/clusters.local.yml
-
-# Candidate pairs do not require cohorts or cluster assignments.
 drifterlab-pairs configs/arcterx/pairs.local.yml
 ```
 
@@ -49,14 +43,16 @@ The raw-MAT drogue and position readers remain the upstream source adapters. See
 
 ## Position-QC input contract
 
-Position QC publishes one schema-`3.0` `<platform_code>.parquet` per source
-trajectory. Each row is an immutable source observation and now includes
+Position QC publishes one schema-`4.0` `<platform_code>.parquet` per source
+trajectory, cropped to the inclusive first-to-last QC-valid time span.
+Each saved row is an immutable source observation and includes
 `source_lon` and `source_lat` alongside the detailed QC evidence, drogue cutoff,
 review snapshots, and final decision. Review decisions remain in the separate
-atomic `position_review.csv` file. A normal position-QC rerun rebuilds schema-2
-files and reapplies those decisions.
+atomic `position_review.csv` file. Rejected observations inside the span remain
+available for before/after comparison. A normal position-QC rerun rebuilds older
+products and reapplies saved decisions.
 
-Reconstruction accepts only complete schema-3 files with consistent identities,
+Reconstruction accepts only complete schema-4 files with consistent identities,
 configuration, algorithm, and resolution policy. It rejects unresolved position
 or drogue state, missing accepted coordinates, duplicate accepted timestamps,
 changed files, and any eligible position before the configured grid anchor. It
@@ -74,9 +70,12 @@ The Zarr has dimensions `(platform, time)` and only these scientific arrays:
 
 - `platform_id` and the shared UTC `time` coordinate;
 - `start_time`, `start_lon`, and `start_lat` for the exact first retained QC fix;
+- integer `array_id` on `platform`, displayed as “Array 1”, “Array 2”, etc.;
+- `longitude_native`, `latitude_native`, linearly resampled from source-valid
+  positions before individual point QC but on the accepted-QC grid lifespan;
 - `longitude_linear`, `latitude_linear`;
 - `longitude_spline_15/30/60`, `latitude_spline_15/30/60`;
-- `source_gap_minutes`.
+- `native_source_gap_minutes` and `source_gap_minutes`.
 
 It does not duplicate native QC rows, sensor variables, QC flags, or velocities.
 All methods remain at the configured five-minute output cadence. Longitude is
@@ -93,7 +92,7 @@ with xr.open_zarr(
     consolidated=True,
     chunks=None,
 ) as ds:
-    print(ds[["longitude_linear", "longitude_spline_30"]])
+    print(ds[["longitude_native", "longitude_linear", "longitude_spline_30"]])
 ```
 
 The product metadata deliberately records
@@ -103,21 +102,11 @@ and fallback details are in [trajectory reconstruction](docs/trajectory_reconstr
 
 The same YAML optionally enables batch plotting. A normal rerun validates and
 reuses an unchanged Zarr, so plotting selections can be changed without rebuilding
-trajectories. It writes an overview, an exact-start map, and optional per-platform
-linear-versus-spline checks to the configured plotting directory.
-
-## Candidate deployment clusters
-
-The cluster workflow is read-only with respect to the reconstructed Zarr. Its
-inspection mode proposes broad observed-start cohorts, calculates WGS84 distances
-to the first several spatial neighbors, and writes one PNG plus a multipage PDF
-for each cohort. Review `cohort_review.csv`, then configure maximum cluster
-diameter, maximum observed-start spread, and maximum membership before building.
-
-Candidate groups must be close in both observed start position and observed start
-time. The workflow does not use later trajectory proximity or require lifetime
-overlap, and it does not encode an expected cluster count. See
-[candidate deployment clusters](docs/candidate_clusters.md).
+trajectories. It writes an overview, a combined exact-start map, one exact-start
+map per deployment array, and optional per-platform native-versus-linear-versus-
+spline checks. Arrays are assigned before Zarr writing from chronological gaps
+between exact first retained QC timestamps; they are not spatial clusters or
+verified deployment positions.
 
 ## Candidate encounter pairs
 
@@ -149,7 +138,7 @@ that the new spline products numerically reproduce the supplied tracks.
 Run the focused production tests with:
 
 ```powershell
-python -m pytest tests/test_position_workflow.py tests/test_native_position_qc_v2.py tests/test_reconstruction.py tests/test_reconstruction_workflow.py tests/test_clustering.py tests/test_cluster_workflow.py tests/test_pairs.py tests/test_pair_workflow.py
+python -m pytest tests/test_position_workflow.py tests/test_native_position_qc_v2.py tests/test_reconstruction.py tests/test_reconstruction_workflow.py tests/test_pairs.py tests/test_pair_workflow.py
 ```
 
 Run the complete synthetic suite with `python -m pytest`.

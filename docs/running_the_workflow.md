@@ -1,14 +1,13 @@
 # Running the complete workflow
 
-This is the operational runbook for processing one ARCTERX drifter array from
-raw MATLAB files through reconstructed trajectories and the two optional
-downstream products: candidate pairs and candidate deployment clusters.
+This is the operational runbook for processing one ARCTERX drifter dataset from
+raw MATLAB files through reconstructed trajectories and optional candidate pairs.
 
 Run commands from the repository root. Raw inputs are read-only. Local YAML
 files, QC products, figures, Parquets, and Zarr stores are intentionally ignored
 by Git.
 
-## 1. Install and select an array
+## 1. Install and select a dataset
 
 Create or update the project environment:
 
@@ -23,21 +22,20 @@ Activate it if command-line entry points are not already available:
 .\.venv\Scripts\Activate.ps1
 ```
 
-The current local configurations are named consistently. Select either array in
+The current local configurations are named consistently. Select either dataset in
 PowerShell:
 
 ```powershell
-$array = "microSVP"  # or "SVP"
+$dataset = "microSVP"  # or "SVP"
 $configRoot = "configs/arcterx"
 
-$drogueConfig = "$configRoot/01_${array}_drogue_detection.local.yml"
-$positionConfig = "$configRoot/02_${array}_position_qc.local.yml"
-$reconstructionConfig = "$configRoot/03_${array}_trajectory_reconstruction.local.yml"
-$pairConfig = "$configRoot/04_${array}_pairs.local.yml"
-$clusterConfig = "$configRoot/05_${array}_clusters.local.yml"
+$drogueConfig = "$configRoot/01_${dataset}_drogue_detection.local.yml"
+$positionConfig = "$configRoot/02_${dataset}_position_qc.local.yml"
+$reconstructionConfig = "$configRoot/03_${dataset}_trajectory_reconstruction.local.yml"
+$pairConfig = "$configRoot/04_${dataset}_pairs.local.yml"
 ```
 
-Before running, check every input and output path. Each array must have separate
+Before running, check every input and output path. Each dataset must have separate
 output directories and review CSVs. Relative paths are resolved relative to the
 YAML file, not the current shell directory.
 
@@ -56,18 +54,11 @@ drifterlab-position-qc $positionConfig --semiautomatic
 # 3. Reconstruct all accepted trajectories.
 drifterlab-reconstruct-trajectories $reconstructionConfig
 
-# 4a. Build pairs (independent of clusters).
+# 4. Build candidate pairs when needed.
 drifterlab-pairs $pairConfig
-
-# 4b. Inspect cluster evidence (independent of pairs).
-drifterlab-clusters $clusterConfig --inspection
-
-# Review cohort_review.csv, configure its path and grouping thresholds, then:
-drifterlab-clusters $clusterConfig
 ```
 
-GUI review commands return only after the review window closes. Pair building and
-cluster inspection can be run in either order after reconstruction.
+GUI review commands return only after the review window closes.
 
 ## 2. Drogue detection and review
 
@@ -159,10 +150,12 @@ Important YAML controls are:
 - local baseline, endpoint, bridge-warning, and ambiguity thresholds;
 - reviewer context and event-merging settings.
 
-The result is one schema-3 Parquet per platform plus a run summary and a separate
-atomic review CSV. The Parquets keep every immutable raw observation and record
-why each point is valid, rejected, excluded, uncertain, or outside the analysis
-window. See [native-position QC](native_position_qc.md).
+The result is one schema-4 Parquet per platform plus a run summary and a separate
+atomic review CSV. The Parquets keep raw coordinates and QC decisions for every
+observation between the first and last QC-valid timestamps, including rejected
+points within that span. A platform with no valid observations has an empty file
+with full QC counts and completeness in its footer. The summary reports full-record
+decisions and exported/trimmed counts separately. See [native-position QC](native_position_qc.md).
 
 Reconstruction accepts only complete position-QC products. If it reports an
 unresolved platform, return to `--semiautomatic` or `--manual`, finish the review,
@@ -193,18 +186,21 @@ Key YAML options are:
 - `grid.dt_minutes`: common output cadence;
 - `spline.period_minutes`: spline phase-ensemble representations to publish;
 - `spline.long_gap_threshold_minutes`: per-period fallback threshold;
+- `arrays.maximum_adjacent_start_gap_hours`: a strictly larger chronological gap
+  between exact first retained-QC timestamps starts the next numeric array;
 - output chunk sizes;
 - optional plotting method, time window, platform subset, per-platform checks,
   map projection/extent, and compatible additional stores.
 
-No method extrapolates before the first or after the last retained QC fix. Review
+Every platform receives one positive, chronological `array_id` before Zarr
+writing. No method extrapolates before the first or after the last retained QC fix. Review
 `build_report.csv` and the figures before treating the candidate Zarr as a frozen
 scientific input. Full details are in
 [trajectory reconstruction](trajectory_reconstruction.md).
 
 ## 5. Candidate pairs
 
-Pair construction does not require cohorts or cluster assignments. A platform may
+Pair construction does not depend on deployment-array assignments. A platform may
 belong to several pairs.
 
 Set the following scientific choices in the pair YAML:
@@ -238,50 +234,6 @@ Options and behavior:
 The output contains authoritative grouped trajectories in `pairs.zarr` and a
 compact `pair_catalog.csv`. See [candidate encounter pairs](candidate_pairs.md).
 
-## 6. Candidate deployment clusters
-
-Cluster work is an optional branch from reconstruction and is independent of pair
-building. Start with inspection:
-
-```powershell
-drifterlab-clusters $clusterConfig --inspection
-```
-
-Inspection can run while the diameter and start-spread thresholds are `null`. It
-writes `inspection/cohort_review.csv`, neighbor diagnostics, maps, PDFs, and a
-manifest. Review the CSV without changing platform IDs, observed starts, or their
-hashes. For each included platform, set or confirm:
-
-- `reviewed_cohort_id`;
-- `include`;
-- optional `review_note`.
-
-Next, update the YAML:
-
-```yaml
-cohorts:
-  reviewed_assignments: /path/to/inspection/cohort_review.csv
-grouping:
-  maximum_cluster_diameter_m: 1000
-  maximum_members_per_cluster: 5
-  maximum_observed_start_spread_minutes: 120
-  cohort_overrides: {}
-```
-
-The numerical thresholds above only illustrate syntax. Choose them from the
-inspection diagnostics. Build reviewed candidate groups with:
-
-```powershell
-drifterlab-clusters $clusterConfig
-```
-
-Cluster YAML options include the adjacent-start gap used to propose cohorts,
-reviewed assignment path, global grouping limits, per-cohort overrides, nearest
-neighbor ranks, and map settings. Neither the expected number of clusters nor a
-required cluster size is hardcoded. `--overwrite` atomically replaces only the
-selected `inspection/` or `candidate/` output. See
-[candidate deployment clusters](candidate_clusters.md).
-
 ## Command-line option summary
 
 | Command | Mode/option | Effect |
@@ -292,8 +244,6 @@ selected `inspection/` or `candidate/` output. See
 | `drifterlab-position-qc` | `--overwrite` | Force per-platform recomputation; retain review CSV |
 | `drifterlab-reconstruct-trajectories` | `--overwrite` | Validate a replacement before atomically replacing the bundle |
 | `drifterlab-pairs` | `--overwrite` | Atomically replace the pair bundle |
-| `drifterlab-clusters` | `--inspection` | Produce diagnostics and review CSV without grouping |
-| `drifterlab-clusters` | `--overwrite` | Atomically replace the selected inspection or candidate bundle |
 
 Every command supports `--help`, for example:
 
@@ -307,7 +257,7 @@ drifterlab-position-qc --help
   input first, then rebuild deliberately.
 - Review CSVs are durable decisions and are separate from regenerated automatic
   products.
-- Reconstruction, pair, and cluster publication is atomic: a completed existing
+- Reconstruction and pair publication is atomic: a completed existing
   bundle is not replaced until the new bundle validates.
 - If an executable is missing after adding a new CLI, rerun the editable install
   command from section 1.

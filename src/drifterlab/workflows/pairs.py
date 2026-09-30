@@ -32,7 +32,7 @@ from drifterlab.pairs import (
 
 PAIR_ALGORITHM_VERSION = "first-geodesic-threshold-crossing-v1"
 PAIR_SCHEMA_VERSION = "1.0"
-SUPPORTED_RECONSTRUCTION_SCHEMA_VERSION = "1.1"
+SUPPORTED_RECONSTRUCTION_SCHEMA_VERSION = "1.3"
 ZARR_NAME = "pairs.zarr"
 CATALOG_NAME = "pair_catalog.csv"
 WGS84 = Geod(ellps="WGS84")

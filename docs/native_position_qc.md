@@ -389,15 +389,18 @@ deployment/temporal uncertainty; exact-repeat reject; automatic short-interval
 reject; human reject; human keep; human uncertain; geometry reject;
 unresolved-event implication; ordinary valid. A local
 keep cannot cross a drogue, deployment, or segment boundary. `final_position_valid`
-is true only for `valid`. The downstream `resolved_position_trajectory` loader
-checks source identities/hashes and rejects unresolved/uncertain state unless the
-caller explicitly opts in.
+is true only for `valid`. The `resolved_position_trajectory` helper validates the
+full in-memory QC result against the raw trajectory and rejects unresolved/uncertain
+state unless the caller explicitly opts in. Reconstruction reads the published
+Parquets directly and validates their footer provenance and completeness.
 
 ## Product schemas and persistence
 
 The configured position directory contains `<platform_code>.parquet`, one file per
-native trajectory. Schema `3.0` contains one row per immutable source observation,
-including the original coordinates needed by reconstruction. Its columns are
+native trajectory. Schema `4.0` contains one row per source observation within the
+inclusive time span from the first to the last `final_position_valid` observation.
+It includes the original coordinates needed for before/after comparison and
+reconstruction. Its columns are
 grouped as follows:
 
 - identity/validity: `platform_code`, `source_obs_index`, `source_path`,
@@ -426,7 +429,24 @@ grouped as follows:
 
 `source_lon` and `source_lat` are copied without normalization or wrapping and are
 never modified by review. Invalid values may remain on rejected audit rows; every
-final-valid row must have a finite in-range coordinate. Compact event details exist
+final-valid row must have a finite in-range coordinate. Export trimming uses UTC
+time, regardless of source order, and preserves original `source_obs_index` values.
+All observations at the endpoint timestamps are included, including rejected ones.
+Rows with no usable timestamp cannot be placed within the span and are omitted.
+If there are no valid observations, a schema-correct empty Parquet is written.
+
+For the native before-QC track, use the published `time`, `source_lon`, and
+`source_lat` rows. For the after-QC track, filter those same rows by
+`final_position_valid`. Sort chronologically for plotting and preserve segment
+and timing breaks. Rejected observations inside the span remain available.
+
+QC still runs on the full raw record. Review history and pending events outside
+the exported span stay in the footer event catalog; the reviewer lazily recalculates
+the full active platform from the raw source when loading a trimmed product.
+This read does not publish files. Committed changes can expand or shrink the
+exported span on the next publication.
+
+Compact event details exist
 only on implicated rows. Every footer stores schema,
 algorithm and product-layout versions, effective configuration, platform-specific
 review/drogue/deployment/source hashes, a compact event catalog, and observation/
@@ -434,6 +454,15 @@ unresolved counts. It also stores the resolution policy and per-case decision
 counts. Event summaries include event type, earliest UTC time, and
 earliest source index for deterministic navigation. The reviewer constructs its queue from these footers without
 materializing all trajectory rows.
+
+Footer `observation_count` is the number of exported rows, while
+`source_observation_count` is the full input count. `trimmed_observation_count`
+records their difference. `valid_time_start_utc` and `valid_time_end_utc` record the
+inclusive span (both null for an empty product). Completeness, unresolved counts,
+and decision summaries describe the full QC result, even for an empty export, so
+trimming cannot hide an unresolved platform. `reconstruction_available` records
+whether a complete usable trajectory exists; reconstruction still requires at
+least two accepted fixes.
 
 `position_review.csv` contains only explicit decisions:
 
@@ -457,7 +486,7 @@ endpoint cure to the aggressive bounded automatic solver. Switching between
 automatic and reviewer modes causes the per-platform products to rebuild under
 the appropriate policy; later runs with the same policy reuse them normally.
 
-The product schema is `3.0` and layout is `per-trajectory-v2`. The compatibility
+The product schema is `4.0` and layout is `per-trajectory-v3`. The compatibility
 check requires both coordinate columns, so older products rebuild independently.
 Human decisions are retained because the authoritative review CSV is separate and
 is reapplied during that rebuild.
@@ -468,7 +497,10 @@ in the trajectory output directory. It has one row per platform plus an
 multi-point speed-cure removals, block sizes, human rejections, capped retained
 anomalies, local unresolved observations, upstream uncertainty, and final valid/
 rejected observations. The CLI prints the aggregate counts. The summary is derived
-from Parquet footers and does not load or concatenate all trajectory rows.
+from Parquet footers and does not load or concatenate all trajectory rows. Decision
+counts and summary `observation_count` cover the full source record, including QC
+rejections removed by export trimming. `exported_observation_count` and
+`trimmed_observation_count` separately report publication sizes.
 
 ## Raw-data smoke check
 

@@ -2,7 +2,7 @@
 
 import numpy as np
 
-from drifterlab.reconstruction.core import reconstruct_platform
+from drifterlab.reconstruction.core import reconstruct_platform, resample_linear_track
 
 
 def times(minutes):
@@ -75,3 +75,16 @@ def test_phase_overshoot_falls_back_for_the_complete_portion():
     np.testing.assert_allclose(result.latitude_spline[15], result.latitude_linear)
     assert result.fallback[15].overshoot_portions == 1
     assert result.fallback[15].overshoot_points == 13
+
+
+def test_native_linear_resampling_uses_explicit_span_and_unwraps_dateline():
+    result = resample_linear_track(
+        times([0, 5, 10, 15, 20]),
+        [170, 179, -179, -170, -160], [0, 1, 2, 3, 4],
+        times(range(0, 21, 5)),
+        coverage_start=times([5])[0], coverage_end=times([15])[0],
+    )
+    assert np.isnan(result.longitude[[0, 4]]).all()
+    np.testing.assert_allclose(result.longitude[1:4], [179, -179, -170])
+    np.testing.assert_array_equal(result.source_gap_minutes, [np.nan, 0, 0, 0, np.nan])
+    assert result.filled_grid_points == 3 and result.exact_grid_points == 3

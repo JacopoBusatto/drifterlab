@@ -17,10 +17,9 @@ COMMON-GRID RECONSTRUCTION
   ↓
 LEAN CANDIDATE TRAJECTORY ZARR + GAP REPORT
   â†“ (optional, read-only)
-TRAJECTORY OVERVIEW / EXACT-START / RECONSTRUCTION-CHECK FIGURES
+TRAJECTORY OVERVIEW / ARRAY EXACT-START / RECONSTRUCTION-CHECK FIGURES
   ↓
-CANDIDATE DEPLOYMENT CLUSTERS FROM OBSERVED STARTS
-CANDIDATE ENCOUNTER PAIRS FROM OVERLAPPING TRAJECTORIES (independent of clusters)
+CANDIDATE ENCOUNTER PAIRS FROM OVERLAPPING TRAJECTORIES
   ↓
 SCIENCE
 ```
@@ -29,12 +28,10 @@ SCIENCE
 |---|---|---|---|---|
 | Raw | Campaign source MAT files | Immutable normalized signals/positions | `drifterlab.io` | Implemented |
 | Drogue QC | Raw TTFF/strain | Automatic Parquet plus explicit review CSV | `drifterlab.qc`, `drifterlab.workflows`, `drifterlab.review` | Implemented |
-| Position QC | Raw positions and resolved drogue decision | Schema-3 per-platform QC Parquets plus review CSV | same generic packages | Implemented |
-| Reconstruction | Finalized position-QC Parquets only | Shared-grid linear and phase-ensemble spline tracks | `drifterlab.reconstruction` and reconstruction workflow | Implemented |
+| Position QC | Raw positions and resolved drogue decision | Schema-4 per-platform QC Parquets plus review CSV | same generic packages | Implemented |
+| Reconstruction | Finalized position-QC Parquets only | Shared-grid native, linear, spline tracks, and numeric deployment arrays | `drifterlab.reconstruction` and reconstruction workflow | Implemented |
 | Trajectory product | Reconstructed rows | Lean candidate Zarr and per-platform build report | reconstruction workflow | Implemented |
-| Plotting | Validated trajectory Zarr | Overview, exact-start, and optional reconstruction-check PNGs | reconstruction command | Implemented |
-| Cluster inspection | Reviewed trajectory Zarr | Observed-start cohorts, neighbor diagnostics, array maps | `drifterlab.clustering`, cluster workflow | Implemented |
-| Candidate grouping | Reviewed cohort assignments | Candidate cluster membership and summaries | same packages | Implemented |
+| Plotting | Validated trajectory Zarr | Overview, combined/per-array exact-start, and optional reconstruction-check PNGs | reconstruction command | Implemented |
 | Candidate pairs | Reconstructed trajectories | Grouped pair Zarr plus diagnostic catalog | `drifterlab.pairs` and pair workflow | Implemented |
 | Pair science | Grouped pairs | Pair analysis products | future packages | Planned |
 
@@ -48,13 +45,12 @@ Zarr has been removed. Its supplied-QC reader and independent diagnostic scripts
 remain for historical investigation only. In particular, the delivered
 `drifter_interp` tracks are not inputs to the production reconstruction stage.
 
-Candidate clustering reads only the exact `start_time`, `start_lon`, and
-`start_lat` values stored by reconstruction. These are observed first retained QC
-fixes, not verified deployment coordinates. Cluster inspection and grouping never
-change trajectory values or valid time spans; later pair analyses must select each
-pair's actual overlapping lifetime. See [candidate deployment clusters](candidate_clusters.md).
+Reconstruction assigns every platform one numeric `array_id` from chronological
+gaps between exact first retained-QC timestamps. These are observed starts, not
+verified deployment coordinates. Assignment never changes trajectory values or
+valid time spans.
 
-Candidate-pair building is independent of cohorts and cluster assignments. It
+Candidate-pair building is independent of array assignments. It
 selects the first configured distance-threshold crossing during each pair's common
 lifetime, optionally restricted to a window measured from both observed starts,
 then retains all reconstructed coordinate representations in a grouped-trajectory

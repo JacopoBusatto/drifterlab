@@ -1,7 +1,8 @@
 # Candidate encounter pairs
 
 This stage discovers pairwise encounters in the read-only reconstructed trajectory
-Zarr. It does not depend on deployment cohorts or candidate clusters. A platform
+Zarr. It does not depend on the reconstruction product's deployment-array
+assignments. A platform
 may therefore appear in zero, one, or many pairs.
 
 ## Selection
@@ -50,12 +51,16 @@ representation explicitly, for example:
 ```text
 lon_linear_1, lat_linear_1, lon_linear_2, lat_linear_2
 center_lon_linear, center_lat_linear
+lon_native_1, lat_native_1, lon_native_2, lat_native_2
+center_lon_native, center_lat_native
 lon_spline_30_1, ..., center_lat_spline_30
 ```
 
 Root attributes identify `canonical_coordinate_method` and
 `available_coordinate_methods`. Changing the selection method can change pair
 membership and encounter times, so it requires rebuilding the product.
+The `native` method is the source-valid pre-point-QC trajectory resampled on the
+same per-platform grid lifespan as the accepted-QC methods.
 
 Trajectory-level diagnostics include both observed starts, overlap bounds,
 encounter time, encounter distance, delay from each start, post-encounter duration,

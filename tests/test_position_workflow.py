@@ -112,8 +112,8 @@ def test_automatic_writes_one_platform_file_with_complete_metadata_and_reuses(po
     np.testing.assert_array_equal(frame.source_lon, [.009, .008, .007, .006, .2, .004, .2, .002, .001, 0])
     np.testing.assert_array_equal(frame.source_lat, np.zeros(10))
     provenance = metadata(output)
-    assert provenance["schema_version"] == "3.0"
-    assert provenance["product_layout"] == "per-trajectory-v2"
+    assert provenance["schema_version"] == "4.0"
+    assert provenance["product_layout"] == "per-trajectory-v3"
     assert provenance["resolution_policy"] == "aggressive"
     assert provenance["platform_code"] == "1001"
     assert provenance["observation_count"] == 10
@@ -158,6 +158,121 @@ def test_multiple_platforms_are_independent_and_unrelated_output_is_untouched(tm
     assert [path.name for path in result.files] == ["1001.parquet", "1002.parquet"]
     assert all(path.exists() for path in result.files)
     assert unrelated.read_bytes() == before
+
+
+def test_publication_crops_time_span_preserving_native_points_and_full_counts(position_inputs):
+    raw, _, config_path = position_inputs
+    initial = run_position_workflow(config_path, "automatic")
+    full = pd.read_parquet(initial.files[0])
+    reviews = PositionReviews(load_position_config(config_path).review_output)
+    reviews.set_observations(full, [0, 9], "reject", decision_source="manual",
+                             config_sha256="test", note="trim endpoints")
+    reviews.save()
+    result = run_position_workflow(config_path, "automatic")
+    saved = pd.read_parquet(result.files[0])
+    native = read_microsvp_position_mat(raw)
+    assert saved.source_obs_index.tolist() == list(range(1, 9))
+    np.testing.assert_array_equal(saved.source_lon, native.lon[1:9])
+    np.testing.assert_array_equal(saved.source_lat, native.lat[1:9])
+    accepted = saved.loc[saved.final_position_valid]
+    assert saved.time.min() == accepted.time.min()
+    assert saved.time.max() == accepted.time.max()
+    assert saved.loc[saved.source_obs_index.isin([4, 6]), "final_position_status"].eq("rejected").all()
+    footer = metadata(result.files[0])
+    assert footer["observation_count"] == 8
+    assert footer["source_observation_count"] == result.observation_count == 10
+    assert footer["trimmed_observation_count"] == 2
+    assert footer["valid_time_start_utc"] == accepted.time.min().isoformat()
+    assert footer["valid_time_end_utc"] == accepted.time.max().isoformat()
+    assert result.decision_summary["human_rejected_points"] == 2
+    assert result.decision_summary["exported_observation_count"] == 8
+    assert result.decision_summary["trimmed_observation_count"] == 2
+    reused = run_position_workflow(config_path, "automatic")
+    assert reused == result
+
+
+@pytest.mark.parametrize("decision,complete", [("reject", True), ("uncertain", False)])
+def test_no_valid_points_writes_empty_product_with_full_resolution_metadata(
+    position_inputs, decision, complete,
+):
+    _, _, config_path = position_inputs
+    initial = run_position_workflow(config_path, "automatic")
+    frame = pd.read_parquet(initial.files[0])
+    reviews = PositionReviews(load_position_config(config_path).review_output)
+    reviews.set_observations(frame, frame.source_obs_index.tolist(), decision,
+                             decision_source="manual", config_sha256="test")
+    reviews.save()
+    result = run_position_workflow(config_path, "automatic")
+    saved = pd.read_parquet(result.files[0])
+    assert saved.empty
+    assert saved.columns.tolist() == frame.columns.tolist()
+    footer = metadata(result.files[0])
+    assert footer["observation_count"] == 0
+    assert footer["source_observation_count"] == footer["trimmed_observation_count"] == 10
+    assert footer["valid_time_start_utc"] is None
+    assert footer["valid_time_end_utc"] is None
+    assert footer["platform_qc_complete"] is complete
+    assert footer["reconstruction_available"] is False
+    assert (result.unresolved_count == 0) is complete
+
+
+def test_valid_span_uses_inclusive_timestamps_and_excludes_untimed_rows():
+    frame = pd.DataFrame({
+        "time": pd.to_datetime([None, "2025-01-01T00:15Z", "2025-01-01T00:10Z",
+                                "2025-01-01T00:05Z", "2025-01-01T00:05Z",
+                                "2025-01-01T00:00Z"], utc=True),
+        "source_obs_index": [50, 40, 30, 20, 10, 0],
+        "final_position_valid": [False, False, True, False, True, False],
+        "source_lon": [-999., 4., 3., -999., 1., 0.],
+    })
+    product, footer = position_workflow_module._valid_span_product(frame)
+    assert product.source_obs_index.tolist() == [30, 20, 10]
+    assert product.source_lon.tolist() == [3., -999., 1.]
+    assert footer["trimmed_observation_count"] == 3
+    # One valid timestamp includes every raw observation at that timestamp.
+    frame.loc[2, "final_position_valid"] = False
+    product, footer = position_workflow_module._valid_span_product(frame)
+    assert product.source_obs_index.tolist() == [20, 10]
+    assert footer["valid_time_start_utc"] == footer["valid_time_end_utc"]
+
+
+def test_reviewer_restores_trimmed_endpoints_without_publication(position_inputs, monkeypatch):
+    _, _, config_path = position_inputs
+
+    class NoopReviewer:
+        def __init__(self, *args, **kwargs):
+            pass
+        def show(self):
+            pass
+
+    initial = run_position_workflow(config_path, "manual", reviewer_factory=NoopReviewer)
+    frame = pd.read_parquet(initial.files[0])
+    reviews = PositionReviews(load_position_config(config_path).review_output)
+    reviews.set_observations(frame, [0, 9], "reject", decision_source="manual",
+                             config_sha256="test")
+    reviews.save()
+    run_position_workflow(config_path, "manual", reviewer_factory=NoopReviewer)
+    assert len(pd.read_parquet(initial.files[0])) == 8
+    output_hash = file_sha256(initial.files[0])
+
+    def no_publication(*args, **kwargs):
+        pytest.fail("Reviewer loading must not publish a platform")
+
+    monkeypatch.setattr(position_workflow_module, "_publish", no_publication)
+    loaded = []
+
+    class InspectReviewer:
+        def __init__(self, *args, platform_loader, **kwargs):
+            self.load = platform_loader
+        def show(self):
+            full = self.load("1001")
+            loaded.append(full)
+            assert full.source_obs_index.tolist() == list(range(10))
+            assert full.loc[full.source_obs_index.isin([0, 9]), "human_position_decision"].eq("reject").all()
+
+    run_position_workflow(config_path, "manual", reviewer_factory=InspectReviewer)
+    assert len(loaded) == 1
+    assert file_sha256(initial.files[0]) == output_hash
 
 
 def test_review_change_rebuilds_only_affected_platform(tmp_path):
@@ -205,7 +320,7 @@ def test_schema_two_product_rebuilds_with_coordinates_and_preserves_review(posit
     result = run_position_workflow(config_path, "automatic")
     output = result.files[0]
     frame = pd.read_parquet(output)
-    source = int(frame.source_obs_index.iloc[0])
+    source = int(frame.source_obs_index.iloc[1])
     reviews = PositionReviews(load_position_config(config_path).review_output)
     reviews.set_observations(
         frame, [source], "reject", decision_source="manual",

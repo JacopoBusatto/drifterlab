@@ -23,7 +23,6 @@ plotting = ["cartopy>=0.22"]
 drifterlab-drogue = "drifterlab.cli.drogue:main"
 drifterlab-position-qc = "drifterlab.cli.position_qc:main"
 drifterlab-reconstruct-trajectories = "drifterlab.cli.reconstruct_trajectories:main"
-drifterlab-clusters = "drifterlab.cli.clusters:main"
 drifterlab-pairs = "drifterlab.cli.pairs:main"
 
 [tool.setuptools.packages.find]
