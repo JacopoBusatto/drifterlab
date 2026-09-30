@@ -11,6 +11,7 @@ requires-python = ">=3.10"
 dependencies = [
     "numpy>=1.24", "scipy>=1.10", "pandas>=2.0", "xarray>=2025.1",
     "zarr>=2.18,<3", "numcodecs>=0.12", "pyarrow>=14", "PyYAML>=6", "matplotlib>=3.8",
+    "pyproj>=3.6",
 ]
 
 [project.optional-dependencies]
@@ -22,6 +23,8 @@ plotting = ["cartopy>=0.22"]
 drifterlab-drogue = "drifterlab.cli.drogue:main"
 drifterlab-position-qc = "drifterlab.cli.position_qc:main"
 drifterlab-reconstruct-trajectories = "drifterlab.cli.reconstruct_trajectories:main"
+drifterlab-clusters = "drifterlab.cli.clusters:main"
+drifterlab-pairs = "drifterlab.cli.pairs:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

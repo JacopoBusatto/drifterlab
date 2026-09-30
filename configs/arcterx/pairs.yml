@@ -1,0 +1,21 @@
+input:
+  # Read-only common-grid reconstruction product.
+  zarr: ../../data/reconstruction/arcterx_trajectories_candidate/trajectories.zarr
+
+coordinates:
+  # This representation alone selects pair membership and encounter time.
+  # Every complete linear/spline representation in the input is retained in output.
+  selection_method: spline_30
+
+selection:
+  # Required scientific choice: set a finite WGS84 member-distance threshold.
+  maximum_distance_m: null
+  # The encounter must fall within this many seconds of BOTH observed starts.
+  # Set null to allow chance encounters anywhere in the common valid lifetime.
+  maximum_seconds_from_each_observed_start: 21600
+
+output:
+  directory: ../../data/pairs/arcterx_candidate
+  chunks:
+    trajectory: 1
+    obs: 2016

@@ -59,6 +59,7 @@ position_qc:
   max_automatic_removal_points: 5
   local_speed_window_points: 15
   endpoint_speed_min_samples: 8
+  boundary_endpoint_speed_multiplier: 10.0
   bridge_speed_warning_z: 3.0
   local_speed_scale_floor_m_s: 0.05
   endpoint_speed_score_margin_z: 2.0
@@ -72,7 +73,9 @@ Recovery is bounded by both `max_automatic_removal_points` and elapsed time. The
 interpolation residual remains evidence rather than a decision gate.
 `bridge_speed_warning_z` controls the atypical-bridge warning threshold;
 `endpoint_speed_score_margin_z` controls how clearly one conservative endpoint
-cure must outperform another.
+cure must outperform another. `boundary_endpoint_speed_multiplier` reserves
+automatic retained-segment boundary removal for gross jumps: its threshold is
+the ordinary speed threshold multiplied by this value.
 
 The optional deployment CSV must have these columns, in order:
 
@@ -206,6 +209,17 @@ nonoverlapping winners are applied together and adjacency is rebuilt to a fixed
 point. If no cure exists within either configured limit, the observations are
 retained as a resolved `automatic_keep_removal_limit_reached` anomaly rather than
 being deleted indefinitely.
+
+The ordinary bounded solver cannot test the first or last point of a retained
+temporal segment because no bridge anchor exists outside the segment. Aggressive
+mode therefore applies one separate boundary-endpoint test. It removes a boundary
+point only when the adjacent edge exceeds
+`speed_threshold_m_s * boundary_endpoint_speed_multiplier`, the inward side has
+at least `endpoint_speed_min_samples` consecutive plausible edges, no competing
+interior removal within the ordinary point/time limits preserves the endpoint,
+and the endpoint has no human keep/uncertain decision. Human uncertainty cannot
+create an artificial eligible boundary. The decision and its support edges are
+stored as `automatic_boundary_endpoint_speed_cure` evidence.
 
 Automatic mode also resolves duplicate timestamps by retaining the representative
 with the best surrounding speed/acceleration score and rejecting the others.
@@ -438,10 +452,10 @@ The CSV is atomically replaced by N or Q. Each affected trajectory Parquet is th
 recomputed and atomically replaced independently. Unaffected files remain byte-for-
 byte unchanged.
 
-Algorithm version `native-position-qc-v2.5` adds the aggressive bounded automatic
-solver and policy-aware provenance. Switching between automatic and reviewer modes
-causes the per-platform products to rebuild under the appropriate policy; later
-runs with the same policy reuse them normally.
+Algorithm version `native-position-qc-v2.6` adds the guarded gross-speed boundary
+endpoint cure to the aggressive bounded automatic solver. Switching between
+automatic and reviewer modes causes the per-platform products to rebuild under
+the appropriate policy; later runs with the same policy reuse them normally.
 
 The product schema is `3.0` and layout is `per-trajectory-v2`. The compatibility
 check requires both coordinate columns, so older products rebuild independently.

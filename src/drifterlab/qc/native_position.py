@@ -39,6 +39,7 @@ class NativePositionConfig:
     max_automatic_removal_points: int = 5
     local_speed_window_points: int = 15
     endpoint_speed_min_samples: int = 8
+    boundary_endpoint_speed_multiplier: float = 10.0
     bridge_speed_warning_z: float = 3.0
     local_speed_scale_floor_m_s: float = .05
     endpoint_speed_score_margin_z: float = 2.0
@@ -913,6 +914,186 @@ def _automatic_duplicate_rejections(
     return result, evidence
 
 
+def _aggressive_boundary_endpoint_cures(
+    frame: pd.DataFrame, base_rejected: np.ndarray, config: NativePositionConfig,
+    protected: np.ndarray, *, first_iteration: int,
+) -> tuple[np.ndarray, dict[int, dict[str, Any]], int]:
+    """Reject a uniquely isolated gross-speed point at a true segment boundary.
+
+    Interior recovery needs an anchor on both sides of a candidate.  This
+    deliberately separate rule handles the first or last surviving observation
+    only when a sustained, physically plausible cluster supports the other side
+    and no bounded removal next to the endpoint provides a competing cure.
+    """
+    n = len(frame)
+    result = np.zeros(n, dtype=bool)
+    evidence: dict[int, dict[str, Any]] = {}
+    time = frame.time_value.to_numpy(dtype="datetime64[ns]")
+    lon = frame.source_lon.to_numpy(dtype=float)
+    lat = frame.source_lat.to_numpy(dtype=float)
+    source = frame.source_obs_index.to_numpy(dtype=np.int64)
+    human = frame.human_position_decision.fillna("").astype(str).to_numpy()
+    maximum_elapsed = config.max_local_gap_seconds + config.gap_tolerance_seconds
+    gross_speed = config.speed_threshold_m_s * config.boundary_endpoint_speed_multiplier
+
+    @lru_cache(None)
+    def values(a: int, b: int) -> tuple[float, float, float]:
+        if time[a] > time[b]:
+            a, b = b, a
+        return _edge_arrays(time, lon, lat, a, b)
+
+    def plausible(a: int, b: int) -> bool:
+        dt, _distance, speed = values(a, b)
+        return bool(
+            config.minimum_local_dt_seconds <= dt <= maximum_elapsed
+            and np.isfinite(speed) and speed <= config.speed_threshold_m_s
+        )
+
+    # Only the outer surviving observations of a retained temporal segment are
+    # true boundaries.  Human uncertainty remains a barrier and cannot create a
+    # synthetic boundary eligible for this automatic rule.
+    boundaries: dict[str, tuple[int, int]] = {}
+    eligible = (
+        frame.segment_status.eq("retained").to_numpy(dtype=bool)
+        & frame.valid_timestamp.to_numpy(dtype=bool)
+        & frame.source_position_valid.to_numpy(dtype=bool)
+        & frame.drogue_eligible.to_numpy(dtype=bool)
+        & frame.deployment_eligible.to_numpy(dtype=bool)
+        & ~frame.deployment_uncertain.to_numpy(dtype=bool)
+        & ~base_rejected
+        & (human != "reject")
+    )
+    for segment_id, segment in frame.loc[eligible].groupby("segment_id", sort=False):
+        order = segment.index.to_numpy(dtype=np.int64)
+        order = order[np.argsort(time[order], kind="stable")]
+        if len(order):
+            boundaries[str(segment_id)] = (int(order[0]), int(order[-1]))
+
+    proposals: list[tuple[int, dict[str, Any], dict[str, Any]]] = []
+    for order in _candidate_runs(frame, base_rejected):
+        if len(order) < config.endpoint_speed_min_samples + 2:
+            continue
+        segment_id = str(frame.at[order[0], "segment_id"])
+        boundary = boundaries.get(segment_id)
+        if boundary is None:
+            continue
+
+        def proposal(side: str) -> tuple[int, dict[str, Any], dict[str, Any]] | None:
+            if side == "start":
+                candidate, neighbor = int(order[0]), int(order[1])
+                if candidate != boundary[0]:
+                    return None
+                support_pairs = [
+                    (int(order[position]), int(order[position + 1]))
+                    for position in range(1, config.endpoint_speed_min_samples + 1)
+                ]
+            else:
+                candidate, neighbor = int(order[-1]), int(order[-2])
+                if candidate != boundary[1]:
+                    return None
+                support_pairs = [
+                    (int(order[position]), int(order[position + 1]))
+                    for position in range(
+                        len(order) - config.endpoint_speed_min_samples - 2,
+                        len(order) - 2,
+                    )
+                ]
+            trigger_dt, trigger_distance, trigger_speed = values(candidate, neighbor)
+            if (protected[candidate]
+                    or not config.minimum_local_dt_seconds <= trigger_dt <= maximum_elapsed
+                    or not np.isfinite(trigger_speed) or trigger_speed <= gross_speed
+                    or not all(plausible(left, right) for left, right in support_pairs)):
+                return None
+
+            attempts: list[dict[str, Any]] = []
+            for count in range(1, config.max_automatic_removal_points + 1):
+                if side == "start":
+                    reconnect_position = count + 1
+                    if reconnect_position >= len(order):
+                        break
+                    anchor, reconnect = int(order[0]), int(order[reconnect_position])
+                    skipped = tuple(int(value) for value in order[1:reconnect_position])
+                else:
+                    anchor_position = len(order) - count - 2
+                    if anchor_position < 0:
+                        break
+                    anchor, reconnect = int(order[anchor_position]), int(order[-1])
+                    skipped = tuple(int(value) for value in order[anchor_position + 1:-1])
+                bridge_dt, bridge_distance, bridge_speed = values(anchor, reconnect)
+                within_time = bool(
+                    np.isfinite(bridge_dt) and bridge_dt > 0
+                    and bridge_dt <= maximum_elapsed
+                )
+                cure = bool(within_time and plausible(anchor, reconnect))
+                attempts.append({
+                    "skipped_source_obs_indices": [int(source[j]) for j in skipped],
+                    "bridge_dt_seconds": bridge_dt,
+                    "bridge_distance_m": bridge_distance,
+                    "bridge_speed_m_s": bridge_speed,
+                    "cures": cure,
+                })
+                if cure:
+                    # The endpoint is not unique: an interior block can instead
+                    # preserve it, so let the ordinary bounded solver decide.
+                    return None
+                if not within_time:
+                    break
+
+            support = [{
+                "left_source_obs_index": int(source[left]),
+                "right_source_obs_index": int(source[right]),
+                "dt_seconds": values(left, right)[0],
+                "speed_m_s": values(left, right)[2],
+            } for left, right in support_pairs]
+            chosen = {
+                "method": "boundary_endpoint_speed_cure",
+                "boundary": side,
+                "candidate": candidate,
+                "candidate_source_obs_index": int(source[candidate]),
+                "neighbor_source_obs_index": int(source[neighbor]),
+                "trigger_dt_seconds": trigger_dt,
+                "trigger_distance_m": trigger_distance,
+                "trigger_speed_m_s": trigger_speed,
+                "gross_speed_threshold_m_s": gross_speed,
+                "support_edge_count": len(support),
+                "required_support_edges": config.endpoint_speed_min_samples,
+                "support_edges": support,
+                "cures": True,
+            }
+            competitor = {
+                "method": "boundary_competing_interior_removal",
+                "maximum_removal_points": config.max_automatic_removal_points,
+                "search_limit_seconds": maximum_elapsed,
+                "tested_hypotheses": attempts,
+                "cures": False,
+            }
+            return candidate, chosen, competitor
+
+        for side in ("start", "end"):
+            item = proposal(side)
+            if item is not None:
+                proposals.append(item)
+
+    if not proposals:
+        return result, evidence, first_iteration
+    iteration = first_iteration + 1
+    for candidate, chosen, competitor in proposals:
+        if result[candidate]:
+            continue
+        result[candidate] = True
+        event_id = _event_id(
+            str(frame.platform_code.iloc[0]), "automatic_boundary_endpoint_speed_cure",
+            [int(source[candidate])],
+        )
+        evidence[candidate] = {
+            "event_id": event_id, "iteration": iteration,
+            "implicated": [int(source[candidate])],
+            "forward": chosen, "backward": competitor,
+            "reason": "automatic_boundary_endpoint_speed_cure",
+        }
+    return result, evidence, iteration
+
+
 def _aggressive_speed_cures(
     frame: pd.DataFrame, base_rejected: np.ndarray, config: NativePositionConfig,
     protected: np.ndarray, *, first_iteration: int,
@@ -1272,6 +1453,15 @@ def _local_qc(frame: pd.DataFrame, position: NativePositionConfig,
         geometry_reject[list(new_points)] = True
 
     if resolution_policy == "aggressive":
+        boundary_reject, boundary_evidence, iteration = (
+            _aggressive_boundary_endpoint_cures(
+                frame,
+                repeat_reject | short_reject | duplicate_reject | geometry_reject,
+                position, protected, first_iteration=iteration,
+            )
+        )
+        geometry_reject |= boundary_reject
+        evidence.update(boundary_evidence)
         aggressive_reject, aggressive_evidence, iteration = _aggressive_speed_cures(
             frame,
             repeat_reject | short_reject | duplicate_reject | geometry_reject,
@@ -1345,9 +1535,16 @@ def _local_qc(frame: pd.DataFrame, position: NativePositionConfig,
         frame.at[j, "point_auto_decision"] = "reject"
         frame.at[j, "point_auto_reason"] = item["reason"]
         frame.at[j, "auto_iteration"] = item["iteration"]
-        frame.at[j, "candidate_bridge_anchor_source_obs_index"] = int(frame.at[forward["anchor"], "source_obs_index"])
-        frame.at[j, "candidate_bridge_reconnection_source_obs_index"] = int(frame.at[forward["reconnect"], "source_obs_index"])
-        frame.at[j, "candidate_bridge_speed_m_s"] = forward["bridge_speed"]
+        if forward.get("anchor") is not None:
+            frame.at[j, "candidate_bridge_anchor_source_obs_index"] = int(
+                frame.at[int(forward["anchor"]), "source_obs_index"]
+            )
+        if forward.get("reconnect") is not None:
+            frame.at[j, "candidate_bridge_reconnection_source_obs_index"] = int(
+                frame.at[int(forward["reconnect"]), "source_obs_index"]
+            )
+        if forward.get("bridge_speed") is not None:
+            frame.at[j, "candidate_bridge_speed_m_s"] = forward["bridge_speed"]
         frame.at[j, "forward_result_json"] = json.dumps(forward, default=float, sort_keys=True)
         frame.at[j, "backward_result_json"] = json.dumps(backward, default=float, sort_keys=True)
 

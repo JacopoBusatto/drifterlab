@@ -218,6 +218,8 @@ _REASON_TEXT = {
         "Forward and backward searches found the same smallest time-bounded block whose removal cures the speed anomaly.",
     "unique_endpoint_speed_cure":
         "Only one endpoint removal cures the high-speed edge; local speed statistics rank the repaired bridge without vetoing it.",
+    "automatic_boundary_endpoint_speed_cure":
+        "A gross-speed point at the retained segment boundary was isolated from a sustained plausible track and removed automatically.",
     "small_observation_and_duration_fraction_relative_to_sustained_dominant_segment":
         "This segment is small in both observation count and duration relative to the sustained dominant segment.",
     "all_substantial_segments_require_review":

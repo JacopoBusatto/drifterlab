@@ -131,6 +131,7 @@ def test_automatic_writes_one_platform_file_with_complete_metadata_and_reuses(po
     effective = provenance["effective_configuration"]["position"]
     assert effective["local_speed_window_points"] == 15
     assert effective["endpoint_speed_min_samples"] == 8
+    assert effective["boundary_endpoint_speed_multiplier"] == 10.0
     assert effective["bridge_speed_warning_z"] == 3.0
     assert effective["local_speed_scale_floor_m_s"] == .05
     assert effective["endpoint_speed_score_margin_z"] == 2.0

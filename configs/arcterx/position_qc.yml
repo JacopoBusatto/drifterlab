@@ -29,6 +29,7 @@ position_qc:
   max_automatic_removal_points: 5
   local_speed_window_points: 15
   endpoint_speed_min_samples: 8
+  boundary_endpoint_speed_multiplier: 10.0
   bridge_speed_warning_z: 3.0
   local_speed_scale_floor_m_s: 0.05
   endpoint_speed_score_margin_z: 2.0

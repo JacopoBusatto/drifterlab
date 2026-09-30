@@ -33,7 +33,7 @@ from .drogue import load_drogue_detection
 
 
 POSITION_QC_SCHEMA_VERSION = "3.0"
-POSITION_QC_ALGORITHM_VERSION = "native-position-qc-v2.5"
+POSITION_QC_ALGORITHM_VERSION = "native-position-qc-v2.6"
 DEPLOYMENT_COLUMNS = [
     "platform_code", "deployment_time", "deployment_window_start",
     "deployment_window_end", "provenance", "note",
@@ -284,6 +284,7 @@ def _decision_summary(frame: pd.DataFrame) -> dict[str, Any]:
     speed_reasons = {
         "unique_endpoint_speed_cure",
         "bidirectionally_confirmed_time_bounded_excursion_cure",
+        "automatic_boundary_endpoint_speed_cure",
         "automatic_iterative_endpoint_speed_cure",
         "automatic_iterative_excursion_speed_cure",
     }

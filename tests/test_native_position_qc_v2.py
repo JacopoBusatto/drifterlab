@@ -133,6 +133,79 @@ def test_aggressive_equal_size_cures_use_vector_acceleration_and_are_determinist
     )
 
 
+@pytest.mark.parametrize("side", ["start", "end"])
+def test_aggressive_rejects_unique_gross_speed_retained_segment_boundary(side):
+    cluster = 130.0 + np.arange(12, dtype=float) * .001
+    lon = np.r_[-117.25, cluster] if side == "start" else np.r_[cluster, -117.25]
+    result = run_native_position_qc(
+        trajectory(lon), drogue(),
+        position_config=NativePositionConfig(speed_threshold_m_s=2),
+        resolution_policy="aggressive",
+    )
+
+    expected = 0 if side == "start" else len(lon) - 1
+    rejected = result.loc[result.final_position_status.eq("rejected")]
+    assert rejected.source_obs_index.tolist() == [expected]
+    row = rejected.iloc[0]
+    assert row.point_auto_reason == "automatic_boundary_endpoint_speed_cure"
+    assert row.position_decision_source == "automatic_geometry"
+    chosen = json.loads(row.forward_result_json)
+    competitor = json.loads(row.backward_result_json)
+    assert chosen["boundary"] == side
+    assert chosen["support_edge_count"] == 8
+    assert chosen["trigger_speed_m_s"] > chosen["gross_speed_threshold_m_s"]
+    assert competitor["cures"] is False
+    assert not any(item["cures"] for item in competitor["tested_hypotheses"])
+    assert not result.loc[result.final_position_valid, "high_speed_flag"].any()
+
+
+def test_boundary_endpoint_cure_requires_support_and_yields_to_an_interior_cure():
+    insufficient = run_native_position_qc(
+        trajectory([-117.25, *list(130.0 + np.arange(6) * .001)]), drogue(),
+        position_config=NativePositionConfig(speed_threshold_m_s=2),
+        resolution_policy="aggressive",
+    )
+    assert not insufficient.point_auto_reason.eq(
+        "automatic_boundary_endpoint_speed_cure"
+    ).any()
+    assert insufficient.point_auto_reason.eq(
+        "automatic_keep_removal_limit_reached"
+    ).any()
+
+    competing = run_native_position_qc(
+        trajectory([0, .2, *list(.001 + np.arange(12) * .001)]), drogue(),
+        position_config=NativePositionConfig(speed_threshold_m_s=2),
+        resolution_policy="aggressive",
+    )
+    assert competing.loc[
+        competing.final_position_status.eq("rejected"), "source_obs_index"
+    ].tolist() == [1]
+    assert competing.loc[competing.source_obs_index == 0, "final_position_status"].item() == "valid"
+    assert not competing.point_auto_reason.eq(
+        "automatic_boundary_endpoint_speed_cure"
+    ).any()
+
+
+def test_boundary_endpoint_cure_respects_a_human_keep():
+    lon = np.r_[-117.25, 130.0 + np.arange(12, dtype=float) * .001]
+    reviews = pd.DataFrame([{
+        "platform_code": "p", "target_type": "observation",
+        "target_id": "observation:0", "source_obs_index": 0,
+        "decision": "keep", "decision_source": "manual", "event_id": "prior",
+    }])
+    result = run_native_position_qc(
+        trajectory(lon), drogue(), reviews=reviews,
+        position_config=NativePositionConfig(speed_threshold_m_s=2),
+        resolution_policy="aggressive",
+    )
+    first = result.loc[result.source_obs_index == 0].iloc[0]
+    assert first.final_position_status == "valid"
+    assert first.position_decision_source == "human"
+    assert not result.point_auto_reason.eq(
+        "automatic_boundary_endpoint_speed_cure"
+    ).any()
+
+
 def test_aggressive_duplicate_time_keeps_smoothest_representative():
     result = run_native_position_qc(
         trajectory([0, .001, .002, .2, .003, .004], seconds=[0, 300, 600, 600, 900, 1200]),

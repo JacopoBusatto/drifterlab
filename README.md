@@ -14,6 +14,9 @@ python -m venv .venv
 
 ## Production commands
 
+For the complete operational sequence, review checkpoints, command-line flags,
+and important YAML choices, see [running the complete workflow](docs/running_the_workflow.md).
+
 Run drogue detection/review first, followed by native-position QC and then
 reconstruction:
 
@@ -26,6 +29,14 @@ drifterlab-position-qc configs/arcterx/position_qc.local.yml --automatic
 
 drifterlab-reconstruct-trajectories configs/arcterx/trajectory_reconstruction.local.yml
 # Add --overwrite only when intentionally replacing a stale reconstruction.
+
+drifterlab-clusters configs/arcterx/clusters.local.yml --inspection
+# Review inspection/cohort_review.csv, configure its path and the two thresholds,
+# then build candidate clusters:
+drifterlab-clusters configs/arcterx/clusters.local.yml
+
+# Candidate pairs do not require cohorts or cluster assignments.
+drifterlab-pairs configs/arcterx/pairs.local.yml
 ```
 
 Copy the tracked configurations before changing local data paths. Relative paths
@@ -95,6 +106,32 @@ reuses an unchanged Zarr, so plotting selections can be changed without rebuildi
 trajectories. It writes an overview, an exact-start map, and optional per-platform
 linear-versus-spline checks to the configured plotting directory.
 
+## Candidate deployment clusters
+
+The cluster workflow is read-only with respect to the reconstructed Zarr. Its
+inspection mode proposes broad observed-start cohorts, calculates WGS84 distances
+to the first several spatial neighbors, and writes one PNG plus a multipage PDF
+for each cohort. Review `cohort_review.csv`, then configure maximum cluster
+diameter, maximum observed-start spread, and maximum membership before building.
+
+Candidate groups must be close in both observed start position and observed start
+time. The workflow does not use later trajectory proximity or require lifetime
+overlap, and it does not encode an expected cluster count. See
+[candidate deployment clusters](docs/candidate_clusters.md).
+
+## Candidate encounter pairs
+
+The pair workflow tests every temporally overlapping platform pair on one selected
+linear/spline representation. It selects the first WGS84 distance-threshold
+crossing, optionally limited to a configured number of seconds from both observed
+starts. Setting that time limit to `null` enables chance encounters over the full
+common lifetime. A trajectory may belong to several pairs.
+
+The authoritative `pairs.zarr` uses the `kinematicParcels` grouped-trajectory
+layout. Its canonical fields use the selection representation, while all available
+linear and spline coordinates remain explicitly available for later analysis. See
+[candidate encounter pairs](docs/candidate_pairs.md).
+
 ## Campaign-supplied QC diagnostics
 
 The delivered ARCTERX QC MATLAB adapter and the investigative tools under
@@ -112,7 +149,7 @@ that the new spline products numerically reproduce the supplied tracks.
 Run the focused production tests with:
 
 ```powershell
-python -m pytest tests/test_position_workflow.py tests/test_native_position_qc_v2.py tests/test_reconstruction.py tests/test_reconstruction_workflow.py
+python -m pytest tests/test_position_workflow.py tests/test_native_position_qc_v2.py tests/test_reconstruction.py tests/test_reconstruction_workflow.py tests/test_clustering.py tests/test_cluster_workflow.py tests/test_pairs.py tests/test_pair_workflow.py
 ```
 
 Run the complete synthetic suite with `python -m pytest`.
