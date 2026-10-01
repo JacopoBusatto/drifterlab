@@ -1,9 +1,26 @@
 # Candidate encounter pairs
 
 This stage discovers pairwise encounters in the read-only reconstructed trajectory
-Zarr. It does not depend on the reconstruction product's deployment-array
-assignments. A platform
-may therefore appear in zero, one, or many pairs.
+Zarr. Deployment-array and candidate-cluster assignments can optionally restrict
+pair eligibility and are preserved for both members in the output. A platform may
+therefore appear in zero, one, or many pairs.
+
+Two explicit Boolean filters can restrict candidate membership before temporal or
+distance calculations:
+
+```yaml
+filters:
+  same_array: false
+  same_cluster: false
+```
+
+Both keys are required so the grouping choice is explicit in every build.
+
+`false` means that the corresponding relation is not required; it does not require
+the members to be different. `same_array: true` requires equal `array_id` values.
+`same_cluster: true` requires both equal `array_id` and equal `cluster_id`, so it
+already implies the same-array condition. Enabling both is valid but redundant.
+Algorithmic singletons cannot form a same-cluster pair with another platform.
 
 ## Selection
 
@@ -39,8 +56,21 @@ The command atomically publishes:
 
 The Zarr uses the `kinematicParcels` grouped-entity layout with dimensions
 `(trajectory, obs)`. Each `trajectory` is one pair, deterministic member order is
-by platform identifier, and `obs=0` is the selected encounter. Values then continue
-through the last common valid timestamp. Shorter rows are padded with NaN/NaT.
+by platform identifier, and `obs=0` is the pair's first common valid timestamp.
+Values continue through the last common valid timestamp, so the complete common
+window is retained even when the selected encounter occurs later. The scalar
+`encounter_observation` locates the encounter inside that window. Shorter rows are
+padded with NaN/NaT.
+
+Each partner retains its exact observed start time and position plus its
+`array_id`, `cluster_id`, cluster-local `member_id`, `cluster_size`, and
+`cluster_assignment_status`. These are published with `_1` and `_2` suffixes in
+both `pairs.zarr` and `pair_catalog.csv`. The IDs describe candidate deployment
+grouping; the configured Boolean filters determine whether those IDs restrict
+pair selection.
+
+The pair-level Boolean variables `same_array` and `same_cluster` are also retained
+in both outputs, even when their corresponding filters are disabled.
 
 The compatibility fields `lon`, `lat`, `z`, `center_lon`, `center_lat`, `lon_1`,
 `lat_1`, `lon_2`, and `lat_2` use the configured selection method. `lon`/`lat` are
@@ -62,10 +92,19 @@ membership and encounter times, so it requires rebuilding the product.
 The `native` method is the source-valid pre-point-QC trajectory resampled on the
 same per-platform grid lifespan as the accepted-QC methods.
 
-Trajectory-level diagnostics include both observed starts, overlap bounds,
-encounter time, encounter distance, delay from each start, post-encounter duration,
-and observation count. Method-specific distances are reported at the canonical
-encounter time; they do not independently reselect the pair.
+Trajectory-level diagnostics include both observed starts and coordinates,
+deployment-group metadata, overlap bounds, encounter time and observation,
+encounter distance, delay from each start, full-common-window duration/count, and
+post-encounter duration/count. Method-specific distances are reported at the
+canonical encounter time; they do not independently reselect the pair.
+
+Product diagnostics distinguish four inventory stages:
+
+- `possible_pair_count`: all unique platform combinations;
+- `eligible_pair_count`: combinations remaining after the array/cluster filters;
+- `overlapping_pair_count`: eligible combinations with a common valid timestamp;
+- `selected_pair_count`: overlapping eligible pairs satisfying the deployment-time
+  and encounter-distance criteria.
 
 ## Command
 

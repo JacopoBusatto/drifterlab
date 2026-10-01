@@ -117,14 +117,18 @@ start time.
 ## Candidate encounter pairs
 
 The pair workflow tests every temporally overlapping platform pair on one selected
-linear/spline representation. It selects the first WGS84 distance-threshold
+coordinate representation. It selects the first WGS84 distance-threshold
 crossing, optionally limited to a configured number of seconds from both observed
 starts. Setting that time limit to `null` enables chance encounters over the full
-common lifetime. A trajectory may belong to several pairs.
+common lifetime. Optional same-array and same-cluster filters are applied before
+the temporal and distance checks. A trajectory may belong to several pairs.
 
 The authoritative `pairs.zarr` uses the `kinematicParcels` grouped-trajectory
-layout. Its canonical fields use the selection representation, while all available
-linear and spline coordinates remain explicitly available for later analysis. See
+layout and retains the complete common valid window, with the selected encounter
+marked inside it. Both partners' observed starts and candidate array/cluster/member
+metadata are retained. Its canonical fields use the selection representation,
+while all available native, linear, and spline coordinates remain explicitly
+available for later analysis. See
 [candidate encounter pairs](docs/candidate_pairs.md).
 
 ## Campaign-supplied QC diagnostics

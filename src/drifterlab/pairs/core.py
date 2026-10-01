@@ -29,6 +29,16 @@ class PairCandidate:
     encounter_delay_seconds_2: float
 
     @property
+    def common_observations(self) -> int:
+        """Number of stored grid points in the complete common valid window."""
+        return self.overlap_end_index - self.overlap_start_index + 1
+
+    @property
+    def encounter_observation(self) -> int:
+        """Zero-based encounter location inside the published common window."""
+        return self.encounter_index - self.overlap_start_index
+
+    @property
     def post_encounter_observations(self) -> int:
         return self.overlap_end_index - self.encounter_index + 1
 
@@ -39,6 +49,7 @@ class PairSearchResult:
 
     candidates: tuple[PairCandidate, ...]
     possible_pair_count: int
+    eligible_pair_count: int
     overlapping_pair_count: int
 
 
@@ -65,26 +76,36 @@ def find_candidate_pairs(
     *,
     maximum_distance_m: float,
     maximum_seconds_from_each_observed_start: float | None,
+    array_id: Sequence[int] | None = None,
+    cluster_id: Sequence[str] | None = None,
+    same_array: bool = False,
+    same_cluster: bool = False,
     progress: Callable[[str], None] | None = None,
 ) -> PairSearchResult:
     """Find the first distance-threshold crossing for every eligible platform pair.
 
     A finite deployment-time limit is enforced independently for both members.
-    Passing ``None`` searches each pair's entire common valid lifetime.
+    Passing ``None`` searches each pair's entire common valid lifetime. Group
+    filters are evaluated first, and same-cluster eligibility requires equal
+    array and cluster identifiers.
     """
     identifiers = np.asarray([str(value) for value in platform_ids], dtype=object)
     grid = np.asarray(time, dtype="datetime64[ns]")
     starts = np.asarray(observed_start_time, dtype="datetime64[ns]")
     lon = np.asarray(longitude, dtype=float)
     lat = np.asarray(latitude, dtype=float)
+    arrays = None if array_id is None else np.asarray(array_id)
+    clusters = None if cluster_id is None else np.asarray(cluster_id, dtype=str)
     _validate_inputs(
         identifiers, grid, starts, lon, lat, maximum_distance_m,
-        maximum_seconds_from_each_observed_start,
+        maximum_seconds_from_each_observed_start, arrays, clusters,
+        same_array, same_cluster,
     )
 
     finite = np.isfinite(lon) & np.isfinite(lat)
     order = sorted(range(len(identifiers)), key=lambda index: identifiers[index])
     possible = len(order) * (len(order) - 1) // 2
+    eligible_count = 0
     overlapping = 0
     candidates: list[PairCandidate] = []
     checked = 0
@@ -98,6 +119,18 @@ def find_candidate_pairs(
     for left_position, first_index in enumerate(order[:-1]):
         for second_index in order[left_position + 1:]:
             checked += 1
+            pair_same_array = (
+                arrays is not None and arrays[first_index] == arrays[second_index]
+            )
+            pair_same_cluster = (
+                pair_same_array and clusters is not None
+                and clusters[first_index] == clusters[second_index]
+            )
+            if same_array and not pair_same_array:
+                continue
+            if same_cluster and not pair_same_cluster:
+                continue
+            eligible_count += 1
             common = np.flatnonzero(finite[first_index] & finite[second_index])
             if common.size == 0:
                 continue
@@ -141,13 +174,15 @@ def find_candidate_pairs(
         if progress is not None and possible >= 1000 and checked % 1000 < len(order):
             progress(f"Pair search: evaluated {checked:,}/{possible:,} platform pairs")
 
-    return PairSearchResult(tuple(candidates), possible, overlapping)
+    return PairSearchResult(tuple(candidates), possible, eligible_count, overlapping)
 
 
 def _validate_inputs(
     identifiers: np.ndarray, grid: np.ndarray, starts: np.ndarray,
     longitude: np.ndarray, latitude: np.ndarray, maximum_distance_m: float,
     maximum_seconds_from_each_observed_start: float | None,
+    array_id: np.ndarray | None, cluster_id: np.ndarray | None,
+    same_array: bool, same_cluster: bool,
 ) -> None:
     if len(identifiers) < 2:
         raise ValueError("Pair discovery requires at least two platforms")
@@ -155,6 +190,19 @@ def _validate_inputs(
         raise ValueError("Platform identifiers must be unique")
     if any(not value.strip() for value in identifiers):
         raise ValueError("Platform identifiers must be nonempty")
+    if not isinstance(same_array, bool) or not isinstance(same_cluster, bool):
+        raise ValueError("same_array and same_cluster filters must be Boolean")
+    if array_id is not None and array_id.shape != (len(identifiers),):
+        raise ValueError("Array identifiers must match platforms")
+    if cluster_id is not None:
+        if cluster_id.shape != (len(identifiers),):
+            raise ValueError("Cluster identifiers must match platforms")
+        if any(not value.strip() for value in cluster_id):
+            raise ValueError("Cluster identifiers must be nonempty")
+    if (same_array or same_cluster) and array_id is None:
+        raise ValueError("Array identifiers are required by the configured pair filters")
+    if same_cluster and cluster_id is None:
+        raise ValueError("Cluster identifiers are required by the same_cluster filter")
     if grid.ndim != 1 or starts.shape != (len(identifiers),):
         raise ValueError("Time must be one-dimensional and starts must match platforms")
     if np.isnat(grid).any() or np.isnat(starts).any():

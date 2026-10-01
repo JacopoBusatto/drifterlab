@@ -30,8 +30,8 @@ from drifterlab.pairs import (
 )
 
 
-PAIR_ALGORITHM_VERSION = "first-geodesic-threshold-crossing-v1"
-PAIR_SCHEMA_VERSION = "1.0"
+PAIR_ALGORITHM_VERSION = "group-filtered-first-geodesic-threshold-crossing-v2"
+PAIR_SCHEMA_VERSION = "1.2"
 SUPPORTED_RECONSTRUCTION_SCHEMA_VERSION = "1.4"
 ZARR_NAME = "pairs.zarr"
 CATALOG_NAME = "pair_catalog.csv"
@@ -45,6 +45,8 @@ class PairWorkflowConfig:
     selection_method: str
     maximum_distance_m: float
     maximum_seconds_from_each_observed_start: float | None
+    same_array: bool
+    same_cluster: bool
     output_directory: Path
     chunk_trajectory: int
     chunk_obs: int
@@ -58,6 +60,10 @@ class PairWorkflowConfig:
                 "maximum_seconds_from_each_observed_start": (
                     self.maximum_seconds_from_each_observed_start
                 ),
+            },
+            "filters": {
+                "same_array": self.same_array,
+                "same_cluster": self.same_cluster,
             },
             "output": {
                 "directory": str(self.output_directory),
@@ -76,6 +82,7 @@ class PairWorkflowResult:
     catalog_path: Path
     platform_count: int
     possible_pair_count: int
+    eligible_pair_count: int
     overlapping_pair_count: int
     selected_pair_count: int
     maximum_observations: int
@@ -84,8 +91,9 @@ class PairWorkflowResult:
     def format(self) -> str:
         lines = [
             f"Candidate pairs: {self.selected_pair_count:,} selected from "
-            f"{self.possible_pair_count:,} possible platform pairs",
-            f"Pairs with temporal overlap: {self.overlapping_pair_count:,}",
+            f"{self.eligible_pair_count:,} group-eligible platform pairs "
+            f"({self.possible_pair_count:,} possible)",
+            f"Eligible pairs with temporal overlap: {self.overlapping_pair_count:,}",
             f"Grouped trajectories: {self.zarr_path}",
             f"Pair catalog: {self.catalog_path}",
             f"Coordinate representations: {', '.join(self.coordinate_methods)}",
@@ -131,12 +139,23 @@ def _positive_integer(value: Any, name: str) -> int:
     return value
 
 
+def _boolean(value: Any, name: str) -> bool:
+    if not isinstance(value, bool):
+        if value is None:
+            raise ValueError(f"{name} is required and cannot be null")
+        raise ValueError(f"{name} must be Boolean")
+    return value
+
+
 def load_pair_config(path: str | Path) -> PairWorkflowConfig:
     """Read and strictly validate a candidate-pair YAML file."""
     config_path = Path(path).resolve()
     with config_path.open(encoding="utf-8-sig") as stream:
         values = yaml.safe_load(stream)
-    values = _mapping(values, {"input", "coordinates", "selection", "output"}, "configuration")
+    values = _mapping(
+        values, {"input", "coordinates", "selection", "filters", "output"},
+        "configuration",
+    )
     source = _mapping(values.get("input", {}), {"zarr"}, "input")
     coordinates = _mapping(
         values.get("coordinates", {}), {"selection_method"}, "coordinates",
@@ -145,6 +164,9 @@ def load_pair_config(path: str | Path) -> PairWorkflowConfig:
         values.get("selection", {}),
         {"maximum_distance_m", "maximum_seconds_from_each_observed_start"},
         "selection",
+    )
+    filters = _mapping(
+        values.get("filters", {}), {"same_array", "same_cluster"}, "filters",
     )
     output = _mapping(values.get("output", {}), {"directory", "chunks"}, "output")
     chunks = _mapping(output.get("chunks", {}), {"trajectory", "obs"}, "output.chunks")
@@ -177,6 +199,8 @@ def load_pair_config(path: str | Path) -> PairWorkflowConfig:
             selection.get("maximum_seconds_from_each_observed_start"),
             "selection.maximum_seconds_from_each_observed_start",
         ),
+        same_array=_boolean(filters.get("same_array"), "filters.same_array"),
+        same_cluster=_boolean(filters.get("same_cluster"), "filters.same_cluster"),
         output_directory=output_directory,
         chunk_trajectory=_positive_integer(
             chunks.get("trajectory", 1), "output.chunks.trajectory",
@@ -220,7 +244,11 @@ def _validate_dataset(dataset: xr.Dataset, config: PairWorkflowConfig) -> tuple[
             f"{dataset.attrs.get('schema_version')!r}; expected "
             f"{SUPPORTED_RECONSTRUCTION_SCHEMA_VERSION!r}"
         )
-    required = {"platform_id", "start_time", "start_lon", "start_lat", "time"}
+    required = {
+        "platform_id", "start_time", "start_lon", "start_lat", "time",
+        "array_id", "cluster_id", "member_id", "cluster_size",
+        "cluster_assignment_status",
+    }
     missing = required - set(dataset.variables)
     if missing:
         raise ValueError(f"Input Zarr is missing required variables: {sorted(missing)}")
@@ -231,6 +259,9 @@ def _validate_dataset(dataset: xr.Dataset, config: PairWorkflowConfig) -> tuple[
     expected_dims = {
         "platform_id": ("platform",), "start_time": ("platform",),
         "start_lon": ("platform",), "start_lat": ("platform",), "time": ("time",),
+        "array_id": ("platform",), "cluster_id": ("platform",),
+        "member_id": ("platform",), "cluster_size": ("platform",),
+        "cluster_assignment_status": ("platform",),
     }
     for name, dimensions in expected_dims.items():
         if dataset[name].dims != dimensions:
@@ -242,6 +273,8 @@ def _validate_dataset(dataset: xr.Dataset, config: PairWorkflowConfig) -> tuple[
         raise ValueError(
             f"Selection method {config.selection_method!r} is unavailable; found {list(methods)}"
         )
+    if "native" not in methods:
+        raise ValueError("Input Zarr has no native pre-point-QC coordinate representation")
     for method in methods:
         for prefix in ("longitude", "latitude"):
             name = f"{prefix}_{method}"
@@ -259,6 +292,16 @@ def _validate_dataset(dataset: xr.Dataset, config: PairWorkflowConfig) -> tuple[
         raise ValueError("Observed starts must contain finite coordinates and valid timestamps")
     if np.any((start_lon < -180) | (start_lon >= 180) | (start_lat < -90) | (start_lat > 90)):
         raise ValueError("Observed starts contain coordinates outside valid longitude/latitude bounds")
+    for name in ("array_id", "member_id", "cluster_size"):
+        values = np.asarray(dataset[name].values)
+        if not np.issubdtype(values.dtype, np.integer) or np.any(values < 1):
+            raise ValueError(f"{name} must contain positive integers")
+    if np.any(dataset.member_id.values > dataset.cluster_size.values):
+        raise ValueError("member_id cannot exceed cluster_size")
+    for name in ("cluster_id", "cluster_assignment_status"):
+        values = dataset[name].values.astype(str)
+        if any(not value.strip() for value in values):
+            raise ValueError(f"{name} must contain nonempty strings")
     return methods
 
 
@@ -305,13 +348,22 @@ def _position_attributes(name: str, method: str | None = None) -> dict[str, Any]
     return result
 
 
+def _member_values(
+    dataset: xr.Dataset, candidates: tuple[PairCandidate, ...], name: str,
+    member: int, dtype: Any,
+) -> np.ndarray:
+    index_name = f"platform_index_{member}"
+    indices = [getattr(item, index_name) for item in candidates]
+    return np.asarray(dataset[name].values[indices], dtype=dtype)
+
+
 def _create_store(
     path: Path, candidates: tuple[PairCandidate, ...], methods: tuple[str, ...],
-    time: np.ndarray, starts: np.ndarray, config: PairWorkflowConfig,
+    time: np.ndarray, dataset: xr.Dataset, config: PairWorkflowConfig,
     search: PairSearchResult, input_attributes: dict[str, Any], input_metadata_sha256: str,
 ) -> zarr.Group:
     pair_count = len(candidates)
-    maximum_obs = max(item.post_encounter_observations for item in candidates)
+    maximum_obs = max(item.common_observations for item in candidates)
     compressor = Blosc(cname="zstd", clevel=3, shuffle=Blosc.BITSHUFFLE)
     root = zarr.open_group(str(path), mode="w")
     root.attrs.update({
@@ -335,9 +387,10 @@ def _create_store(
             "maximum_seconds_from_each_observed_start for either member; null searches the "
             "full common valid lifetime"
         ),
-        "post_encounter_policy": (
-            "obs=0 is the selected encounter; rows continue on the source time grid through "
-            "the final common valid timestamp of the canonical coordinate method"
+        "common_lifetime_policy": (
+            "obs=0 is the first common valid canonical timestamp; rows continue on the "
+            "source time grid through the final common valid timestamp. encounter_observation "
+            "locates the selected encounter inside that window"
         ),
         "time_convention": "UTC; timezone-naive datetime64 values represent UTC",
         "distance_method": "WGS84 geodesic (pyproj.Geod.inv)",
@@ -345,8 +398,11 @@ def _create_store(
         "maximum_seconds_from_each_observed_start": (
             config.maximum_seconds_from_each_observed_start
         ),
-        "platform_count": len(starts),
+        "same_array_filter": config.same_array,
+        "same_cluster_filter": config.same_cluster,
+        "platform_count": dataset.sizes["platform"],
         "possible_pair_count": search.possible_pair_count,
+        "eligible_pair_count": search.eligible_pair_count,
         "overlapping_pair_count": search.overlapping_pair_count,
         "selected_pair_count": pair_count,
         "effective_configuration": config.effective(),
@@ -369,7 +425,10 @@ def _create_store(
         "obs", data=np.arange(maximum_obs, dtype=np.int32),
         chunks=(obs_chunk,), compressor=compressor, fill_value=None,
     )
-    obs.attrs.update({"_ARRAY_DIMENSIONS": ["obs"], "long_name": "observation index after encounter"})
+    obs.attrs.update({
+        "_ARRAY_DIMENSIONS": ["obs"],
+        "long_name": "observation index in complete common valid window",
+    })
 
     _one_dimensional(
         root, "group_id", np.arange(pair_count, dtype=np.int64), compressor,
@@ -397,6 +456,47 @@ def _create_store(
         attributes={"long_name": "platform identifier of deterministic second pair member"},
     )
 
+    metadata_attributes = {
+        "array_id": "chronological deployment-array identifier",
+        "cluster_id": "deterministic candidate deployment-cluster identifier",
+        "member_id": "one-based member identifier within candidate cluster",
+        "cluster_size": "number of platforms in candidate cluster",
+        "cluster_assignment_status": "candidate cluster assignment status",
+    }
+    for name, dtype in (
+        ("array_id", np.int32), ("cluster_id", str), ("member_id", np.int32),
+        ("cluster_size", np.int32), ("cluster_assignment_status", str),
+    ):
+        for member in (1, 2):
+            _one_dimensional(
+                root, f"{name}_{member}",
+                _member_values(dataset, candidates, name, member, dtype),
+                compressor, chunks=config.chunk_trajectory,
+                attributes={"long_name": f"{metadata_attributes[name]} of member {member}"},
+            )
+
+    array_1 = _member_values(dataset, candidates, "array_id", 1, np.int64)
+    array_2 = _member_values(dataset, candidates, "array_id", 2, np.int64)
+    cluster_1 = _member_values(dataset, candidates, "cluster_id", 1, str)
+    cluster_2 = _member_values(dataset, candidates, "cluster_id", 2, str)
+    same_array_values = array_1 == array_2
+    same_cluster_values = same_array_values & (cluster_1 == cluster_2)
+    _one_dimensional(
+        root, "same_array", same_array_values, compressor,
+        chunks=config.chunk_trajectory,
+        attributes={"long_name": "whether both pair members have the same array_id"},
+    )
+    _one_dimensional(
+        root, "same_cluster", same_cluster_values, compressor,
+        chunks=config.chunk_trajectory,
+        attributes={
+            "long_name": (
+                "whether both pair members have the same array_id and cluster_id"
+            ),
+        },
+    )
+
+    starts = dataset.start_time.values.astype("datetime64[ns]")
     encounter_times = np.asarray(
         [time[item.encounter_index] for item in candidates], dtype="datetime64[ns]",
     )
@@ -425,10 +525,33 @@ def _create_store(
             root, name, values, compressor, chunks=config.chunk_trajectory,
             attributes={"standard_name": "time", "timezone": "UTC", "long_name": long_name},
         )
+    for coordinate, standard_name, units in (
+        ("lon", "longitude", "degrees_east"),
+        ("lat", "latitude", "degrees_north"),
+    ):
+        source_name = f"start_{coordinate}"
+        for member in (1, 2):
+            _one_dimensional(
+                root, f"observed_start_{coordinate}_{member}",
+                _member_values(dataset, candidates, source_name, member, np.float64),
+                compressor, chunks=config.chunk_trajectory,
+                attributes={
+                    "standard_name": standard_name, "units": units,
+                    "long_name": f"exact first retained QC-fix {coordinate} of member {member}",
+                },
+            )
     duration_seconds = (
         overlap_ends.astype(np.int64) - encounter_times.astype(np.int64)
     ) / 1_000_000_000
+    common_duration_seconds = (
+        overlap_ends.astype(np.int64) - overlap_starts.astype(np.int64)
+    ) / 1_000_000_000
     one_dimensional_values = (
+        (
+            "encounter_observation",
+            np.asarray([item.encounter_observation for item in candidates], dtype=np.int64),
+            "1", "zero-based selected encounter index in the published common window",
+        ),
         (
             "encounter_distance_m",
             np.asarray([item.encounter_distance_m for item in candidates], dtype=np.float64),
@@ -451,7 +574,16 @@ def _create_store(
         (
             "post_encounter_observations",
             np.asarray([item.post_encounter_observations for item in candidates], dtype=np.int64),
-            "1", "number of published observations for this pair",
+            "1", "number of observations from encounter through common-window end",
+        ),
+        (
+            "common_overlap_duration_seconds", common_duration_seconds.astype(np.float64),
+            "s", "duration from first through final common valid timestamp",
+        ),
+        (
+            "common_overlap_observations",
+            np.asarray([item.common_observations for item in candidates], dtype=np.int64),
+            "1", "number of published observations in the complete common valid window",
         ),
     )
     for name, values, units, long_name in one_dimensional_values:
@@ -514,8 +646,9 @@ def _write_pairs(
     rows: list[dict[str, Any]] = []
     starts = dataset.start_time.values.astype("datetime64[ns]")
     for trajectory, candidate in enumerate(candidates):
-        source_slice = slice(candidate.encounter_index, candidate.overlap_end_index + 1)
-        count = candidate.post_encounter_observations
+        source_slice = slice(candidate.overlap_start_index, candidate.overlap_end_index + 1)
+        count = candidate.common_observations
+        encounter_observation = candidate.encounter_observation
         root["time"][trajectory, :count] = time[source_slice]
         root["z"][trajectory, :count] = 0.0
         method_distances: dict[str, float] = {}
@@ -533,8 +666,10 @@ def _write_pairs(
                 candidate.platform_index_2, source_slice
             ].values, dtype=float)
             if not (
-                np.isfinite(lon_1[0]) and np.isfinite(lat_1[0])
-                and np.isfinite(lon_2[0]) and np.isfinite(lat_2[0])
+                np.isfinite(lon_1[encounter_observation])
+                and np.isfinite(lat_1[encounter_observation])
+                and np.isfinite(lon_2[encounter_observation])
+                and np.isfinite(lat_2[encounter_observation])
             ):
                 raise ValueError(
                     f"Coordinate method {method!r} is invalid at the selected encounter for "
@@ -550,7 +685,10 @@ def _write_pairs(
             for name, data in values.items():
                 root[name][trajectory, :count] = data
             _azimuth_1, _azimuth_2, distance = WGS84.inv(
-                float(lon_1[0]), float(lat_1[0]), float(lon_2[0]), float(lat_2[0]),
+                float(lon_1[encounter_observation]),
+                float(lat_1[encounter_observation]),
+                float(lon_2[encounter_observation]),
+                float(lat_2[encounter_observation]),
             )
             method_distances[method] = float(distance)
             root[f"encounter_distance_{method}_m"][trajectory] = float(distance)
@@ -565,29 +703,62 @@ def _write_pairs(
         encounter_time = time[candidate.encounter_index]
         overlap_start = time[candidate.overlap_start_index]
         overlap_end = time[candidate.overlap_end_index]
+        array_id_1 = int(dataset.array_id.values[candidate.platform_index_1])
+        array_id_2 = int(dataset.array_id.values[candidate.platform_index_2])
+        cluster_id_1 = str(dataset.cluster_id.values[candidate.platform_index_1])
+        cluster_id_2 = str(dataset.cluster_id.values[candidate.platform_index_2])
+        pair_same_array = array_id_1 == array_id_2
+        pair_same_cluster = pair_same_array and cluster_id_1 == cluster_id_2
         row: dict[str, Any] = {
             "trajectory": trajectory,
             "group_id": trajectory,
             "group_size": 2,
             "platform_code_1": candidate.platform_id_1,
             "platform_code_2": candidate.platform_id_2,
+            "array_id_1": array_id_1,
+            "array_id_2": array_id_2,
+            "cluster_id_1": cluster_id_1,
+            "cluster_id_2": cluster_id_2,
+            "member_id_1": int(dataset.member_id.values[candidate.platform_index_1]),
+            "member_id_2": int(dataset.member_id.values[candidate.platform_index_2]),
+            "cluster_size_1": int(dataset.cluster_size.values[candidate.platform_index_1]),
+            "cluster_size_2": int(dataset.cluster_size.values[candidate.platform_index_2]),
+            "cluster_assignment_status_1": str(
+                dataset.cluster_assignment_status.values[candidate.platform_index_1]
+            ),
+            "cluster_assignment_status_2": str(
+                dataset.cluster_assignment_status.values[candidate.platform_index_2]
+            ),
+            "same_array": pair_same_array,
+            "same_cluster": pair_same_cluster,
             "observed_start_time_1_utc": _format_utc(starts[candidate.platform_index_1]),
             "observed_start_time_2_utc": _format_utc(starts[candidate.platform_index_2]),
+            "observed_start_lon_1": float(dataset.start_lon.values[candidate.platform_index_1]),
+            "observed_start_lat_1": float(dataset.start_lat.values[candidate.platform_index_1]),
+            "observed_start_lon_2": float(dataset.start_lon.values[candidate.platform_index_2]),
+            "observed_start_lat_2": float(dataset.start_lat.values[candidate.platform_index_2]),
             "overlap_start_time_utc": _format_utc(overlap_start),
             "overlap_end_time_utc": _format_utc(overlap_end),
             "encounter_time_utc": _format_utc(encounter_time),
+            "encounter_observation": encounter_observation,
             "encounter_distance_m": candidate.encounter_distance_m,
             "encounter_delay_seconds_1": candidate.encounter_delay_seconds_1,
             "encounter_delay_seconds_2": candidate.encounter_delay_seconds_2,
             "post_encounter_duration_seconds": float(
                 (overlap_end - encounter_time) / np.timedelta64(1, "s")
             ),
-            "post_encounter_observations": count,
+            "post_encounter_observations": candidate.post_encounter_observations,
+            "common_overlap_duration_seconds": float(
+                (overlap_end - overlap_start) / np.timedelta64(1, "s")
+            ),
+            "common_overlap_observations": count,
             "canonical_coordinate_method": selection_method,
             "maximum_distance_m": config.maximum_distance_m,
             "maximum_seconds_from_each_observed_start": (
                 config.maximum_seconds_from_each_observed_start
             ),
+            "same_array_filter": config.same_array,
+            "same_cluster_filter": config.same_cluster,
         }
         for method in methods:
             row[f"encounter_distance_{method}_m"] = method_distances[method]
@@ -601,11 +772,18 @@ def _expected_data_variables(methods: tuple[str, ...]) -> set[str]:
     names = {
         "time", "lon", "lat", "z", "group_id", "group_size", "center_lon",
         "center_lat", "lon_1", "lat_1", "lon_2", "lat_2", "platform_code_1",
-        "platform_code_2", "encounter_time", "encounter_distance_m",
+        "platform_code_2", "array_id_1", "array_id_2", "cluster_id_1",
+        "cluster_id_2", "member_id_1", "member_id_2", "cluster_size_1",
+        "cluster_size_2", "cluster_assignment_status_1",
+        "cluster_assignment_status_2", "same_array", "same_cluster",
+        "encounter_time", "encounter_observation", "encounter_distance_m",
         "encounter_delay_seconds_1", "encounter_delay_seconds_2",
-        "observed_start_time_1", "observed_start_time_2", "overlap_start_time",
+        "observed_start_time_1", "observed_start_time_2", "observed_start_lon_1",
+        "observed_start_lat_1", "observed_start_lon_2", "observed_start_lat_2",
+        "overlap_start_time",
         "overlap_end_time", "post_encounter_duration_seconds",
-        "post_encounter_observations",
+        "post_encounter_observations", "common_overlap_duration_seconds",
+        "common_overlap_observations",
     }
     for method in methods:
         names.update({
@@ -618,10 +796,11 @@ def _expected_data_variables(methods: tuple[str, ...]) -> set[str]:
 
 def _verify(
     zarr_path: Path, catalog_path: Path, candidates: tuple[PairCandidate, ...],
-    methods: tuple[str, ...], selection_method: str,
+    methods: tuple[str, ...], config: PairWorkflowConfig, source: xr.Dataset,
 ) -> None:
+    selection_method = config.selection_method
     expected = _expected_data_variables(methods)
-    maximum_obs = max(item.post_encounter_observations for item in candidates)
+    maximum_obs = max(item.common_observations for item in candidates)
     with xr.open_zarr(zarr_path, consolidated=True, chunks=None) as dataset:
         expected_sizes = {"trajectory": len(candidates), "obs": maximum_obs}
         if dict(dataset.sizes) != expected_sizes:
@@ -636,6 +815,12 @@ def _verify(
             raise ValueError("Pair Zarr readback changed the canonical coordinate method")
         if tuple(dataset.attrs.get("available_coordinate_methods", [])) != methods:
             raise ValueError("Pair Zarr readback changed the available coordinate methods")
+        if dataset.attrs.get("schema_version") != PAIR_SCHEMA_VERSION:
+            raise ValueError("Pair Zarr readback changed the pair schema version")
+        if dataset.attrs.get("same_array_filter") is not config.same_array:
+            raise ValueError("Pair Zarr readback changed the same_array filter")
+        if dataset.attrs.get("same_cluster_filter") is not config.same_cluster:
+            raise ValueError("Pair Zarr readback changed the same_cluster filter")
         expected_1 = [item.platform_id_1 for item in candidates]
         expected_2 = [item.platform_id_2 for item in candidates]
         if dataset.platform_code_1.values.astype(str).tolist() != expected_1:
@@ -646,6 +831,42 @@ def _verify(
             raise ValueError("Pair Zarr readback changed deterministic group identifiers")
         if not np.all(dataset.group_size.values == 2):
             raise ValueError("Pair Zarr readback changed pair group sizes")
+        for name, dtype in (
+            ("array_id", np.int64), ("cluster_id", str), ("member_id", np.int64),
+            ("cluster_size", np.int64), ("cluster_assignment_status", str),
+        ):
+            for member in (1, 2):
+                expected_values = _member_values(source, candidates, name, member, dtype)
+                actual_values = np.asarray(dataset[f"{name}_{member}"].values, dtype=dtype)
+                if not np.array_equal(actual_values, expected_values):
+                    raise ValueError(
+                        f"Pair Zarr readback changed {name} values for member {member}"
+                    )
+        expected_same_array = (
+            _member_values(source, candidates, "array_id", 1, np.int64)
+            == _member_values(source, candidates, "array_id", 2, np.int64)
+        )
+        expected_same_cluster = expected_same_array & (
+            _member_values(source, candidates, "cluster_id", 1, str)
+            == _member_values(source, candidates, "cluster_id", 2, str)
+        )
+        if not np.array_equal(dataset.same_array.values, expected_same_array):
+            raise ValueError("Pair Zarr readback changed same_array values")
+        if not np.array_equal(dataset.same_cluster.values, expected_same_cluster):
+            raise ValueError("Pair Zarr readback changed same_cluster values")
+        for coordinate in ("lon", "lat"):
+            for member in (1, 2):
+                expected_values = _member_values(
+                    source, candidates, f"start_{coordinate}", member, np.float64,
+                )
+                np.testing.assert_allclose(
+                    dataset[f"observed_start_{coordinate}_{member}"].values,
+                    expected_values,
+                    err_msg=(
+                        f"Pair Zarr readback changed observed start {coordinate} "
+                        f"for member {member}"
+                    ),
+                )
         for canonical, retained in (
             ("lon_1", f"lon_{selection_method}_1"),
             ("lat_1", f"lat_{selection_method}_1"),
@@ -661,11 +882,17 @@ def _verify(
         np.testing.assert_allclose(dataset.lon.values, dataset.center_lon.values, equal_nan=True)
         np.testing.assert_allclose(dataset.lat.values, dataset.center_lat.values, equal_nan=True)
         for index, candidate in enumerate(candidates):
-            count = candidate.post_encounter_observations
-            if dataset.time.values[index, 0] != dataset.encounter_time.values[index]:
-                raise ValueError(f"Pair {index} does not begin at its selected encounter")
-            if not np.isfinite(dataset.lon_1.values[index, 0]):
-                raise ValueError(f"Pair {index} has invalid coordinates at obs=0")
+            count = candidate.common_observations
+            encounter_observation = candidate.encounter_observation
+            if dataset.time.values[index, 0] != dataset.overlap_start_time.values[index]:
+                raise ValueError(f"Pair {index} does not begin at its first common valid time")
+            if dataset.encounter_observation.values[index] != encounter_observation:
+                raise ValueError(f"Pair {index} changed its encounter observation")
+            if (dataset.time.values[index, encounter_observation]
+                    != dataset.encounter_time.values[index]):
+                raise ValueError(f"Pair {index} encounter time is outside its published window")
+            if not np.isfinite(dataset.lon_1.values[index, encounter_observation]):
+                raise ValueError(f"Pair {index} has invalid coordinates at its encounter")
             if count < maximum_obs:
                 if not np.isnat(dataset.time.values[index, count:]).all():
                     raise ValueError(f"Pair {index} has non-NaT time padding")
@@ -673,10 +900,33 @@ def _verify(
                     raise ValueError(f"Pair {index} has non-NaN coordinate padding")
 
     catalog = pd.read_csv(
-        catalog_path, dtype={"platform_code_1": str, "platform_code_2": str},
+        catalog_path,
+        dtype={
+            "platform_code_1": str, "platform_code_2": str,
+            "cluster_id_1": str, "cluster_id_2": str,
+        },
     )
     if len(catalog) != len(candidates) or catalog.trajectory.tolist() != list(range(len(candidates))):
         raise ValueError("Pair catalog readback changed the selected pair inventory")
+    if not np.array_equal(catalog.same_array.to_numpy(dtype=bool), expected_same_array):
+        raise ValueError("Pair catalog readback changed same_array values")
+    if not np.array_equal(catalog.same_cluster.to_numpy(dtype=bool), expected_same_cluster):
+        raise ValueError("Pair catalog readback changed same_cluster values")
+    if not (catalog.same_array_filter == config.same_array).all():
+        raise ValueError("Pair catalog readback changed the same_array filter")
+    if not (catalog.same_cluster_filter == config.same_cluster).all():
+        raise ValueError("Pair catalog readback changed the same_cluster filter")
+    for name, dtype in (
+        ("array_id", np.int64), ("cluster_id", str), ("member_id", np.int64),
+        ("cluster_size", np.int64), ("cluster_assignment_status", str),
+    ):
+        for member in (1, 2):
+            expected_values = _member_values(source, candidates, name, member, dtype)
+            actual_values = catalog[f"{name}_{member}"].to_numpy(dtype=dtype)
+            if not np.array_equal(actual_values, expected_values):
+                raise ValueError(
+                    f"Pair catalog readback changed {name} values for member {member}"
+                )
 
 
 def _remove_generated(path: Path, parent: Path) -> None:
@@ -709,7 +959,7 @@ def _publish(temporary: Path, target: Path, *, token: str, overwrite: bool) -> N
 
 def _build_bundle(
     dataset: xr.Dataset, config: PairWorkflowConfig, methods: tuple[str, ...],
-    search: PairSearchResult, time: np.ndarray, starts: np.ndarray,
+    search: PairSearchResult, time: np.ndarray,
     input_metadata_sha256: str, report: Callable[[str], None], *, overwrite: bool,
 ) -> None:
     target = config.output_directory
@@ -721,7 +971,7 @@ def _build_bundle(
     catalog_path = temporary / CATALOG_NAME
     try:
         root = _create_store(
-            zarr_path, search.candidates, methods, time, starts, config, search,
+            zarr_path, search.candidates, methods, time, dataset, config, search,
             dict(dataset.attrs), input_metadata_sha256,
         )
         catalog = _write_pairs(
@@ -733,7 +983,7 @@ def _build_bundle(
             raise ValueError("Input Zarr metadata changed during pair building")
         zarr.consolidate_metadata(str(zarr_path))
         _verify(
-            zarr_path, catalog_path, search.candidates, methods, config.selection_method,
+            zarr_path, catalog_path, search.candidates, methods, config, dataset,
         )
         _publish(temporary, target, token=token, overwrite=overwrite)
     finally:
@@ -762,7 +1012,8 @@ def run_pair_workflow(
         starts = dataset.start_time.values.astype("datetime64[ns]")
         report(
             f"Searching {len(platform_ids) * (len(platform_ids) - 1) // 2:,} pairs "
-            f"with canonical coordinates {config.selection_method!r}"
+            f"with canonical coordinates {config.selection_method!r}; "
+            f"same_array={config.same_array}, same_cluster={config.same_cluster}"
         )
         search = find_candidate_pairs(
             platform_ids, time, starts,
@@ -772,28 +1023,39 @@ def run_pair_workflow(
             maximum_seconds_from_each_observed_start=(
                 config.maximum_seconds_from_each_observed_start
             ),
+            array_id=dataset.array_id.values,
+            cluster_id=dataset.cluster_id.values.astype(str),
+            same_array=config.same_array,
+            same_cluster=config.same_cluster,
             progress=report,
         )
         if not search.candidates:
+            if search.eligible_pair_count == 0:
+                raise ValueError(
+                    "No platform pairs remain after the configured same_array/same_cluster "
+                    "filters"
+                )
             raise ValueError(
-                "No candidate pairs met the temporal-overlap, deployment-window, and distance "
-                "criteria; increase maximum_distance_m or set "
+                "No group-eligible candidate pairs met the temporal-overlap, deployment-window, "
+                "and distance criteria; increase maximum_distance_m or set "
                 "maximum_seconds_from_each_observed_start to null to search chance encounters"
             )
         report(
-            f"Selected {len(search.candidates):,} candidate pairs; writing all coordinate methods"
+            f"Selected {len(search.candidates):,} candidates from "
+            f"{search.eligible_pair_count:,} group-eligible pairs; writing all coordinate methods"
         )
         _build_bundle(
-            dataset, config, methods, search, time, starts, metadata_sha256, report,
+            dataset, config, methods, search, time, metadata_sha256, report,
             overwrite=overwrite,
         )
-    maximum_obs = max(item.post_encounter_observations for item in search.candidates)
+    maximum_obs = max(item.common_observations for item in search.candidates)
     return PairWorkflowResult(
         output_directory=config.output_directory,
         zarr_path=config.output_directory / ZARR_NAME,
         catalog_path=config.output_directory / CATALOG_NAME,
         platform_count=len(platform_ids),
         possible_pair_count=search.possible_pair_count,
+        eligible_pair_count=search.eligible_pair_count,
         overlapping_pair_count=search.overlapping_pair_count,
         selected_pair_count=len(search.candidates),
         maximum_observations=maximum_obs,

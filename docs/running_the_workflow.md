@@ -220,8 +220,9 @@ array's first observed start and marker shape for candidate cluster number.
 
 ## 5. Candidate pairs
 
-Pair construction does not depend on deployment-array assignments. A platform may
-belong to several pairs.
+Pair selection can optionally require matching deployment-array or
+candidate-cluster assignments. Those identifiers are retained for both members in
+the pair product, and a platform may belong to several pairs.
 
 Set the following scientific choices in the pair YAML:
 
@@ -231,6 +232,9 @@ coordinates:
 selection:
   maximum_distance_m: 200
   maximum_seconds_from_each_observed_start: 21600
+filters:
+  same_array: false
+  same_cluster: false
 ```
 
 Then run:
@@ -242,13 +246,19 @@ drifterlab-pairs $pairConfig
 Options and behavior:
 
 - `selection_method` selects pair membership and encounter time. All complete
-  linear/spline coordinate representations are still retained in the output.
+  native, linear, and spline coordinate representations are still retained in the
+  output.
 - `maximum_distance_m` is required, finite, and positive. An encounter is the
   first common stored timestamp at or below this WGS84 distance.
 - A finite `maximum_seconds_from_each_observed_start` must hold independently
   from both starts.
+- `same_array: true` requires equal array IDs. `false` imposes no array relation.
+- `same_cluster: true` requires equal array and cluster IDs. `false` imposes no
+  cluster relation.
 - Setting only the time option to `null` enables full-overlap chance encounters;
   it does not disable the distance threshold.
+- Each grouped trajectory spans the complete first-to-last common valid window;
+  `encounter_observation` locates the selected encounter inside that window.
 - `--overwrite` atomically replaces an existing pair bundle.
 
 The output contains authoritative grouped trajectories in `pairs.zarr` and a

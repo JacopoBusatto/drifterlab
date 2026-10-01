@@ -4,7 +4,7 @@ input:
 
 coordinates:
   # This representation alone selects pair membership and encounter time.
-  # Every complete linear/spline representation in the input is retained in output.
+  # Every complete native/linear/spline representation is retained in output.
   selection_method: spline_30
 
 selection:
@@ -13,6 +13,12 @@ selection:
   # The encounter must fall within this many seconds of BOTH observed starts.
   # Set null to allow chance encounters anywhere in the common valid lifetime.
   maximum_seconds_from_each_observed_start: 21600
+
+filters:
+  # False means no restriction; true requires matching deployment metadata.
+  same_array: false
+  # Same cluster means that both array_id and cluster_id match.
+  same_cluster: false
 
 output:
   directory: ../../data/pairs/arcterx_candidate

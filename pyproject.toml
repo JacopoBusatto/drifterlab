@@ -24,6 +24,7 @@ drifterlab-drogue = "drifterlab.cli.drogue:main"
 drifterlab-position-qc = "drifterlab.cli.position_qc:main"
 drifterlab-reconstruct-trajectories = "drifterlab.cli.reconstruct_trajectories:main"
 drifterlab-pairs = "drifterlab.cli.pairs:main"
+drifterlab-postprocess = "drifterlab.cli.postprocess:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

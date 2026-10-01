@@ -138,7 +138,9 @@ Create one movie for each experimental array. The primary movie will include:
 
 - instantaneous drifter positions;
 - recent trajectory tails;
-- persistent colors for deployment clusters;
+- persistent colors selected from platform metadata in the postprocessing YAML
+  (for example `cluster_id`, `member_id`, or `platform_id`), with deployment
+  clusters as the primary default;
 - the array centroid;
 - optional deployment-cluster centroids and hulls or covariance ellipses;
 - UTC time and elapsed time from the nominal array deployment;
@@ -552,6 +554,7 @@ and local slopes. A fitted slope alone will not define an inertial range.
 ### Movies
 
 - tail duration and frame cadence;
+- platform-level variable and categorical or numeric color treatment;
 - map extent policy;
 - physical background products available for each array;
 - geometry and velocity time series shown beside the map.

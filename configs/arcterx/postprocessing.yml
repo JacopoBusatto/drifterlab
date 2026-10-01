@@ -1,0 +1,66 @@
+input:
+  # Analysis-ready common-grid trajectory product.
+  trajectories: ../../data/reconstruction/arcterx_trajectories_candidate/trajectories.zarr
+  dataset_label: MicroSVP
+  coordinate_method: spline_30
+
+output:
+  directory: ../../data/postprocessing/arcterx
+
+arrays:
+  # Replace null with a verified UTC deployment time when one is available.
+  # A null or omitted value uses the earliest retained fix and labels it as such.
+  array_001:
+    nominal_deployment_time: null
+  array_002:
+    nominal_deployment_time: null
+  array_003:
+    nominal_deployment_time: null
+  array_004:
+    nominal_deployment_time: null
+
+trajectory_plotting:
+  enabled: true
+  # Any variable with dimensions (platform,), for example cluster_id, member_id,
+  # platform_id, or another platform-level property added in the future.
+  color_by: cluster_id
+  color_mode: categorical  # auto, categorical, or numeric
+  cmap: tab20
+  color_label: Candidate deployment cluster
+  vmin: null
+  vmax: null
+
+  time:
+    start: null
+    end: null
+
+  movie:
+    enabled: true
+    format: mp4
+    frame_interval_minutes: 60
+    fps: 15
+    tail_hours: 24
+    dpi: 120
+
+  map:
+    projection: PlateCarree
+    central_longitude: 0
+    # Null derives one fixed extent from the complete configured array window.
+    extent: null
+    padding_fraction: 0.05
+    figsize: [12, 8]
+    dpi: 150
+    land: true
+    coastlines: true
+    gridlines: true
+    scale_bar: true
+
+  # Optional array-specific time windows and map extents.
+  array_overrides: {}
+  # array_overrides:
+  #   array_003:
+  #     time:
+  #       start: "2025-02-06T00:00:00Z"
+  #       end: "2025-02-20T00:00:00Z"
+  #     map:
+  #       extent: [123, 137, 18, 29]
