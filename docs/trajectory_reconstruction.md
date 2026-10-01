@@ -25,7 +25,7 @@ Without an explicit end, the grid ends at the last anchored instant no later tha
 the latest eligible fix.
 
 The command is idempotent. If the bundle already exists, it validates schema
-`1.3`, the reconstruction-only configuration, deployment-array assignments, the
+`1.4`, the reconstruction-only configuration, deployment-array and initial-cluster assignments, the
 build-report hash, and every QC input hash. A matching bundle is reused; plotting-only YAML changes do not
 invalidate it. A mismatch fails with an instruction to use `--overwrite`.
 Overwrite builds and validates a complete temporary replacement before swapping
@@ -92,8 +92,59 @@ platform; a new array starts only when the adjacent start-time gap is strictly
 greater than `arrays.maximum_adjacent_start_gap_hours` (24 hours by default).
 Identifiers are positive, contiguous, chronological integers. The Zarr variable
 is named `array_id`; figures display it as “Array X”. These temporal deployment
-arrays replace the former downstream cohort/cluster workflow and do not use
-spatial proximity or later trajectory behavior.
+arrays are the temporal boundary inside which initial deployment clusters are
+inferred.
+
+Initial clustering is performed independently inside each array using the
+configured `distance_reference`. ARCTERX uses `observed_starts`: WGS84 distance
+is calculated between the two first retained-QC coordinates even when their
+timestamps differ. This is appropriate for candidate deployment-group inference,
+but these remain observed starts after QC rather than verified deployment
+coordinates. A pair is a candidate link only when both its exact observed-start
+time difference and observed-start distance satisfy their configured maxima.
+
+Distance on the selected reconstructed coordinate method (`linear` by default)
+is also calculated at every pair's first common finite grid timestamp and retained
+as a diagnostic. It does not control ARCTERX cluster assignment. Setting
+`distance_reference: first_common_grid` restores that time-aligned assignment
+mode when needed for another experiment.
+
+Candidate links are merged deterministically by joining-link distance, resulting
+diameter, resulting start spread, and platform IDs. A merge is accepted only when
+the complete proposed cluster satisfies `maximum_cluster_diameter_m`, the maximum
+observed-start spread, and `maximum_members` when it is not `null`. Thus nearby
+links cannot create an arbitrarily long nearest-neighbor chain. The expected
+experimental cluster count or size is not forced by the algorithm.
+
+Every value may be replaced under an `array_NNN` override. Setting
+`assignment: single_cluster` intentionally assigns the complete array as one
+cluster while still reporting its measured start spread, diameter, and missing
+pair distances. This is the explicit option for a known line deployment. Cluster
+assignment never trims, aligns, fills, or otherwise changes any trajectory's
+values or valid lifespan; downstream pair analyses select common lifetimes.
+
+```yaml
+initial_clustering:
+  distance_reference: observed_starts
+  coordinate_method: linear
+  defaults:
+    maximum_start_time_difference_seconds: 21600
+    maximum_pair_distance_m: 200
+    maximum_cluster_diameter_m: 1000
+    maximum_members: 5          # null means unlimited
+  array_overrides:
+    array_002:
+      maximum_pair_distance_m: 300
+      maximum_cluster_diameter_m: 1200
+    array_004:
+      assignment: single_cluster
+```
+
+Missing override fields inherit the defaults. In inferred mode,
+`maximum_pair_distance_m` makes two platforms eligible to link under the selected
+distance reference;
+`maximum_cluster_diameter_m` applies to every pair in the proposed cluster. The
+diameter must therefore be at least the link distance threshold.
 
 `longitude_native` and `latitude_native` linearly resample the native comparison
 fixes on the same shared grid. Their finite mask must equal the QC-derived linear
@@ -118,19 +169,33 @@ native, linear, and configured spline longitude/latitude, plus native and
 accepted-QC source-gap minutes. Positions are float64 and chunks default to one
 platform by 2,016 times. Metadata records the complete effective configuration,
 input hashes, units, interpolation/fallback policy, schemas, software version, and
-candidate status. Root attributes also record the assignment rule, threshold,
-assignment hash, and per-array counts/start ranges.
+candidate status. Root attributes also record the array and initial-cluster rules,
+assignment hashes, summaries, and pair-diagnostic counts.
+
+The platform metadata variables are deterministic dataset-wide `cluster_id`,
+one-based cluster-local `member_id`, `cluster_size`, and
+`cluster_assignment_status`. The status distinguishes inferred multi-platform
+candidates, algorithmic singletons, and configured whole-array clusters. An
+algorithmic singleton only means that no merge was accepted under these settings;
+it does not establish an intentional single-platform deployment.
 
 `start_time`, `start_lon`, and `start_lat` are one-dimensional platform variables.
 They preserve the actual first retained QC fix and therefore need not coincide
 with the first populated common-grid cell. They are not deployment estimates.
 
-The CSV has one row per platform with its `array_id`, gaps to the preceding and
-following chronological starts, eligible/fill bounds, native and accepted-fix
+The CSV has one row per platform with its array/cluster/member metadata, cluster
+start spread and diameter diagnostics, gaps to the preceding and following
+chronological starts, eligible/fill bounds, native and accepted-fix
 counts, gap quantiles and threshold exceedances, exact/interpolated grid counts, boundary
 warnings, and per-period counts for long-gap, insufficient-support, overshoot, and
 total linear fallback. Review this report before promoting the candidate product
 to a frozen scientific input.
+
+`cluster_diameter_m` is the diameter used for assignment. The report also records
+`cluster_observed_start_diameter_m` and
+`cluster_first_common_grid_diameter_m`. The latter is left missing when any
+within-cluster pair has no common finite timestamp, with a corresponding
+unavailable-pair count.
 
 ## Optional plotting in the same YAML
 
@@ -166,7 +231,9 @@ breaking lines at missing values and longitude wraps. Star markers denote the
 exact first retained QC position. `starting_positions.png` maps those exact
 coordinates colored by deployment array without implying verified deployment
 locations. `starting_positions__array_XX.png` provides one readable map per array,
-colored by hours after that array's first start. Optional labels use platform IDs.
+colored by hours after that array's first start. Marker shape identifies the
+candidate cluster number, with a per-array legend; this keeps start timing and
+cluster membership visible simultaneously. Optional labels use platform IDs.
 Each `check_platforms` entry
 adds `reconstruction_check__<dataset>__<platform>.png`, overlaying the native,
 linear, and every spline pair present in that store.

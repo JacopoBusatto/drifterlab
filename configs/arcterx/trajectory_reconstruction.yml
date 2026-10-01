@@ -17,6 +17,24 @@ arrays:
   # Starts are sorted chronologically; a strictly larger adjacent gap starts
   # the next 1-based deployment array.
   maximum_adjacent_start_gap_hours: 24
+
+initial_clustering:
+  # Assignment compares first retained-QC coordinates. The selected reconstructed
+  # method is retained for first-common-grid distance diagnostics.
+  distance_reference: observed_starts
+  coordinate_method: linear
+  defaults:
+    maximum_start_time_difference_seconds: 21600  # 6 hours
+    maximum_pair_distance_m: 200
+    maximum_cluster_diameter_m: 1000
+    maximum_members: 5  # null removes the inferred-cluster member cap
+  # Arrays 1 and 2 are known line deployments and are intentionally represented
+  # as one complete deployment cluster each. No geometry is inferred here.
+  array_overrides:
+    array_001:
+      assignment: single_cluster
+    array_002:
+      assignment: single_cluster
 output:
   # Atomically published bundle containing trajectories.zarr and build_report.csv.
   directory: ../../data/reconstruction/arcterx_trajectories_candidate

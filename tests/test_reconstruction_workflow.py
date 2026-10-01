@@ -80,7 +80,7 @@ def write_qc(
 
 def write_config(
     tmp_path: Path, *, end=None, periods=(15,), thresholds=None, plotting=None,
-    array_gap_hours=24,
+    array_gap_hours=24, initial_clustering=None,
 ):
     values = {
         "input": {"directory": "qc", "pattern": "*.parquet"},
@@ -90,6 +90,17 @@ def write_config(
             "long_gap_threshold_minutes": thresholds or {period: period for period in periods},
         },
         "arrays": {"maximum_adjacent_start_gap_hours": array_gap_hours},
+        "initial_clustering": initial_clustering or {
+            "distance_reference": "first_common_grid",
+            "coordinate_method": "linear",
+            "defaults": {
+                "maximum_start_time_difference_seconds": 3600,
+                "maximum_pair_distance_m": 1000,
+                "maximum_cluster_diameter_m": 2000,
+                "maximum_members": 5,
+            },
+            "array_overrides": {},
+        },
         "output": {"directory": "candidate", "chunks": {"platform": 1, "time": 4}},
     }
     if plotting is not None:
@@ -97,6 +108,21 @@ def write_config(
     path = tmp_path / "reconstruction.yml"
     path.write_text(yaml.safe_dump(values), encoding="utf-8")
     return path
+
+
+def cluster_config(*, overrides=None, method="linear", reference="first_common_grid",
+                   pair=1000, diameter=2000, seconds=3600, members=5):
+    return {
+        "distance_reference": reference,
+        "coordinate_method": method,
+        "defaults": {
+            "maximum_start_time_difference_seconds": seconds,
+            "maximum_pair_distance_m": pair,
+            "maximum_cluster_diameter_m": diameter,
+            "maximum_members": members,
+        },
+        "array_overrides": overrides or {},
+    }
 
 
 def test_common_grid_leading_trim_report_and_readback(tmp_path):
@@ -109,7 +135,10 @@ def test_common_grid_leading_trim_report_and_readback(tmp_path):
     assert result.end_time == np.datetime64("2025-01-12T01:15:00")
     report = pd.read_csv(result.report_path)
     assert report.platform_id.astype(str).tolist() == ["1001", "1002"]
-    assert {"gap_p50_minutes", "spline_15_total_fallback_points"} <= set(report)
+    assert {
+        "gap_p50_minutes", "spline_15_total_fallback_points", "cluster_id",
+        "member_id", "cluster_assignment_status", "cluster_diameter_m",
+    } <= set(report)
     with xr.open_zarr(result.zarr_path, consolidated=True, chunks=None) as dataset:
         assert dict(dataset.sizes) == {"platform": 2, "time": 14}
         assert dataset.platform_id.values.tolist() == ["1001", "1002"]
@@ -118,9 +147,18 @@ def test_common_grid_leading_trim_report_and_readback(tmp_path):
             "longitude_linear", "latitude_linear", "source_gap_minutes",
             "longitude_spline_15", "latitude_spline_15",
             "start_time", "start_lon", "start_lat",
-            "array_id",
+            "array_id", "cluster_id", "member_id", "cluster_size",
+            "cluster_assignment_status",
         }
         np.testing.assert_array_equal(dataset.array_id, [1, 1])
+        assert dataset.cluster_id.values.astype(str).tolist() == [
+            "array_001__cluster_001", "array_001__cluster_001",
+        ]
+        np.testing.assert_array_equal(dataset.member_id, [1, 2])
+        np.testing.assert_array_equal(dataset.cluster_size, [2, 2])
+        assert dataset.cluster_assignment_status.values.astype(str).tolist() == [
+            "candidate_cluster", "candidate_cluster",
+        ]
         np.testing.assert_array_equal(dataset.start_time.values, np.asarray([
             "2025-01-12T00:07:00", "2025-01-12T00:15:00",
         ], dtype="datetime64[ns]"))
@@ -514,19 +552,109 @@ def test_array_ids_follow_exact_start_times_and_are_in_report(tmp_path):
     assert report.array_id.tolist() == [1, 1, 1]
 
 
+def test_single_cluster_override_preserves_individual_lifespans(tmp_path):
+    write_qc(
+        tmp_path / "qc/A.parquet", "A", [0, 10, 20],
+        lon=[0, 0, 0], lat=[0, 0, 0],
+    )
+    write_qc(
+        tmp_path / "qc/B.parquet", "B", [5, 15, 25],
+        lon=[1, 1, 1], lat=[0, 0, 0],
+    )
+    clustering = cluster_config(
+        pair=10, diameter=20, seconds=10,
+        overrides={"array_001": {"assignment": "single_cluster"}},
+    )
+    result = run_reconstruction_workflow(
+        write_config(tmp_path, initial_clustering=clustering),
+    )
+    with xr.open_zarr(result.zarr_path, consolidated=True, chunks=None) as dataset:
+        assert dataset.cluster_id.values.astype(str).tolist() == [
+            "array_001__cluster_001", "array_001__cluster_001",
+        ]
+        assert dataset.cluster_assignment_status.values.astype(str).tolist() == [
+            "configured_single_cluster", "configured_single_cluster",
+        ]
+        assert np.isfinite(dataset.longitude_linear.isel(platform=0)).values.tolist() == [
+            True, True, True, True, True, False,
+        ]
+        assert np.isfinite(dataset.longitude_linear.isel(platform=1)).values.tolist() == [
+            False, True, True, True, True, True,
+        ]
+    report = pd.read_csv(result.report_path)
+    assert (report.cluster_diameter_m > 100_000).all()
+    assert result.cluster_count == 1
+
+
+def test_observed_start_reference_assigns_clusters_and_retains_common_grid_diagnostic(tmp_path):
+    write_qc(
+        tmp_path / "qc/A.parquet", "A", [0, 5, 10],
+        lon=[0, .01, .02], lat=[0, 0, 0],
+    )
+    write_qc(
+        tmp_path / "qc/B.parquet", "B", [5, 10, 15],
+        lon=[.0001, .0002, .0003], lat=[0, 0, 0],
+    )
+    clustering = cluster_config(
+        reference="observed_starts", pair=100, diameter=100,
+    )
+    result = run_reconstruction_workflow(
+        write_config(tmp_path, initial_clustering=clustering),
+    )
+    with xr.open_zarr(result.zarr_path, consolidated=True, chunks=None) as dataset:
+        assert len(set(dataset.cluster_id.values.astype(str))) == 1
+        assert dataset.attrs["initial_cluster_assignment_policy"][
+            "distance_reference"
+        ] == "observed_starts"
+    report = pd.read_csv(result.report_path)
+    assert (report.cluster_distance_reference == "observed_starts").all()
+    assert (report.cluster_observed_start_diameter_m < 100).all()
+    assert (report.cluster_first_common_grid_diameter_m > 1000).all()
+
+
+def test_cluster_override_inherits_defaults_and_null_removes_member_cap(tmp_path):
+    config = cluster_config(overrides={
+        "array_002": {"maximum_pair_distance_m": 1500, "maximum_members": None},
+    })
+    loaded = load_reconstruction_config(
+        write_config(tmp_path, initial_clustering=config),
+    )
+    override = loaded.initial_clustering.array_overrides[2]
+    assert override.maximum_pair_distance_m == 1500
+    assert override.maximum_cluster_diameter_m == 2000
+    assert override.maximum_start_time_difference_seconds == 3600
+    assert override.maximum_members is None
+
+
+def test_cluster_diameter_cannot_be_below_candidate_link_distance(tmp_path):
+    config = cluster_config(pair=1000, diameter=999)
+    with pytest.raises(ValueError, match="must be at least maximum_pair_distance_m"):
+        load_reconstruction_config(write_config(tmp_path, initial_clustering=config))
+
+
 def test_plotting_writes_one_exact_start_map_per_array(tmp_path):
     write_qc(tmp_path / "qc/1001.parquet", "1001", [7, 22, 37, 52])
     write_qc(tmp_path / "qc/1002.parquet", "1002", [1507, 1522, 1537, 1552])
+    write_qc(
+        tmp_path / "qc/1003.parquet", "1003", [12, 27, 42, 57],
+        lon=[10, 10, 10, 10], lat=[0, 0, 0, 0],
+    )
     plotting = plotting_config(checks=False)
     result = run_reconstruction_workflow(
-        write_config(tmp_path, plotting=plotting, array_gap_hours=24),
+        write_config(
+            tmp_path, plotting=plotting, array_gap_hours=24,
+            initial_clustering=cluster_config(pair=10, diameter=20),
+        ),
     )
     assert [path.name for path in result.figure_paths] == [
         "trajectory_overview.png", "starting_positions.png",
         "starting_positions__array_01.png", "starting_positions__array_02.png",
     ]
     with xr.open_zarr(result.zarr_path, consolidated=True, chunks=None) as dataset:
-        np.testing.assert_array_equal(dataset.array_id, [1, 2])
+        np.testing.assert_array_equal(dataset.array_id, [1, 2, 1])
+        assert len(set(
+            dataset.cluster_id.where(dataset.array_id == 1, drop=True).values.astype(str)
+        )) == 2
 
 
 def test_longitude_wrap_and_missing_values_split_paths_without_bridge():

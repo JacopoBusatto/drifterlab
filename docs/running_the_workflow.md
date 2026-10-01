@@ -188,15 +188,35 @@ Key YAML options are:
 - `spline.long_gap_threshold_minutes`: per-period fallback threshold;
 - `arrays.maximum_adjacent_start_gap_hours`: a strictly larger chronological gap
   between exact first retained-QC timestamps starts the next numeric array;
+- `initial_clustering.distance_reference`: `observed_starts` for deployment-group
+  inference, or `first_common_grid` for time-aligned reconstructed positions;
+- `initial_clustering.coordinate_method`: reconstructed coordinates used for the
+  first-common-grid assignment mode and diagnostic (`native`, `linear`, or a
+  configured spline);
+- `initial_clustering.defaults.maximum_start_time_difference_seconds`: maximum
+  exact observed-start difference for a candidate link and complete cluster;
+- `initial_clustering.defaults.maximum_pair_distance_m`: candidate-link distance
+  under the selected distance reference;
+- `initial_clustering.defaults.maximum_cluster_diameter_m`: maximum distance
+  across every pair in a proposed cluster, preventing nearest-neighbor chaining;
+- `initial_clustering.defaults.maximum_members`: inferred-cluster cap, or `null`
+  for no cap;
+- `initial_clustering.array_overrides.array_NNN`: replacements for any defaults,
+  or `assignment: single_cluster` for an intentionally whole-array group;
 - output chunk sizes;
 - optional plotting method, time window, platform subset, per-platform checks,
   map projection/extent, and compatible additional stores.
 
-Every platform receives one positive, chronological `array_id` before Zarr
-writing. No method extrapolates before the first or after the last retained QC fix. Review
+Every platform receives one positive, chronological `array_id`, a deterministic
+`cluster_id`, and a cluster-local `member_id` before publication. Initial cluster
+assignment does not trim trajectories. No method extrapolates before the first or
+after the last retained QC fix. Review
 `build_report.csv` and the figures before treating the candidate Zarr as a frozen
 scientific input. Full details are in
 [trajectory reconstruction](trajectory_reconstruction.md).
+
+Each `starting_positions__array_XX.png` map uses color for elapsed time from the
+array's first observed start and marker shape for candidate cluster number.
 
 ## 5. Candidate pairs
 

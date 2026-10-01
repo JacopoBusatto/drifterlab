@@ -32,6 +32,12 @@ class _Dataset:
     platform_index: dict[str, int]
     methods: dict[str, tuple[str, str]]
     array_ids: tuple[int, ...] | None
+    cluster_ids: tuple[str, ...] | None
+
+
+CLUSTER_MARKERS = (
+    "o", "s", "^", "D", "v", "P", "X", "<", ">", "h", "p", "8", "*", "H", "d",
+)
 
 
 def split_longitude_wrapped_path(
@@ -123,9 +129,21 @@ def _open_dataset(stack: ExitStack, label: str, path: Path, method: str) -> _Dat
         array_ids = tuple(int(value) for value in values)
         if any(value < 1 for value in array_ids):
             raise ValueError(f"Plotting dataset {label!r} has invalid array_id values")
+    cluster_ids: tuple[str, ...] | None = None
+    if "cluster_id" in dataset.variables:
+        if dataset.cluster_id.dims != ("platform",):
+            raise ValueError(f"Plotting dataset {label!r} has invalid cluster_id dimensions")
+        cluster_ids = tuple(dataset.cluster_id.values.astype(str).tolist())
+        if any(not value.strip() for value in cluster_ids):
+            raise ValueError(f"Plotting dataset {label!r} has empty cluster_id values")
+        if array_ids is None:
+            raise ValueError(
+                f"Plotting dataset {label!r} has cluster_id but no array_id variable"
+            )
     return _Dataset(
         label, path, method, dataset, platform_ids,
-        {platform: index for index, platform in enumerate(platform_ids)}, methods, array_ids,
+        {platform: index for index, platform in enumerate(platform_ids)}, methods,
+        array_ids, cluster_ids,
     )
 
 
@@ -306,10 +324,32 @@ def _plot_array_starts(
     times = source.dataset.start_time.isel(platform=indices).values.astype("datetime64[ns]")
     elapsed_hours = (times - times.min()) / np.timedelta64(1, "h")
     maximum = max(1.0, float(np.max(elapsed_hours)))
-    points = axes.scatter(
-        longitude, latitude, c=elapsed_hours, cmap="viridis", vmin=0, vmax=maximum,
-        transform=transform, marker="*", s=62, edgecolor="black", linewidth=.5, zorder=4,
-    )
+    if source.cluster_ids is None:
+        cluster_ids = ("unassigned",) * len(indices)
+    else:
+        cluster_ids = tuple(source.cluster_ids[index] for index in indices)
+    unique_clusters = sorted(set(cluster_ids), key=_cluster_sort_key)
+    marker_by_cluster = {
+        cluster_id: CLUSTER_MARKERS[index % len(CLUSTER_MARKERS)]
+        for index, cluster_id in enumerate(unique_clusters)
+    }
+    points = None
+    handles: list[Line2D] = []
+    for cluster_id in unique_clusters:
+        selected = np.asarray([value == cluster_id for value in cluster_ids], dtype=bool)
+        current = axes.scatter(
+            longitude[selected], latitude[selected], c=elapsed_hours[selected],
+            cmap="viridis", vmin=0, vmax=maximum, transform=transform,
+            marker=marker_by_cluster[cluster_id], s=62, edgecolor="black",
+            linewidth=.5, zorder=4,
+        )
+        if points is None:
+            points = current
+        handles.append(Line2D(
+            [0], [0], linestyle="none", marker=marker_by_cluster[cluster_id],
+            markersize=8, markerfacecolor="white", markeredgecolor="black",
+            label=_cluster_display_name(cluster_id),
+        ))
     if config.map.label_starts:
         for index, platform in enumerate(platforms):
             if source.platform_index[platform] not in indices:
@@ -321,7 +361,10 @@ def _plot_array_starts(
             )
     colorbar = figure.colorbar(points, ax=axes, pad=.04, shrink=.8)
     colorbar.set_label("Hours after first start in array")
-    axes.set_title(f"{source.label} — Array {array_id}: first retained QC positions")
+    axes.legend(handles=handles, title="Candidate cluster", loc="best", frameon=True)
+    axes.set_title(
+        f"{source.label} — Array {array_id}: candidate deployment clusters"
+    )
     axes.autoscale_view()
     _save_figure(figure, path, dpi=config.map.dpi)
 
@@ -333,6 +376,16 @@ def _method_order(name: str) -> tuple[int, int | str]:
         return 1, 0
     match = re.fullmatch(r"spline_(\d+)", name)
     return (2, int(match.group(1))) if match else (3, name)
+
+
+def _cluster_sort_key(cluster_id: str) -> tuple[int, int | str]:
+    match = re.fullmatch(r"array_[0-9]+__cluster_([0-9]+)", cluster_id)
+    return (0, int(match.group(1))) if match else (1, cluster_id)
+
+
+def _cluster_display_name(cluster_id: str) -> str:
+    match = re.fullmatch(r"array_[0-9]+__cluster_([0-9]+)", cluster_id)
+    return f"Cluster {int(match.group(1))}" if match else cluster_id
 
 
 def _safe_filename(value: str) -> str:

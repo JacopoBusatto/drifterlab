@@ -24,14 +24,17 @@ import zarr
 
 from drifterlab import __version__
 from drifterlab.reconstruction import (
-    ArrayAssignment, LinearGridTrack, PlatformReconstruction, assign_start_arrays,
-    reconstruct_platform, resample_linear_track,
+    ArrayAssignment, InitialClusterResult, InitialClusterRule,
+    LinearGridTrack, PlatformReconstruction, assign_initial_clusters, assign_start_arrays,
+    reconstruct_platform, resample_linear_track, validate_cluster_rule,
 )
 from drifterlab.workflows.position import POSITION_QC_PRODUCT_LAYOUT, POSITION_QC_SCHEMA_VERSION
 
 
-RECONSTRUCTION_SCHEMA_VERSION = "1.3"
-RECONSTRUCTION_ALGORITHM_VERSION = "phase-ensemble-natural-cubic-native-grid-arrays-v3"
+RECONSTRUCTION_SCHEMA_VERSION = "1.4"
+RECONSTRUCTION_ALGORITHM_VERSION = (
+    "phase-ensemble-natural-cubic-native-grid-arrays-initial-clusters-v5"
+)
 POSITION_QC_METADATA_KEY = b"drifterlab_position_qc"
 ZARR_NAME = "trajectories.zarr"
 REPORT_NAME = "build_report.csv"
@@ -88,6 +91,37 @@ class TrajectoryPlottingConfig:
 
 
 @dataclass(frozen=True)
+class InitialClusteringConfig:
+    distance_reference: str
+    coordinate_method: str
+    default_rule: InitialClusterRule
+    array_overrides: dict[int, InitialClusterRule]
+
+    def effective(self) -> dict[str, Any]:
+        def rule_values(rule: InitialClusterRule) -> dict[str, Any]:
+            return {
+                "assignment": rule.assignment,
+                "maximum_start_time_difference_seconds":
+                    rule.maximum_start_time_difference_seconds,
+                "maximum_pair_distance_m": rule.maximum_pair_distance_m,
+                "maximum_cluster_diameter_m": rule.maximum_cluster_diameter_m,
+                "maximum_members": rule.maximum_members,
+            }
+
+        defaults = rule_values(self.default_rule)
+        defaults.pop("assignment")
+        return {
+            "distance_reference": self.distance_reference,
+            "coordinate_method": self.coordinate_method,
+            "defaults": defaults,
+            "array_overrides": {
+                f"array_{array_id:03d}": rule_values(rule)
+                for array_id, rule in sorted(self.array_overrides.items())
+            },
+        }
+
+
+@dataclass(frozen=True)
 class ReconstructionWorkflowConfig:
     input_directory: Path
     input_pattern: str
@@ -97,6 +131,7 @@ class ReconstructionWorkflowConfig:
     periods_minutes: tuple[int, ...]
     long_gap_threshold_minutes: dict[int, float]
     maximum_adjacent_start_gap_hours: float
+    initial_clustering: InitialClusteringConfig
     output_directory: Path
     chunk_platform: int
     chunk_time: int
@@ -122,6 +157,7 @@ class ReconstructionWorkflowConfig:
             "arrays": {
                 "maximum_adjacent_start_gap_hours": self.maximum_adjacent_start_gap_hours,
             },
+            "initial_clustering": self.initial_clustering.effective(),
             "output": {
                 "directory": str(self.output_directory),
                 "chunks": {"platform": self.chunk_platform, "time": self.chunk_time},
@@ -142,11 +178,13 @@ class ReconstructionWorkflowResult:
     action: str
     figure_paths: tuple[Path, ...]
     array_count: int
+    cluster_count: int
 
     def format(self) -> str:
         return "\n".join([
             f"Candidate trajectories ({self.action}): {self.platform_count} platforms x {self.time_count} times",
             f"Deployment arrays: {self.array_count}",
+            f"Candidate initial clusters: {self.cluster_count}",
             f"Published UTC grid: {_format_utc(self.published_start_time)} to {_format_utc(self.end_time)}",
             f"Zarr: {self.zarr_path}", f"Build report: {self.report_path}",
             *( [f"Figures: {len(self.figure_paths)} in {self.figure_paths[0].parent}"]
@@ -240,7 +278,9 @@ def load_reconstruction_config(path: str | Path) -> ReconstructionWorkflowConfig
     with source_path.open(encoding="utf-8-sig") as stream:
         data = yaml.safe_load(stream)
     data = _mapping(
-        data, {"input", "grid", "spline", "arrays", "output", "plotting"}, "configuration",
+        data,
+        {"input", "grid", "spline", "arrays", "initial_clustering", "output", "plotting"},
+        "configuration",
     )
     source = _mapping(data.get("input", {}), {"directory", "pattern"}, "input")
     grid = _mapping(data.get("grid", {}), {"start_time", "end_time", "dt_minutes"}, "grid")
@@ -250,6 +290,22 @@ def load_reconstruction_config(path: str | Path) -> ReconstructionWorkflowConfig
     arrays = _mapping(
         data.get("arrays", {}), {"maximum_adjacent_start_gap_hours"}, "arrays",
     )
+    initial_clustering = _mapping(
+        data.get("initial_clustering", {}),
+        {"distance_reference", "coordinate_method", "defaults", "array_overrides"},
+        "initial_clustering",
+    )
+    cluster_defaults = _mapping(
+        initial_clustering.get("defaults", {}),
+        {
+            "maximum_start_time_difference_seconds", "maximum_pair_distance_m",
+            "maximum_cluster_diameter_m", "maximum_members",
+        },
+        "initial_clustering.defaults",
+    )
+    raw_cluster_overrides = initial_clustering.get("array_overrides", {})
+    if not isinstance(raw_cluster_overrides, dict):
+        raise ValueError("initial_clustering.array_overrides must be a mapping")
     output = _mapping(data.get("output", {}), {"directory", "chunks"}, "output")
     chunks = _mapping(output.get("chunks", {}), {"platform", "time"}, "output.chunks")
     plotting = _mapping(
@@ -319,6 +375,126 @@ def load_reconstruction_config(path: str | Path) -> ReconstructionWorkflowConfig
         arrays.get("maximum_adjacent_start_gap_hours", 24),
         "arrays.maximum_adjacent_start_gap_hours",
     )
+
+    required_cluster_defaults = {
+        "maximum_start_time_difference_seconds", "maximum_pair_distance_m",
+        "maximum_cluster_diameter_m", "maximum_members",
+    }
+    missing_cluster_defaults = required_cluster_defaults - set(cluster_defaults)
+    if missing_cluster_defaults:
+        raise ValueError(
+            "initial_clustering.defaults is missing keys: "
+            f"{sorted(missing_cluster_defaults)}"
+        )
+
+    def maximum_members(value: Any, name: str) -> int | None:
+        if value is None:
+            return None
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            raise ValueError(f"{name} must be null or a positive integer")
+        return value
+
+    default_cluster_rule = InitialClusterRule(
+        "infer",
+        _positive_number(
+            cluster_defaults["maximum_start_time_difference_seconds"],
+            "initial_clustering.defaults.maximum_start_time_difference_seconds",
+        ),
+        _positive_number(
+            cluster_defaults["maximum_pair_distance_m"],
+            "initial_clustering.defaults.maximum_pair_distance_m",
+        ),
+        _positive_number(
+            cluster_defaults["maximum_cluster_diameter_m"],
+            "initial_clustering.defaults.maximum_cluster_diameter_m",
+        ),
+        maximum_members(
+            cluster_defaults["maximum_members"],
+            "initial_clustering.defaults.maximum_members",
+        ),
+    )
+    validate_cluster_rule(default_cluster_rule, name="initial_clustering.defaults")
+    cluster_overrides: dict[int, InitialClusterRule] = {}
+    override_key_pattern = re.compile(r"^array_([0-9]{3})$")
+    override_fields = {
+        "assignment", "maximum_start_time_difference_seconds",
+        "maximum_pair_distance_m", "maximum_cluster_diameter_m", "maximum_members",
+    }
+    for raw_key, raw_value in raw_cluster_overrides.items():
+        if not isinstance(raw_key, str) or not (matched := override_key_pattern.fullmatch(raw_key)):
+            raise ValueError(
+                "initial_clustering.array_overrides keys must use array_NNN"
+            )
+        array_number = int(matched.group(1))
+        if array_number < 1:
+            raise ValueError("initial_clustering array override identifiers start at array_001")
+        values = _mapping(
+            raw_value, override_fields,
+            f"initial_clustering.array_overrides.{raw_key}",
+        )
+        assignment = values.get("assignment", "infer")
+        if assignment not in {"infer", "single_cluster"}:
+            raise ValueError(
+                f"initial_clustering.array_overrides.{raw_key}.assignment must be "
+                "'infer' or 'single_cluster'"
+            )
+        rule = InitialClusterRule(
+            assignment,
+            _positive_number(
+                values.get(
+                    "maximum_start_time_difference_seconds",
+                    default_cluster_rule.maximum_start_time_difference_seconds,
+                ),
+                f"initial_clustering.array_overrides.{raw_key}.maximum_start_time_difference_seconds",
+            ),
+            _positive_number(
+                values.get(
+                    "maximum_pair_distance_m", default_cluster_rule.maximum_pair_distance_m,
+                ),
+                f"initial_clustering.array_overrides.{raw_key}.maximum_pair_distance_m",
+            ),
+            _positive_number(
+                values.get(
+                    "maximum_cluster_diameter_m",
+                    default_cluster_rule.maximum_cluster_diameter_m,
+                ),
+                f"initial_clustering.array_overrides.{raw_key}.maximum_cluster_diameter_m",
+            ),
+            maximum_members(
+                values["maximum_members"] if "maximum_members" in values
+                else default_cluster_rule.maximum_members,
+                f"initial_clustering.array_overrides.{raw_key}.maximum_members",
+            ),
+        )
+        validate_cluster_rule(
+            rule, name=f"initial_clustering.array_overrides.{raw_key}",
+        )
+        cluster_overrides[array_number] = rule
+    distance_reference = initial_clustering.get(
+        "distance_reference", "observed_starts",
+    )
+    if distance_reference not in {"observed_starts", "first_common_grid"}:
+        raise ValueError(
+            "initial_clustering.distance_reference must be 'observed_starts' "
+            "or 'first_common_grid'"
+        )
+    initial_clustering_config = InitialClusteringConfig(
+        distance_reference,
+        _method(
+            initial_clustering.get("coordinate_method", "linear"),
+            "initial_clustering.coordinate_method",
+        ),
+        default_cluster_rule,
+        cluster_overrides,
+    )
+    available_cluster_methods = {
+        "native", "linear", *(f"spline_{period}" for period in periods),
+    }
+    if initial_clustering_config.coordinate_method not in available_cluster_methods:
+        raise ValueError(
+            "initial_clustering.coordinate_method must be one of the reconstructed "
+            f"methods {sorted(available_cluster_methods)}"
+        )
 
     chunk_values: list[int] = []
     for name, default in (("platform", 1), ("time", 2016)):
@@ -428,7 +604,8 @@ def load_reconstruction_config(path: str | Path) -> ReconstructionWorkflowConfig
     )
     return ReconstructionWorkflowConfig(
         input_directory, pattern, start, end, dt_minutes, tuple(periods), thresholds,
-        maximum_adjacent_start_gap_hours, output_directory, *chunk_values, plotting_config,
+        maximum_adjacent_start_gap_hours, initial_clustering_config,
+        output_directory, *chunk_values, plotting_config,
     )
 
 
@@ -720,6 +897,171 @@ def _array_metadata(
     }
 
 
+def _cluster_coordinate_variables(config: ReconstructionWorkflowConfig) -> tuple[str, str]:
+    method = config.initial_clustering.coordinate_method
+    return f"longitude_{method}", f"latitude_{method}"
+
+
+def _assign_clusters_from_store(
+    root: zarr.Group, inventories: list[QCInventory], grid: np.ndarray,
+    assignments: tuple[ArrayAssignment, ...], config: ReconstructionWorkflowConfig,
+) -> InitialClusterResult:
+    longitude_name, latitude_name = _cluster_coordinate_variables(config)
+    longitude = np.asarray(root[longitude_name][:], dtype=float)
+    latitude = np.asarray(root[latitude_name][:], dtype=float)
+    return assign_initial_clusters(
+        [item.platform_id for item in inventories],
+        [item.array_id for item in assignments],
+        [item.first_time for item in inventories],
+        grid, longitude, latitude,
+        config.initial_clustering.default_rule,
+        config.initial_clustering.array_overrides,
+        distance_reference=config.initial_clustering.distance_reference,
+        start_longitude=[item.first_longitude for item in inventories],
+        start_latitude=[item.first_latitude for item in inventories],
+    )
+
+
+def _cluster_metadata(
+    result: InitialClusterResult, config: ReconstructionWorkflowConfig,
+) -> dict[str, Any]:
+    records = [
+        {
+            "platform_id": item.platform_id,
+            "array_id": item.array_id,
+            "cluster_id": item.cluster_id,
+            "member_id": item.member_id,
+            "cluster_size": item.cluster_size,
+            "cluster_assignment_status": item.cluster_assignment_status,
+        }
+        for item in result.assignments
+    ]
+    canonical = json.dumps(records, sort_keys=True, separators=(",", ":")).encode()
+    unavailable = sum(item.distance_m is None for item in result.pair_diagnostics)
+    unavailable_common = sum(
+        item.first_common_grid_distance_m is None for item in result.pair_diagnostics
+    )
+    candidate_links = sum(item.candidate_link for item in result.pair_diagnostics)
+    return {
+        "initial_cluster_assignment_policy": {
+            "distance_reference": config.initial_clustering.distance_reference,
+            "coordinate_method": config.initial_clustering.coordinate_method,
+            "distance_ellipsoid": "WGS84",
+            "observed_start_distance": (
+                "WGS84 distance between each platform's first retained-QC coordinate"
+            ),
+            "first_common_grid_distance": (
+                "WGS84 distance at the first common finite reconstructed-grid timestamp; "
+                "retained as a diagnostic"
+            ),
+            "link_rule": (
+                "same array; observed-start difference at most the configured maximum; "
+                "configured distance_reference at most maximum_pair_distance_m"
+            ),
+            "merge_rule": (
+                "deterministic smallest joining distance, then resulting diameter, "
+                "resulting start spread, and sorted platform IDs"
+            ),
+            "cluster_constraints": (
+                "maximum complete-link diameter, full observed-start spread, and optional "
+                "member cap"
+            ),
+            "trajectory_coverage": "unchanged by cluster assignment",
+            "effective_configuration": config.initial_clustering.effective(),
+        },
+        "initial_cluster_assignment_sha256": sha256(canonical).hexdigest(),
+        "initial_cluster_summary": list(result.array_summary),
+        "initial_cluster_pair_diagnostic_summary": {
+            "same_array_pair_count": len(result.pair_diagnostics),
+            "candidate_link_count": candidate_links,
+            "unavailable_assignment_distance_count": unavailable,
+            "unavailable_first_common_grid_distance_count": unavailable_common,
+        },
+    }
+
+
+def _write_cluster_variables(
+    root: zarr.Group, result: InitialClusterResult,
+    config: ReconstructionWorkflowConfig,
+) -> None:
+    assignments = result.assignments
+    compressor = Blosc(cname="zstd", clevel=3, shuffle=Blosc.BITSHUFFLE)
+    chunks = (min(config.chunk_platform, len(assignments)),)
+    width = max(1, *(len(item.cluster_id) for item in assignments))
+    definitions: tuple[tuple[str, np.ndarray, dict[str, Any]], ...] = (
+        (
+            "cluster_id",
+            np.asarray([item.cluster_id for item in assignments], dtype=f"<U{width}"),
+            {
+                "long_name": "candidate initial deployment cluster identifier",
+                "comment": "Deterministic dataset-wide identifier; not a verified deployment label",
+            },
+        ),
+        (
+            "member_id",
+            np.asarray([item.member_id for item in assignments], dtype=np.int32),
+            {
+                "long_name": "one-based member number within candidate cluster",
+                "comment": "Ordered by observed start timestamp then platform_id",
+            },
+        ),
+        (
+            "cluster_size",
+            np.asarray([item.cluster_size for item in assignments], dtype=np.int32),
+            {"long_name": "number of platforms in candidate cluster"},
+        ),
+        (
+            "cluster_assignment_status",
+            np.asarray(
+                [item.cluster_assignment_status for item in assignments], dtype="<U25",
+            ),
+            {
+                "long_name": "candidate cluster assignment status",
+                "flag_values": [
+                    "candidate_cluster", "algorithmic_singleton", "configured_single_cluster",
+                ],
+            },
+        ),
+    )
+    for name, values, attributes in definitions:
+        array = root.create_dataset(
+            name, data=values, chunks=chunks, compressor=compressor, fill_value=None,
+        )
+        array.attrs.update({"_ARRAY_DIMENSIONS": ["platform"], **attributes})
+    root.attrs.update(_cluster_metadata(result, config))
+
+
+def _add_cluster_report_fields(
+    rows: list[dict[str, Any]], result: InitialClusterResult,
+    config: ReconstructionWorkflowConfig,
+) -> None:
+    if len(rows) != len(result.assignments):
+        raise ValueError("Cluster assignments are not aligned with the build report")
+    for row, item in zip(rows, result.assignments, strict=True):
+        if row["platform_id"] != item.platform_id or row["array_id"] != item.array_id:
+            raise ValueError("Cluster assignments changed platform or array alignment")
+        row.update({
+            "cluster_id": item.cluster_id,
+            "member_id": item.member_id,
+            "cluster_size": item.cluster_size,
+            "cluster_assignment_status": item.cluster_assignment_status,
+            "cluster_start_spread_seconds": item.cluster_start_spread_seconds,
+            "cluster_diameter_m": item.cluster_diameter_m,
+            "cluster_maximum_available_pair_distance_m":
+                item.cluster_maximum_available_pair_distance_m,
+            "cluster_observed_start_diameter_m":
+                item.cluster_observed_start_diameter_m,
+            "cluster_first_common_grid_diameter_m":
+                item.cluster_first_common_grid_diameter_m,
+            "cluster_first_common_grid_unavailable_pair_count":
+                item.cluster_first_common_grid_unavailable_pair_count,
+            "cluster_candidate_link_count": item.cluster_candidate_link_count,
+            "cluster_unavailable_pair_count": item.cluster_unavailable_pair_count,
+            "cluster_distance_reference": config.initial_clustering.distance_reference,
+            "cluster_coordinate_method": config.initial_clustering.coordinate_method,
+        })
+
+
 def _create_store(
     path: Path, inventories: list[QCInventory], grid: np.ndarray,
     config: ReconstructionWorkflowConfig, attributes: dict[str, Any],
@@ -885,12 +1227,14 @@ def _write_platform(
 def _verify(
     path: Path, platforms: list[str], grid: np.ndarray, inventories: list[QCInventory],
     config: ReconstructionWorkflowConfig, assignments: tuple[ArrayAssignment, ...],
+    cluster_result: InitialClusterResult,
 ) -> None:
     required = {
         "longitude_native", "latitude_native", "native_source_gap_minutes",
         "longitude_linear", "latitude_linear", "source_gap_minutes",
         "start_time", "start_lon", "start_lat",
-        "array_id",
+        "array_id", "cluster_id", "member_id", "cluster_size",
+        "cluster_assignment_status",
         *(f"longitude_spline_{period}" for period in config.periods_minutes),
         *(f"latitude_spline_{period}" for period in config.periods_minutes),
     }
@@ -906,11 +1250,29 @@ def _verify(
         expected_arrays = np.asarray([item.array_id for item in assignments], dtype=np.int32)
         if not np.array_equal(dataset.array_id.values.astype(np.int32), expected_arrays):
             raise ValueError("Zarr readback changed deployment-array assignments")
+        expected_clusters = [item.cluster_id for item in cluster_result.assignments]
+        if dataset.cluster_id.values.astype(str).tolist() != expected_clusters:
+            raise ValueError("Zarr readback changed initial cluster assignments")
+        for name in ("member_id", "cluster_size"):
+            expected = np.asarray(
+                [getattr(item, name) for item in cluster_result.assignments], dtype=np.int32,
+            )
+            if not np.array_equal(dataset[name].values.astype(np.int32), expected):
+                raise ValueError(f"Zarr readback changed {name}")
+        expected_status = [
+            item.cluster_assignment_status for item in cluster_result.assignments
+        ]
+        if dataset.cluster_assignment_status.values.astype(str).tolist() != expected_status:
+            raise ValueError("Zarr readback changed initial cluster assignment status")
     root = zarr.open_group(str(path), mode="r")
+    expected_cluster_metadata = _cluster_metadata(cluster_result, config)
+    if any(root.attrs.get(key) != value for key, value in expected_cluster_metadata.items()):
+        raise ValueError("Zarr readback changed initial cluster provenance")
     position_names = sorted(
         required - {
             "source_gap_minutes", "native_source_gap_minutes",
-            "start_time", "start_lon", "start_lat", "array_id",
+            "start_time", "start_lon", "start_lat", "array_id", "cluster_id",
+            "member_id", "cluster_size", "cluster_assignment_status",
         }
     )
     for index, inventory in enumerate(inventories):
@@ -1001,7 +1363,12 @@ def _existing_problem(
         expected_array_metadata = _array_metadata(inventories, assignments, config)
         if any(attrs.get(key) != value for key, value in expected_array_metadata.items()):
             return "the recorded deployment-array assignment differs"
-        _verify(zarr_path, platforms, grid, inventories, config, assignments)
+        cluster_result = _assign_clusters_from_store(
+            root, inventories, grid, assignments, config,
+        )
+        _verify(
+            zarr_path, platforms, grid, inventories, config, assignments, cluster_result,
+        )
     except (OSError, ValueError, KeyError, TypeError) as exc:
         return f"schema/readback validation failed: {exc}"
     return None
@@ -1099,6 +1466,16 @@ def _build_bundle(
                 track, reconstructed, grid, config, native, assignments[index],
             ))
             report(f"Reconstructed {index + 1}/{len(inventories)}: {inventory.platform_id}")
+        cluster_result = _assign_clusters_from_store(
+            root, inventories, grid, assignments, config,
+        )
+        _write_cluster_variables(root, cluster_result, config)
+        _add_cluster_report_fields(rows, cluster_result, config)
+        report(
+            f"Assigned {len(inventories)} platforms to "
+            f"{len({item.cluster_id for item in cluster_result.assignments})} "
+            "candidate deployment clusters"
+        )
         pd.DataFrame(rows).to_csv(report_path, index=False)
         root.attrs["build_report_sha256"] = _file_sha256(report_path)
 
@@ -1109,7 +1486,9 @@ def _build_bundle(
         if changed:
             raise ValueError(f"Position-QC inputs changed during reconstruction: {changed}")
         zarr.consolidate_metadata(str(zarr_path))
-        _verify(zarr_path, platforms, grid, inventories, config, assignments)
+        _verify(
+            zarr_path, platforms, grid, inventories, config, assignments, cluster_result,
+        )
         _publish_bundle(
             temporary, config.output_directory, token=token, overwrite=overwrite,
         )
@@ -1165,10 +1544,14 @@ def run_reconstruction_workflow(
         figure_paths = generate_trajectory_figures(
             config.output_directory / ZARR_NAME, config.plotting, progress=report,
         )
+    published_root = zarr.open_group(str(config.output_directory / ZARR_NAME), mode="r")
+    cluster_count = len(set(
+        np.asarray(published_root["cluster_id"][:]).astype(str).tolist()
+    ))
     result = ReconstructionWorkflowResult(
         config.output_directory, config.output_directory / ZARR_NAME,
         config.output_directory / REPORT_NAME, len(platforms), len(grid),
         config.start_time, published_start, grid[-1], action, figure_paths,
-        max(item.array_id for item in assignments),
+        max(item.array_id for item in assignments), cluster_count,
     )
     return result

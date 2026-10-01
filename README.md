@@ -70,6 +70,8 @@ The Zarr has dimensions `(platform, time)` and only these scientific arrays:
 
 - `platform_id` and the shared UTC `time` coordinate;
 - `start_time`, `start_lon`, and `start_lat` for the exact first retained QC fix;
+- deterministic candidate `cluster_id`, one-based cluster-local `member_id`,
+  `cluster_size`, and `cluster_assignment_status` on `platform`;
 - integer `array_id` on `platform`, displayed as “Array 1”, “Array 2”, etc.;
 - `longitude_native`, `latitude_native`, linearly resampled from source-valid
   positions before individual point QC but on the accepted-QC grid lifespan;
@@ -104,9 +106,13 @@ The same YAML optionally enables batch plotting. A normal rerun validates and
 reuses an unchanged Zarr, so plotting selections can be changed without rebuilding
 trajectories. It writes an overview, a combined exact-start map, one exact-start
 map per deployment array, and optional per-platform native-versus-linear-versus-
-spline checks. Arrays are assigned before Zarr writing from chronological gaps
-between exact first retained QC timestamps; they are not spatial clusters or
-verified deployment positions.
+spline checks. Arrays are assigned from chronological gaps between exact first
+retained QC timestamps. Initial deployment clusters are then inferred within each
+array from observed-start time and WGS84 position proximity. Time-aligned distance
+at the first common reconstructed grid time is retained as a diagnostic. Both
+assignments leave trajectory values and valid spans unchanged.
+Per-array start maps use marker shape for cluster number and color for elapsed
+start time.
 
 ## Candidate encounter pairs
 

@@ -29,7 +29,7 @@ SCIENCE
 | Raw | Campaign source MAT files | Immutable normalized signals/positions | `drifterlab.io` | Implemented |
 | Drogue QC | Raw TTFF/strain | Automatic Parquet plus explicit review CSV | `drifterlab.qc`, `drifterlab.workflows`, `drifterlab.review` | Implemented |
 | Position QC | Raw positions and resolved drogue decision | Schema-4 per-platform QC Parquets plus review CSV | same generic packages | Implemented |
-| Reconstruction | Finalized position-QC Parquets only | Shared-grid native, linear, spline tracks, and numeric deployment arrays | `drifterlab.reconstruction` and reconstruction workflow | Implemented |
+| Reconstruction | Finalized position-QC Parquets only | Shared-grid native, linear, spline tracks, numeric deployment arrays, and candidate initial clusters | `drifterlab.reconstruction` and reconstruction workflow | Implemented |
 | Trajectory product | Reconstructed rows | Lean candidate Zarr and per-platform build report | reconstruction workflow | Implemented |
 | Plotting | Validated trajectory Zarr | Overview, combined/per-array exact-start, and optional reconstruction-check PNGs | reconstruction command | Implemented |
 | Candidate pairs | Reconstructed trajectories | Grouped pair Zarr plus diagnostic catalog | `drifterlab.pairs` and pair workflow | Implemented |
@@ -48,7 +48,12 @@ remain for historical investigation only. In particular, the delivered
 Reconstruction assigns every platform one numeric `array_id` from chronological
 gaps between exact first retained-QC timestamps. These are observed starts, not
 verified deployment coordinates. Assignment never changes trajectory values or
-valid time spans.
+valid time spans. Inside each array it also assigns deterministic candidate
+`cluster_id`/`member_id` metadata from exact start-time differences and WGS84
+distance between first retained-QC coordinates. First-common-grid distance is
+retained as a time-aligned diagnostic. Diameter and member constraints prevent
+chaining; configured array overrides can select a complete array as one group.
+This second assignment likewise never changes coverage.
 
 Candidate-pair building is independent of array assignments. It
 selects the first configured distance-threshold crossing during each pair's common

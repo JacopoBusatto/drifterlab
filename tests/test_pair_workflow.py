@@ -49,7 +49,7 @@ def write_zarr(path: Path) -> None:
         },
         coords={"platform": np.arange(3), "time": time},
         attrs={
-            "schema_version": "1.3", "algorithm_version": "test-reconstruction",
+            "schema_version": "1.4", "algorithm_version": "test-reconstruction",
             "build_report_sha256": "test-report",
         },
     )
