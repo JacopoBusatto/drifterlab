@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
-from hashlib import sha256
 import json
+from hashlib import sha256
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 import pytest
 import xarray as xr
 import yaml
@@ -16,10 +17,20 @@ from drifterlab.plotting.array_trajectories import (
     movie_frame_indices,
 )
 from drifterlab.postprocessing import load_postprocessing_config, run_postprocessing
-from drifterlab.postprocessing.trajectories import load_array_trajectories
+from drifterlab.postprocessing.cluster_statistics import (
+    calculate_array_cluster_statistics,
+)
+from drifterlab.postprocessing.trajectories import (
+    load_array_trajectories,
+    load_cluster_statistic_trajectories,
+)
 
 
-def _write_store(path: Path, *, invalid_color_dims: bool = False) -> Path:
+def _write_store(
+    path: Path, *, invalid_color_dims: bool = False,
+    cluster_sizes: list[int] | None = None,
+    cluster_ids: list[str] | None = None,
+) -> Path:
     times = np.arange(
         np.datetime64("2025-02-01T00:00:00", "m"),
         np.datetime64("2025-02-01T00:20:00", "m"),
@@ -44,12 +55,17 @@ def _write_store(path: Path, *, invalid_color_dims: bool = False) -> Path:
         "array_id": (("platform",), np.asarray([1, 1, 2], dtype=np.int32)),
         "cluster_id": (
             ("time",) if invalid_color_dims else ("platform",),
-            np.asarray(["bad"] * 4) if invalid_color_dims else np.asarray([
-                "array_001__cluster_001", "array_001__cluster_002",
-                "array_002__cluster_001",
-            ]),
+            np.asarray(["bad"] * 4) if invalid_color_dims else np.asarray(
+                [
+                    "array_001__cluster_001", "array_001__cluster_002",
+                    "array_002__cluster_001",
+                ] if cluster_ids is None else cluster_ids
+            ),
         ),
         "member_id": (("platform",), np.asarray([1, 1, 1], dtype=np.int32)),
+        "cluster_size": (("platform",), np.asarray(
+            [1, 1, 1] if cluster_sizes is None else cluster_sizes, dtype=np.int32,
+        )),
         "longitude_spline_30": (("platform", "time"), longitude),
         "latitude_spline_30": (("platform", "time"), latitude),
     }
@@ -119,6 +135,30 @@ def test_config_defaults_and_resolved_paths(tmp_path):
     assert config.trajectory_plotting.movie.tail_hours == 24
     assert str(config.arrays[1].nominal_deployment_time) == "2025-02-01T00:00:00.000000000"
     assert config.effective()["trajectory_plotting"]["color_by"] == "cluster_id"
+    assert not config.cluster_statistics.enabled
+    assert config.cluster_statistics.percentiles == (0, 25, 50, 75, 100)
+
+
+@pytest.mark.parametrize(
+    "statistics,match",
+    [
+        ({"unknown": True}, "Unknown cluster_statistics keys"),
+        ({"stop_on_member_loss": "false"}, "must be true or false"),
+        ({"percentiles": [0, 25, 25, 100]}, "unique and strictly increasing"),
+        ({"percentiles": [-1, 50]}, r"lie in \[0, 100\]"),
+        ({"velocity": {"histogram_bins": 0}}, "positive integer"),
+        ({"velocity": {"difference_interval_minutes": 0}}, "finite and positive"),
+        ({"velocity": {"speed_range_m_s": [-1, 2]}}, "0 <= minimum"),
+        ({"plotting": {"relative_dispersion_yscale": "symlog"}}, "linear or log"),
+        ({"array_overrides": {"array_001": {"stop_on_member_loss": True}}},
+         "Unknown cluster_statistics.array_overrides"),
+    ],
+)
+def test_config_rejects_invalid_cluster_statistics_values(tmp_path, statistics, match):
+    values = _configuration(tmp_path)
+    values["cluster_statistics"] = statistics
+    with pytest.raises(ValueError, match=match):
+        load_postprocessing_config(_write_config(tmp_path, values))
 
 
 @pytest.mark.parametrize(
@@ -201,3 +241,93 @@ def test_workflow_creates_one_png_per_array_and_manifest_without_changing_input(
 
     with pytest.raises(ValueError, match="already exist"):
         run_postprocessing(config_path)
+
+
+def test_cluster_statistics_runs_without_trajectory_plotting_and_declares_outputs(tmp_path):
+    store = _write_store(tmp_path / "trajectories.zarr")
+    metadata_path = store / ".zmetadata"
+    before = _sha256(metadata_path)
+    store_before = {
+        path.relative_to(store).as_posix(): _sha256(path)
+        for path in store.rglob("*") if path.is_file()
+    }
+    values = _configuration(tmp_path, enabled=False)
+    values["cluster_statistics"] = {
+        "enabled": True,
+        "time": {"start": None, "end": None},
+        "stop_on_member_loss": False,
+        "percentiles": [0, 12.5, 50, 100],
+        "velocity": {
+            "difference_interval_minutes": 10,
+            "histogram_bins": 5,
+            "speed_range_m_s": None,
+        },
+        "plotting": {"dpi": 30, "relative_dispersion_yscale": "log"},
+        "array_overrides": {},
+    }
+    result = run_postprocessing(_write_config(tmp_path, values))
+
+    assert result.array_count == 2
+    assert len(result.figure_paths) == 12
+    assert len(result.numerical_paths) == 4
+    assert result.movie_paths == ()
+    assert all(path.is_file() and path.stat().st_size > 0 for path in result.figure_paths)
+    assert all(path.is_file() and path.stat().st_size > 0 for path in result.numerical_paths)
+    assert _sha256(metadata_path) == before
+    assert store_before == {
+        path.relative_to(store).as_posix(): _sha256(path)
+        for path in store.rglob("*") if path.is_file()
+    }
+    assert sorted(path.name for path in result.numerical_paths) == [
+        "cluster_summary.csv", "cluster_summary.csv",
+        "cluster_timeseries.csv", "cluster_timeseries.csv",
+    ]
+    manifest = json.loads(result.manifest_path.read_text(encoding="utf-8"))
+    assert not manifest["analyses"]["trajectory_plotting"]["enabled"]
+    entries = manifest["analyses"]["cluster_statistics"]["arrays"]
+    assert [entry["array_id"] for entry in entries] == [1, 2]
+    assert all(len(entry["figures"]) == 6 and len(entry["tables"]) == 2 for entry in entries)
+    assert entries[0]["projection"]["origin_method"].startswith("wrap-safe spherical mean")
+    assert manifest["effective_configuration"]["cluster_statistics"]["percentiles"] == [
+        0.0, 12.5, 50.0, 100.0,
+    ]
+    array_one = pd.read_csv(
+        tmp_path / "products/array_001/cluster_statistics/cluster_timeseries.csv",
+    )
+    assert "speed_p012p5_m_s" in array_one.columns
+    assert array_one.valid_pair_count.eq(0).all()
+    assert set(array_one.cluster_id) == {
+        "array_001__cluster_001", "array_001__cluster_002",
+    }
+    with pytest.raises(ValueError, match="already exist"):
+        run_postprocessing(_write_config(tmp_path, values))
+
+
+def test_cluster_statistics_rejects_stored_cluster_size_mismatch(tmp_path):
+    _write_store(tmp_path / "trajectories.zarr", cluster_sizes=[2, 1, 1])
+    values = _configuration(tmp_path, enabled=False)
+    values["cluster_statistics"] = {"enabled": True}
+    with pytest.raises(ValueError, match=r"stores cluster_size 2, but 1 platforms"):
+        run_postprocessing(_write_config(tmp_path, values))
+
+
+def test_cluster_statistics_never_forms_pairs_across_arrays(tmp_path):
+    _write_store(
+        tmp_path / "trajectories.zarr",
+        cluster_ids=["shared", "shared", "shared"],
+        cluster_sizes=[2, 2, 1],
+    )
+    values = _configuration(tmp_path, enabled=False)
+    values["cluster_statistics"] = {
+        "enabled": True,
+        "velocity": {"difference_interval_minutes": 10},
+    }
+    config = load_postprocessing_config(_write_config(tmp_path, values))
+    arrays, _ = load_cluster_statistic_trajectories(config)
+    results = [
+        calculate_array_cluster_statistics(item, config.cluster_statistics)
+        for item in arrays
+    ]
+    assert [result.summary.assigned_cluster_size.iloc[0] for result in results] == [2, 1]
+    assert results[0].timeseries.valid_pair_count.eq(1).all()
+    assert results[1].timeseries.valid_pair_count.eq(0).all()

@@ -42,6 +42,23 @@ class TrajectoryInputMetadata:
     array_ids: tuple[int, ...]
 
 
+@dataclass(frozen=True)
+class ClusterArrayTrajectoryData:
+    """Independent per-array input view for within-cluster statistics."""
+
+    array_id: int
+    dataset_label: str
+    coordinate_method: str
+    platform_ids: tuple[str, ...]
+    cluster_ids: tuple[str, ...]
+    cluster_sizes: np.ndarray
+    times: np.ndarray
+    longitude: np.ndarray
+    latitude: np.ndarray
+    projection_origin_longitude: float
+    projection_origin_latitude: float
+
+
 def _coordinate_names(dataset: xr.Dataset, method: str) -> tuple[str, str]:
     candidates = (
         (("longitude", "latitude"),) if method == "native" else ()
@@ -95,6 +112,182 @@ def _validate_base_dataset(dataset: xr.Dataset, path: Path) -> tuple[np.ndarray,
     if np.isnat(starts).any():
         raise ValueError("Trajectory start_time contains missing values")
     return platform_ids, times
+
+
+def _input_metadata(dataset: xr.Dataset, array_ids: tuple[int, ...]) -> TrajectoryInputMetadata:
+    attrs: dict[str, Any] = dataset.attrs
+    return TrajectoryInputMetadata(
+        schema_version=_optional_attr(attrs, "schema_version"),
+        algorithm_version=_optional_attr(attrs, "algorithm_version"),
+        product_status=_optional_attr(attrs, "product_status"),
+        build_report_sha256=_optional_attr(attrs, "build_report_sha256"),
+        array_assignment_sha256=_optional_attr(attrs, "array_assignment_sha256"),
+        initial_cluster_assignment_sha256=_optional_attr(
+            attrs, "initial_cluster_assignment_sha256",
+        ),
+        array_ids=array_ids,
+    )
+
+
+def _validate_coordinates(
+    longitude: np.ndarray, latitude: np.ndarray, *, method: str,
+) -> np.ndarray:
+    longitude_finite = np.isfinite(longitude)
+    latitude_finite = np.isfinite(latitude)
+    if not np.array_equal(longitude_finite, latitude_finite):
+        raise ValueError(
+            f"Trajectory {method} longitude and latitude finite masks differ"
+        )
+    if np.any(longitude_finite & ((longitude < -180) | (longitude >= 180))):
+        raise ValueError(f"Trajectory {method} longitude must lie in [-180, 180)")
+    if np.any(latitude_finite & ((latitude < -90) | (latitude > 90))):
+        raise ValueError(f"Trajectory {method} latitude must lie in [-90, 90]")
+    return longitude_finite
+
+
+def _spherical_mean(longitude: np.ndarray, latitude: np.ndarray) -> tuple[float, float]:
+    """Return the wrap-safe equal-weight spherical mean of coordinate pairs."""
+    lon_radians = np.deg2rad(np.asarray(longitude, dtype=float))
+    lat_radians = np.deg2rad(np.asarray(latitude, dtype=float))
+    vectors = np.column_stack((
+        np.cos(lat_radians) * np.cos(lon_radians),
+        np.cos(lat_radians) * np.sin(lon_radians),
+        np.sin(lat_radians),
+    ))
+    mean = vectors.mean(axis=0)
+    norm = float(np.linalg.norm(mean))
+    if not np.isfinite(norm) or norm <= 1e-12:
+        raise ValueError("Cannot derive a unique spherical-mean array projection origin")
+    mean /= norm
+    longitude_mean = float(np.rad2deg(np.arctan2(mean[1], mean[0])))
+    latitude_mean = float(np.rad2deg(np.arctan2(mean[2], np.hypot(mean[0], mean[1]))))
+    if longitude_mean >= 180:
+        longitude_mean -= 360
+    return longitude_mean, latitude_mean
+
+
+def load_cluster_statistic_trajectories(
+    config: PostprocessingConfig,
+) -> tuple[tuple[ClusterArrayTrajectoryData, ...], TrajectoryInputMetadata]:
+    """Load cluster metadata and an independent statistics window for every array."""
+    path = config.trajectory_path
+    if not path.is_dir():
+        raise ValueError(f"Trajectory Zarr does not exist: {path}")
+    try:
+        context = xr.open_zarr(path, consolidated=True, chunks=None)
+    except Exception as exc:
+        raise ValueError(f"Cannot open consolidated trajectory Zarr {path}: {exc}") from exc
+    with context as dataset:
+        platform_ids, times = _validate_base_dataset(dataset, path)
+        longitude_name, latitude_name = _coordinate_names(dataset, config.coordinate_method)
+        required = {
+            "cluster_id": ("platform",),
+            "cluster_size": ("platform",),
+            longitude_name: ("platform", "time"),
+            latitude_name: ("platform", "time"),
+        }
+        for name, dimensions in required.items():
+            if name not in dataset.variables or dataset[name].dims != dimensions:
+                raise ValueError(
+                    f"Trajectory store has no valid {name} variable with dimensions {dimensions}"
+                )
+
+        longitude_all = dataset[longitude_name].values.astype(float)
+        latitude_all = dataset[latitude_name].values.astype(float)
+        finite_all = _validate_coordinates(
+            longitude_all, latitude_all, method=config.coordinate_method,
+        )
+        if np.any(~finite_all.any(axis=1)):
+            missing = platform_ids[~finite_all.any(axis=1)].tolist()
+            raise ValueError(
+                "Every platform must have a finite selected coordinate for the fixed "
+                f"array projection; missing: {missing}"
+            )
+
+        raw_cluster_ids = np.asarray(dataset.cluster_id.values)
+        if any(
+            value is None
+            or (isinstance(value, (float, np.floating)) and np.isnan(value))
+            or not str(value)
+            for value in raw_cluster_ids.tolist()
+        ):
+            raise ValueError("Trajectory cluster_id must contain nonempty identifiers")
+        cluster_ids_all = np.asarray([str(value) for value in raw_cluster_ids], dtype=object)
+        try:
+            raw_sizes = np.asarray(dataset.cluster_size.values, dtype=float)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Trajectory cluster_size must be numeric") from exc
+        if (
+            not np.isfinite(raw_sizes).all()
+            or np.any(raw_sizes < 1)
+            or np.any(raw_sizes != np.floor(raw_sizes))
+        ):
+            raise ValueError(
+                "Trajectory cluster_size must contain finite positive integer values"
+            )
+        cluster_sizes_all = raw_sizes.astype(np.int64)
+
+        array_values = dataset.array_id.values.astype(int)
+        array_ids = tuple(sorted(set(array_values.tolist())))
+        configured_ids = set(config.arrays) | set(config.cluster_statistics.array_overrides)
+        unknown = sorted(configured_ids - set(array_ids))
+        if unknown:
+            raise ValueError(f"Postprocessing configuration references unknown arrays: {unknown}")
+
+        for array_id in array_ids:
+            array_mask = array_values == array_id
+            for cluster_id in dict.fromkeys(cluster_ids_all[array_mask].tolist()):
+                group = array_mask & (cluster_ids_all == cluster_id)
+                stored_sizes = np.unique(cluster_sizes_all[group])
+                if len(stored_sizes) != 1:
+                    raise ValueError(
+                        f"Array {array_id} cluster {cluster_id!r} has inconsistent cluster_size"
+                    )
+                assigned = int(group.sum())
+                if int(stored_sizes[0]) != assigned:
+                    raise ValueError(
+                        f"Array {array_id} cluster {cluster_id!r} stores cluster_size "
+                        f"{int(stored_sizes[0])}, but {assigned} platforms carry that assignment"
+                    )
+
+        result: list[ClusterArrayTrajectoryData] = []
+        statistics = config.cluster_statistics
+        for array_id in array_ids:
+            platform_mask = array_values == array_id
+            longitude_full = longitude_all[platform_mask]
+            latitude_full = latitude_all[platform_mask]
+            finite_full = finite_all[platform_mask]
+            first_indices = np.argmax(finite_full, axis=1)
+            row_indices = np.arange(int(platform_mask.sum()))
+            origin_longitude, origin_latitude = _spherical_mean(
+                longitude_full[row_indices, first_indices],
+                latitude_full[row_indices, first_indices],
+            )
+
+            override = statistics.array_overrides.get(array_id)
+            window = _merged_time_window(statistics.time, override)
+            active_times = finite_full.any(axis=0)
+            start = times[np.flatnonzero(active_times)[0]] if np.isnat(window.start) else window.start
+            end = times[np.flatnonzero(active_times)[-1]] if np.isnat(window.end) else window.end
+            time_mask = (times >= start) & (times <= end)
+            if not time_mask.any():
+                raise ValueError(
+                    f"Array {array_id} cluster_statistics time window contains no source timestamps"
+                )
+            result.append(ClusterArrayTrajectoryData(
+                array_id=array_id,
+                dataset_label=config.dataset_label,
+                coordinate_method=config.coordinate_method,
+                platform_ids=tuple(platform_ids[platform_mask].tolist()),
+                cluster_ids=tuple(cluster_ids_all[platform_mask].tolist()),
+                cluster_sizes=cluster_sizes_all[platform_mask].copy(),
+                times=times[time_mask].copy(),
+                longitude=longitude_full[:, time_mask].copy(),
+                latitude=latitude_full[:, time_mask].copy(),
+                projection_origin_longitude=origin_longitude,
+                projection_origin_latitude=origin_latitude,
+            ))
+        return tuple(result), _input_metadata(dataset, array_ids)
 
 
 def load_array_trajectories(
@@ -190,18 +383,7 @@ def load_array_trajectories(
                 configured_extent=configured_extent,
             ))
 
-        attrs: dict[str, Any] = dataset.attrs
-        input_metadata = TrajectoryInputMetadata(
-            schema_version=_optional_attr(attrs, "schema_version"),
-            algorithm_version=_optional_attr(attrs, "algorithm_version"),
-            product_status=_optional_attr(attrs, "product_status"),
-            build_report_sha256=_optional_attr(attrs, "build_report_sha256"),
-            array_assignment_sha256=_optional_attr(attrs, "array_assignment_sha256"),
-            initial_cluster_assignment_sha256=_optional_attr(
-                attrs, "initial_cluster_assignment_sha256",
-            ),
-            array_ids=array_ids,
-        )
+        input_metadata = _input_metadata(dataset, array_ids)
     return tuple(result), input_metadata
 
 

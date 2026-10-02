@@ -64,3 +64,31 @@ trajectory_plotting:
   #       end: "2025-02-20T00:00:00Z"
   #     map:
   #       extent: [123, 137, 18, 29]
+
+cluster_statistics:
+  enabled: true
+
+  # This window is independent of trajectory_plotting.time.
+  time:
+    start: null
+    end: null
+
+  # false recalculates from active members; true admits the first complete
+  # interval and stops permanently at the first subsequent member loss.
+  stop_on_member_loss: false
+
+  percentiles: [0, 25, 50, 75, 100]
+
+  velocity:
+    # Total span: centered estimates use t +/- 15 minutes; boundary estimates
+    # use a one-sided 30-minute span. Exact timestamps and finite endpoints are required.
+    difference_interval_minutes: 30
+    histogram_bins: 50
+    speed_range_m_s: null
+
+  plotting:
+    dpi: 150
+    relative_dispersion_yscale: log
+
+  # Only independent time-window overrides are accepted in this phase.
+  array_overrides: {}

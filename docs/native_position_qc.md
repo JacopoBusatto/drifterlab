@@ -206,9 +206,20 @@ the change between incoming and outgoing east/north velocity divided by the
 separation of the edge midpoints. It therefore recognizes both abrupt speed
 changes and reversals, but never makes an over-threshold bridge acceptable. All
 nonoverlapping winners are applied together and adjacency is rebuilt to a fixed
-point. If no cure exists within either configured limit, the observations are
-retained as a resolved `automatic_keep_removal_limit_reached` anomaly rather than
-being deleted indefinitely.
+point.
+
+If the bounded solvers still leave a high-speed edge, aggressive automatic mode
+uses a deterministic last-resort new-side policy. After two consecutive plausible
+edges have established the older side, it preserves the older anchor and rejects
+later observations one at a time until the recomputed bridge speed is at or below
+`speed_threshold_m_s`. Neither `max_local_gap_seconds` nor
+`max_automatic_removal_points` limits this fallback. If the track never reconnects,
+the later tail is rejected through the retained segment end. Decisions are stored
+as `automatic_new_side_speed_thinning`, including every tested edge, the preserved
+anchor, the first surviving reconnection when present, and whether the segment end
+terminated removal. Human keep/uncertain decisions remain protected, and a run
+without two plausible older-side support edges remains an explicitly retained
+anomaly rather than guessing which boundary side is valid.
 
 The ordinary bounded solver cannot test the first or last point of a retained
 temporal segment because no bridge anchor exists outside the segment. Aggressive
@@ -228,9 +239,12 @@ Conservative modes continue to review duplicate timestamps.
 ## Modes, decisions, and final resolution
 
 - `--automatic` has no GUI and uses the aggressive deterministic policy. It leaves
-  no unresolved eligible local-geometry event; capped non-cures remain explicitly
-  flagged but valid. Upstream drogue, deployment, temporal, or human uncertainty is
-  reported separately and is never disguised as solved geometry.
+  no unresolved eligible local-geometry event. After bounded cures, its last-resort
+  policy removes the later side of any remaining high-speed edge that has an
+  established older-side history. Boundary cases without that history and
+  human-protected observations remain explicitly flagged. Upstream drogue,
+  deployment, temporal, or human uncertainty is reported separately and is never
+  disguised as solved geometry.
 - `--semiautomatic` queues pending temporal segments, unresolved local events,
   timing-blocked anomalies, persistent/ambiguous geometry, and human/automatic
   conflicts. Exact-repeat and automatic short-interval events are always hidden;
@@ -481,10 +495,11 @@ The CSV is atomically replaced by N or Q. Each affected trajectory Parquet is th
 recomputed and atomically replaced independently. Unaffected files remain byte-for-
 byte unchanged.
 
-Algorithm version `native-position-qc-v2.6` adds the guarded gross-speed boundary
-endpoint cure to the aggressive bounded automatic solver. Switching between
-automatic and reviewer modes causes the per-platform products to rebuild under
-the appropriate policy; later runs with the same policy reuse them normally.
+Algorithm version `native-position-qc-v2.7` adds the aggressive last-resort
+new-side speed-thinning policy after the guarded boundary and bounded automatic
+solvers. Switching between automatic and reviewer modes causes the per-platform
+products to rebuild under the appropriate policy; later runs with the same policy
+reuse them normally.
 
 The product schema is `4.0` and layout is `per-trajectory-v3`. The compatibility
 check requires both coordinate columns, so older products rebuild independently.

@@ -1291,6 +1291,152 @@ def _aggressive_speed_cures(
     return result, evidence, iteration
 
 
+def _aggressive_new_side_speed_thinning(
+    frame: pd.DataFrame, base_rejected: np.ndarray, config: NativePositionConfig,
+    protected: np.ndarray, *, first_iteration: int,
+) -> tuple[np.ndarray, dict[int, dict[str, Any]], int]:
+    """Remove the later side of otherwise unresolved high-speed edges.
+
+    This is the final aggressive fallback.  It becomes active only after two
+    plausible surviving edges have established the older side of a run.  The
+    older point then remains fixed while later observations are removed until
+    the recomputed bridge is at or below the configured speed threshold.  The
+    bounded cure's elapsed-time and point-count limits intentionally do not
+    apply to this last-resort policy.
+    """
+    n = len(frame)
+    result = np.zeros(n, dtype=bool)
+    evidence: dict[int, dict[str, Any]] = {}
+    time = frame.time_value.to_numpy(dtype="datetime64[ns]")
+    lon = frame.source_lon.to_numpy(dtype=float)
+    lat = frame.source_lat.to_numpy(dtype=float)
+    source = frame.source_obs_index.to_numpy(dtype=np.int64)
+    maximum_elapsed = config.max_local_gap_seconds + config.gap_tolerance_seconds
+    iteration = first_iteration
+
+    def edge(a: int, b: int) -> tuple[float, float, float]:
+        return _edge_arrays(time, lon, lat, a, b)
+
+    def record(
+        anchor: int, block: list[int], edge_history: list[dict[str, Any]],
+        reconnect: int | None, termination: str,
+    ) -> None:
+        nonlocal iteration
+        if not block:
+            return
+        iteration += 1
+        rejected_sources = [int(source[j]) for j in block]
+        event_id = _event_id(
+            str(frame.platform_code.iloc[0]),
+            "automatic_new_side_speed_thinning",
+            rejected_sources,
+        )
+        bridge_dt = bridge_distance = bridge_speed = None
+        if reconnect is not None:
+            bridge_dt, bridge_distance, bridge_speed = edge(anchor, reconnect)
+        detail = {
+            "method": "unbounded_new_side_speed_thinning",
+            "direction": "later_observations",
+            "anchor": int(anchor),
+            "reconnect": None if reconnect is None else int(reconnect),
+            "anchor_source_obs_index": int(source[anchor]),
+            "reconnect_source_obs_index": (
+                None if reconnect is None else int(source[reconnect])
+            ),
+            "skipped": [int(j) for j in block],
+            "skipped_source_obs_indices": rejected_sources,
+            "skipped_count": len(block),
+            "bridge_dt_seconds": bridge_dt,
+            "bridge_distance_m": bridge_distance,
+            "bridge_speed": bridge_speed,
+            "speed_threshold_m_s": config.speed_threshold_m_s,
+            "elapsed_time_limit_applied": False,
+            "removal_point_limit_applied": False,
+            "termination": termination,
+            "tested_edges": edge_history,
+            "cures": bool(
+                reconnect is None
+                or (
+                    np.isfinite(bridge_speed)
+                    and bridge_speed <= config.speed_threshold_m_s
+                )
+            ),
+        }
+        policy = {
+            "method": "last_resort_new_side_policy",
+            "preserved_side": "older",
+            "rule": "reject later observations until speed is at or below threshold",
+            "required_preceding_plausible_edges": 2,
+        }
+        for j in block:
+            result[j] = True
+            evidence[j] = {
+                "event_id": event_id,
+                "event_type": "automatic_new_side_speed_thinning",
+                "point_auto_status": "automatic_new_side_reject",
+                "iteration": iteration,
+                "implicated": rejected_sources,
+                "forward": detail,
+                "backward": policy,
+                "reason": "automatic_new_side_speed_thinning",
+            }
+
+    for order in _candidate_runs(frame, base_rejected):
+        if len(order) < 2:
+            continue
+        anchor = int(order[0])
+        plausible_history = 0
+        trusted_older_side = False
+        block: list[int] = []
+        edge_history: list[dict[str, Any]] = []
+        block_anchor: int | None = None
+        for value in order[1:]:
+            candidate = int(value)
+            dt, distance, speed = edge(anchor, candidate)
+            high = bool(
+                np.isfinite(speed) and dt > 0
+                and speed > config.speed_threshold_m_s
+            )
+            if high and trusted_older_side and not protected[candidate]:
+                if block_anchor is None:
+                    block_anchor = anchor
+                block.append(candidate)
+                edge_history.append({
+                    "candidate": candidate,
+                    "candidate_source_obs_index": int(source[candidate]),
+                    "dt_seconds": dt,
+                    "distance_m": distance,
+                    "speed_m_s": speed,
+                })
+                continue
+
+            if block:
+                assert block_anchor is not None
+                termination = (
+                    "protected_human_decision" if high
+                    else "speed_at_or_below_threshold"
+                )
+                record(block_anchor, block, edge_history, candidate, termination)
+                block, edge_history, block_anchor = [], [], None
+
+            usable_plausible = bool(
+                config.minimum_local_dt_seconds <= dt <= maximum_elapsed
+                and np.isfinite(speed) and speed <= config.speed_threshold_m_s
+            )
+            if usable_plausible:
+                plausible_history += 1
+                trusted_older_side |= plausible_history >= 2
+            else:
+                plausible_history = 0
+            anchor = candidate
+
+        if block:
+            assert block_anchor is not None
+            record(block_anchor, block, edge_history, None, "retained_segment_end")
+
+    return result, evidence, iteration
+
+
 def _repeat_rejections(frame: pd.DataFrame) -> np.ndarray:
     result = np.zeros(len(frame), dtype=bool)
     frame["exact_repeat_flag"] = False
@@ -1469,6 +1615,15 @@ def _local_qc(frame: pd.DataFrame, position: NativePositionConfig,
         )
         geometry_reject |= aggressive_reject
         evidence.update(aggressive_evidence)
+        new_side_reject, new_side_evidence, iteration = (
+            _aggressive_new_side_speed_thinning(
+                frame,
+                repeat_reject | short_reject | duplicate_reject | geometry_reject,
+                position, protected, first_iteration=iteration,
+            )
+        )
+        geometry_reject |= new_side_reject
+        evidence.update(new_side_evidence)
 
     # Final surviving edge evidence.
     columns: dict[str, Any] = {
@@ -1529,9 +1684,13 @@ def _local_qc(frame: pd.DataFrame, position: NativePositionConfig,
     for j, item in evidence.items():
         forward, backward = item["forward"], item["backward"]
         frame.at[j, "local_event_id"] = item["event_id"]
-        frame.at[j, "local_event_type"] = "local_spike_or_short_block"
+        frame.at[j, "local_event_type"] = item.get(
+            "event_type", "local_spike_or_short_block",
+        )
         frame.at[j, "local_event_implicated_source_obs_indices"] = json.dumps(item["implicated"])
-        frame.at[j, "point_auto_status"] = "high_confidence_reject"
+        frame.at[j, "point_auto_status"] = item.get(
+            "point_auto_status", "high_confidence_reject",
+        )
         frame.at[j, "point_auto_decision"] = "reject"
         frame.at[j, "point_auto_reason"] = item["reason"]
         frame.at[j, "auto_iteration"] = item["iteration"]

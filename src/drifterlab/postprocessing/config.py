@@ -2,17 +2,18 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import math
+import re
+from dataclasses import dataclass
+from decimal import Decimal
+from itertools import pairwise
 from numbers import Real
 from pathlib import Path
-import re
 from typing import Any
 
 import numpy as np
 import pandas as pd
 import yaml
-
 
 SUPPORTED_MAP_PROJECTIONS = {
     "PlateCarree", "Mercator", "SouthPolarStereo", "NorthPolarStereo", "Robinson",
@@ -79,6 +80,30 @@ class TrajectoryPlottingConfig:
 
 
 @dataclass(frozen=True)
+class ClusterVelocityConfig:
+    difference_interval_minutes: float
+    histogram_bins: int
+    speed_range_m_s: tuple[float, float] | None
+
+
+@dataclass(frozen=True)
+class ClusterStatisticsPlottingConfig:
+    dpi: int
+    relative_dispersion_yscale: str
+
+
+@dataclass(frozen=True)
+class ClusterStatisticsConfig:
+    enabled: bool
+    time: TimeWindowConfig
+    stop_on_member_loss: bool
+    percentiles: tuple[float, ...]
+    velocity: ClusterVelocityConfig
+    plotting: ClusterStatisticsPlottingConfig
+    array_overrides: dict[int, TimeWindowConfig]
+
+
+@dataclass(frozen=True)
 class PostprocessingConfig:
     source_path: Path
     trajectory_path: Path
@@ -87,10 +112,12 @@ class PostprocessingConfig:
     output_directory: Path
     arrays: dict[int, ArrayMetadataConfig]
     trajectory_plotting: TrajectoryPlottingConfig
+    cluster_statistics: ClusterStatisticsConfig
 
     def effective(self) -> dict[str, Any]:
         """Return a JSON-serializable representation of the resolved configuration."""
         plotting = self.trajectory_plotting
+        statistics = self.cluster_statistics
         return {
             "input": {
                 "trajectories": str(self.trajectory_path),
@@ -144,6 +171,32 @@ class PostprocessingConfig:
                         ),
                     }
                     for array_id, item in sorted(plotting.array_overrides.items())
+                },
+            },
+            "cluster_statistics": {
+                "enabled": statistics.enabled,
+                "time": _time_effective(statistics.time),
+                "stop_on_member_loss": statistics.stop_on_member_loss,
+                "percentiles": list(statistics.percentiles),
+                "velocity": {
+                    "difference_interval_minutes": (
+                        statistics.velocity.difference_interval_minutes
+                    ),
+                    "histogram_bins": statistics.velocity.histogram_bins,
+                    "speed_range_m_s": (
+                        None if statistics.velocity.speed_range_m_s is None
+                        else list(statistics.velocity.speed_range_m_s)
+                    ),
+                },
+                "plotting": {
+                    "dpi": statistics.plotting.dpi,
+                    "relative_dispersion_yscale": (
+                        statistics.plotting.relative_dispersion_yscale
+                    ),
+                },
+                "array_overrides": {
+                    _array_key(array_id): {"time": _time_effective(time)}
+                    for array_id, time in sorted(statistics.array_overrides.items())
                 },
             },
         }
@@ -250,6 +303,50 @@ def _parse_extent(value: Any, name: str) -> tuple[float, float, float, float] | 
     return extent
 
 
+def percentile_suffix(value: float) -> str:
+    """Return a deterministic CSV-safe percentile suffix such as ``p012p5``."""
+    decimal = Decimal(str(value))
+    rendered = format(decimal, "f")
+    whole, separator, fraction = rendered.partition(".")
+    fraction = fraction.rstrip("0")
+    suffix = f"p{int(whole):03d}"
+    return suffix if not separator or not fraction else f"{suffix}p{fraction}"
+
+
+def _parse_percentiles(value: Any, name: str) -> tuple[float, ...]:
+    if not isinstance(value, list) or not value:
+        raise ValueError(f"{name} must be a nonempty list")
+    parsed: list[float] = []
+    for item in value:
+        if isinstance(item, bool) or not isinstance(item, Real):
+            raise ValueError(f"{name} values must be numeric")
+        number = float(item)
+        if not math.isfinite(number) or not 0 <= number <= 100:
+            raise ValueError(f"{name} values must lie in [0, 100]")
+        parsed.append(number)
+    if any(right <= left for left, right in pairwise(parsed)):
+        raise ValueError(f"{name} values must be unique and strictly increasing")
+    suffixes = [percentile_suffix(item) for item in parsed]
+    if len(set(suffixes)) != len(suffixes):
+        raise ValueError(f"{name} values produce colliding canonical column names")
+    return tuple(parsed)
+
+
+def _parse_speed_range(
+    value: Any, name: str,
+) -> tuple[float, float] | None:
+    if value is None:
+        return None
+    if not isinstance(value, list) or len(value) != 2:
+        raise ValueError(f"{name} must be null or [minimum, maximum]")
+    if any(isinstance(item, bool) or not isinstance(item, Real) for item in value):
+        raise ValueError(f"{name} bounds must be numeric")
+    lower, upper = (float(item) for item in value)
+    if not math.isfinite(lower) or not math.isfinite(upper) or lower < 0 or upper <= lower:
+        raise ValueError(f"{name} must satisfy 0 <= minimum < maximum")
+    return lower, upper
+
+
 def _parse_array_key(value: Any, name: str) -> int:
     if not isinstance(value, str) or not (match := ARRAY_KEY_PATTERN.fullmatch(value)):
         raise ValueError(f"{name} keys must use array_NNN")
@@ -264,7 +361,11 @@ def load_postprocessing_config(path: str | Path) -> PostprocessingConfig:
     source_path = Path(path).resolve()
     with source_path.open(encoding="utf-8-sig") as stream:
         data = yaml.safe_load(stream)
-    data = _mapping(data, {"input", "output", "arrays", "trajectory_plotting"}, "configuration")
+    data = _mapping(
+        data,
+        {"input", "output", "arrays", "trajectory_plotting", "cluster_statistics"},
+        "configuration",
+    )
     input_section = _mapping(
         data.get("input", {}),
         {"trajectories", "dataset_label", "coordinate_method"},
@@ -432,7 +533,86 @@ def load_postprocessing_config(path: str | Path) -> PostprocessingConfig:
         map_config,
         overrides,
     )
+
+    statistics_section = _mapping(
+        data.get("cluster_statistics", {}),
+        {
+            "enabled", "time", "stop_on_member_loss", "percentiles", "velocity",
+            "plotting", "array_overrides",
+        },
+        "cluster_statistics",
+    )
+    statistics_time = _parse_time(
+        statistics_section.get("time", {}), "cluster_statistics.time",
+    )
+    velocity_section = _mapping(
+        statistics_section.get("velocity", {}),
+        {"difference_interval_minutes", "histogram_bins", "speed_range_m_s"},
+        "cluster_statistics.velocity",
+    )
+    velocity = ClusterVelocityConfig(
+        _positive_number(
+            velocity_section.get("difference_interval_minutes", 30),
+            "cluster_statistics.velocity.difference_interval_minutes",
+        ),
+        _positive_integer(
+            velocity_section.get("histogram_bins", 50),
+            "cluster_statistics.velocity.histogram_bins",
+        ),
+        _parse_speed_range(
+            velocity_section.get("speed_range_m_s"),
+            "cluster_statistics.velocity.speed_range_m_s",
+        ),
+    )
+    statistics_plotting_section = _mapping(
+        statistics_section.get("plotting", {}),
+        {"dpi", "relative_dispersion_yscale"},
+        "cluster_statistics.plotting",
+    )
+    relative_dispersion_yscale = _nonempty_string(
+        statistics_plotting_section.get("relative_dispersion_yscale", "log"),
+        "cluster_statistics.plotting.relative_dispersion_yscale",
+    ).lower()
+    if relative_dispersion_yscale not in {"linear", "log"}:
+        raise ValueError(
+            "cluster_statistics.plotting.relative_dispersion_yscale must be linear or log"
+        )
+    statistics_plotting = ClusterStatisticsPlottingConfig(
+        _positive_integer(
+            statistics_plotting_section.get("dpi", 150),
+            "cluster_statistics.plotting.dpi",
+        ),
+        relative_dispersion_yscale,
+    )
+    raw_statistics_overrides = statistics_section.get("array_overrides", {})
+    if not isinstance(raw_statistics_overrides, dict):
+        raise ValueError("cluster_statistics.array_overrides must be a mapping")
+    statistics_overrides: dict[int, TimeWindowConfig] = {}
+    for raw_key, raw_value in raw_statistics_overrides.items():
+        array_id = _parse_array_key(raw_key, "cluster_statistics.array_overrides")
+        section = _mapping(
+            raw_value, {"time"}, f"cluster_statistics.array_overrides.{raw_key}",
+        )
+        statistics_overrides[array_id] = _parse_time(
+            section.get("time", {}),
+            f"cluster_statistics.array_overrides.{raw_key}.time",
+        )
+    cluster_statistics = ClusterStatisticsConfig(
+        _boolean(statistics_section.get("enabled", False), "cluster_statistics.enabled"),
+        statistics_time,
+        _boolean(
+            statistics_section.get("stop_on_member_loss", False),
+            "cluster_statistics.stop_on_member_loss",
+        ),
+        _parse_percentiles(
+            statistics_section.get("percentiles", [0, 25, 50, 75, 100]),
+            "cluster_statistics.percentiles",
+        ),
+        velocity,
+        statistics_plotting,
+        statistics_overrides,
+    )
     return PostprocessingConfig(
         source_path, trajectory_path, dataset_label, coordinate_method,
-        output_directory, arrays, trajectory_plotting,
+        output_directory, arrays, trajectory_plotting, cluster_statistics,
     )

@@ -190,6 +190,7 @@ class EventPresentation:
 _EVENT_TITLES = {
     "single_edge_ambiguous": "Ambiguous high-speed edge",
     "local_spike_or_short_block": "Confirmed speed-cure repair",
+    "automatic_new_side_speed_thinning": "Automatic later-side speed thinning",
     "persistent_excursion": "Persistent excursion",
     "boundary_or_insufficient_context": "Timing or boundary-limited anomaly",
     "repeated_position": "Exact repeated position",
@@ -216,6 +217,8 @@ _REASON_TEXT = {
         "This observation arrived too soon after the last retained observation and was removed automatically.",
     "bidirectionally_confirmed_time_bounded_excursion_cure":
         "Forward and backward searches found the same smallest time-bounded block whose removal cures the speed anomaly.",
+    "automatic_new_side_speed_thinning":
+        "After bounded cures failed, automatic mode preserved the established older track and removed later observations until the surviving speed returned to the configured threshold.",
     "unique_endpoint_speed_cure":
         "Only one endpoint removal cures the high-speed edge; local speed statistics rank the repaired bridge without vetoing it.",
     "automatic_boundary_endpoint_speed_cure":

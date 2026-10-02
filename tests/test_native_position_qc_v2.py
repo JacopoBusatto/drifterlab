@@ -81,7 +81,7 @@ def test_block_beyond_elapsed_time_limit_and_uncured_single_edge_remain_unresolv
     assert not single.final_position_status.eq("rejected").any()
 
 
-def test_aggressive_solver_expands_only_to_configured_removal_limit():
+def test_aggressive_solver_falls_back_to_unbounded_new_side_thinning():
     values = [0, .001, .002, .20, .201, .202, .203, .204, .205, .003, .004, .005]
     limited = run_native_position_qc(
         trajectory(values), drogue(),
@@ -91,8 +91,16 @@ def test_aggressive_solver_expands_only_to_configured_removal_limit():
         ),
         resolution_policy="aggressive",
     )
-    assert not limited.final_position_status.eq("rejected").any()
-    assert limited.point_auto_reason.eq("automatic_keep_removal_limit_reached").any()
+    rejected = limited.loc[limited.final_position_status.eq("rejected")]
+    assert rejected.source_obs_index.tolist() == list(range(3, 9))
+    assert rejected.point_auto_reason.eq("automatic_new_side_speed_thinning").all()
+    assert rejected.point_auto_status.eq("automatic_new_side_reject").all()
+    evidence = json.loads(rejected.iloc[0].forward_result_json)
+    assert evidence["elapsed_time_limit_applied"] is False
+    assert evidence["removal_point_limit_applied"] is False
+    assert evidence["termination"] == "speed_at_or_below_threshold"
+    assert evidence["bridge_speed"] <= 2
+    assert not limited.loc[limited.final_position_valid, "high_speed_flag"].any()
     assert not limited.final_position_status.isin(["unresolved", "uncertain"]).any()
 
     cured = run_native_position_qc(
@@ -106,6 +114,25 @@ def test_aggressive_solver_expands_only_to_configured_removal_limit():
     assert cured.loc[cured.final_position_status.eq("rejected"), "source_obs_index"].tolist() == list(
         range(3, 9)
     )
+    assert cured.loc[
+        cured.final_position_status.eq("rejected"), "point_auto_reason"
+    ].eq("bidirectionally_confirmed_time_bounded_excursion_cure").all()
+
+
+def test_aggressive_new_side_fallback_can_remove_a_persistent_tail():
+    result = run_native_position_qc(
+        trajectory([0, .001, .002, .03, .031, .032]), drogue(),
+        position_config=NativePositionConfig(speed_threshold_m_s=2),
+        resolution_policy="aggressive",
+    )
+
+    rejected = result.loc[result.final_position_status.eq("rejected")]
+    assert rejected.source_obs_index.tolist() == [3, 4, 5]
+    assert rejected.point_auto_reason.eq("automatic_new_side_speed_thinning").all()
+    evidence = json.loads(rejected.iloc[0].forward_result_json)
+    assert evidence["termination"] == "retained_segment_end"
+    assert evidence["reconnect"] is None
+    assert not result.loc[result.final_position_valid, "high_speed_flag"].any()
 
 
 def test_aggressive_equal_size_cures_use_vector_acceleration_and_are_deterministic():

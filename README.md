@@ -16,6 +16,8 @@ python -m venv .venv
 
 For the complete operational sequence, review checkpoints, command-line flags,
 and important YAML choices, see [running the complete workflow](docs/running_the_workflow.md).
+The implemented within-array metrics and their equations are documented in
+[cluster-statistics methodology](docs/cluster_statistics_methodology.md).
 
 Run drogue detection/review first, followed by native-position QC and then
 reconstruction:

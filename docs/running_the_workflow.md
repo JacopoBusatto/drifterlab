@@ -129,7 +129,9 @@ drifterlab-position-qc $positionConfig --manual
 Mode behavior:
 
 - `--automatic` uses the aggressive deterministic resolution policy and never
-  opens a GUI.
+  opens a GUI. After bounded cures fail, an established older trajectory is
+  preserved while later observations are removed until surviving speed returns
+  to the configured threshold.
 - `--semiautomatic` uses the conservative policy and opens pending temporal,
   timing, geometry, and decision-conflict events.
 - `--manual` uses the same conservative policy and exposes completed reviewable
@@ -146,7 +148,8 @@ Important YAML controls are:
 - `position_qc.minimum_local_dt_seconds` and `max_local_gap_seconds`: the timing
   range eligible for local geometry decisions;
 - `position_qc.speed_threshold_m_s`: physical speed threshold;
-- `position_qc.max_automatic_removal_points`: bounded repair size;
+- `position_qc.max_automatic_removal_points`: bounded repair size before the
+  aggressive automatic new-side fallback;
 - local baseline, endpoint, bridge-warning, and ambiguity thresholds;
 - reviewer context and event-merging settings.
 

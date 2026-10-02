@@ -204,8 +204,16 @@ R_g^2(t)=\frac{1}{N(t)}\sum_i
 \left|\mathbf{x}_i(t)-\overline{\mathbf{x}}(t)\right|^2,
 $
 
-convex-hull area, nearest-neighbor distances, and the minimum, median, mean, and
-upper quantiles of within-array pair separation.
+convex-hull area, normalized convex-hull area
+
+$$
+\frac{A(t)}{A(t_0)},
+$$
+
+nearest-neighbor distances, and the minimum, median, mean, and upper quantiles of
+within-array pair separation. In the implemented cluster statistics, `t₀` is
+the first admitted timestamp with a finite hull; a zero initial hull makes the
+ratio undefined rather than infinite.
 
 ### 5.4 Shape, elongation, and orientation
 
@@ -221,15 +229,31 @@ From its eigenvalues and eigenvectors, calculate:
 
 - major- and minor-axis scales;
 - major-axis orientation;
-- aspect ratio
+- eigenvalue ratio
 
 $
-\alpha(t)=\frac{\lambda_{\min}}{\lambda_{\max}}.
+\rho_\lambda(t)=\frac{\lambda_{\min}}{\lambda_{\max}},
 $
 
-Values near one indicate a relatively isotropic configuration; values near zero
-indicate strong elongation. Line deployments are expected to begin with small
-aspect ratio and require special care in two-dimensional gradient estimates.
+and aspect ratio
+
+$
+\alpha(t)=\sqrt{\frac{\lambda_{\min}}{\lambda_{\max}}}.
+$
+
+Both ratios lie between zero and one. Values near one indicate a relatively
+isotropic configuration; values near zero indicate strong elongation. The
+eigenvalue ratio is the square of the aspect ratio, and the two names will not be
+used interchangeably. Line deployments are expected to begin with small aspect
+ratio and require special care in two-dimensional gradient estimates. A
+zero-size or numerically isotropic covariance has no identifiable major-axis
+orientation.
+
+The first implementation of cluster-level baseline statistics is descriptive
+and graphical. Comparisons are restricted to clusters within the same array and
+do not demonstrate statistical equivalence. Hypothesis tests, scalar similarity
+scores, automatic grouping, separation-binned structure functions, FSLE, and
+front, eddy, or convergence detection remain later stages.
 
 ## 6. Stage 2B: velocity statistics
 
@@ -457,17 +481,27 @@ with explicit initial-separation and encounter definitions.
 
 ### 9.1 Relative dispersion
 
-Calculate
+For each pair, define the fixed-frame relative-position vector
+
+$
+\mathbf{R}_{ij}(t)=\mathbf{X}_j(t)-\mathbf{X}_i(t),
+$
+
+and calculate
 
 $
 D^2(t)=\left\langle
-[r_{ij}(t)-r_{ij}(0)]^2
+\left|\mathbf{R}_{ij}(t)-\mathbf{R}_{ij}(t_{ij0})\right|^2
 \right\rangle
 $
 
-for documented initial-separation classes. Examine ballistic and Richardson-like
-intervals, compensated curves, pair-retention counts, and sensitivity to the
-definition of `t = 0`.
+for documented initial-separation classes. Here `t_ij0` is the declared first
+simultaneous valid pair time for the analysis. This vector statistic retains
+changes in both magnitude and orientation. The distinct scalar quantity
+`[r_ij(t)-r_ij(t_ij0)]²`, if used, must be named radial-separation change and
+must not be labelled `D²` or relative dispersion. Examine ballistic and
+Richardson-like intervals, compensated curves, pair-retention counts, and
+sensitivity to the definition of the initial time.
 
 ### 9.2 Finite-size Lyapunov exponent
 
