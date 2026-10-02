@@ -137,6 +137,7 @@ def test_config_defaults_and_resolved_paths(tmp_path):
     assert config.effective()["trajectory_plotting"]["color_by"] == "cluster_id"
     assert not config.cluster_statistics.enabled
     assert config.cluster_statistics.percentiles == (0, 25, 50, 75, 100)
+    assert not config.cluster_statistics.velocity.share_probability_density_y_axis
 
 
 @pytest.mark.parametrize(
@@ -149,6 +150,8 @@ def test_config_defaults_and_resolved_paths(tmp_path):
         ({"velocity": {"histogram_bins": 0}}, "positive integer"),
         ({"velocity": {"difference_interval_minutes": 0}}, "finite and positive"),
         ({"velocity": {"speed_range_m_s": [-1, 2]}}, "0 <= minimum"),
+        ({"velocity": {"share_probability_density_y_axis": "false"}},
+         "must be true or false"),
         ({"plotting": {"relative_dispersion_yscale": "symlog"}}, "linear or log"),
         ({"array_overrides": {"array_001": {"stop_on_member_loss": True}}},
          "Unknown cluster_statistics.array_overrides"),
@@ -261,6 +264,7 @@ def test_cluster_statistics_runs_without_trajectory_plotting_and_declares_output
             "difference_interval_minutes": 10,
             "histogram_bins": 5,
             "speed_range_m_s": None,
+            "share_probability_density_y_axis": True,
         },
         "plotting": {"dpi": 30, "relative_dispersion_yscale": "log"},
         "array_overrides": {},
@@ -288,6 +292,9 @@ def test_cluster_statistics_runs_without_trajectory_plotting_and_declares_output
     assert [entry["array_id"] for entry in entries] == [1, 2]
     assert all(len(entry["figures"]) == 6 and len(entry["tables"]) == 2 for entry in entries)
     assert entries[0]["projection"]["origin_method"].startswith("wrap-safe spherical mean")
+    assert manifest["effective_configuration"]["cluster_statistics"]["velocity"][
+        "share_probability_density_y_axis"
+    ] is True
     assert manifest["effective_configuration"]["cluster_statistics"]["percentiles"] == [
         0.0, 12.5, 50.0, 100.0,
     ]

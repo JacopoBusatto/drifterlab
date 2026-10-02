@@ -84,6 +84,7 @@ class ClusterVelocityConfig:
     difference_interval_minutes: float
     histogram_bins: int
     speed_range_m_s: tuple[float, float] | None
+    share_probability_density_y_axis: bool
 
 
 @dataclass(frozen=True)
@@ -186,6 +187,9 @@ class PostprocessingConfig:
                     "speed_range_m_s": (
                         None if statistics.velocity.speed_range_m_s is None
                         else list(statistics.velocity.speed_range_m_s)
+                    ),
+                    "share_probability_density_y_axis": (
+                        statistics.velocity.share_probability_density_y_axis
                     ),
                 },
                 "plotting": {
@@ -547,7 +551,10 @@ def load_postprocessing_config(path: str | Path) -> PostprocessingConfig:
     )
     velocity_section = _mapping(
         statistics_section.get("velocity", {}),
-        {"difference_interval_minutes", "histogram_bins", "speed_range_m_s"},
+        {
+            "difference_interval_minutes", "histogram_bins", "speed_range_m_s",
+            "share_probability_density_y_axis",
+        },
         "cluster_statistics.velocity",
     )
     velocity = ClusterVelocityConfig(
@@ -562,6 +569,10 @@ def load_postprocessing_config(path: str | Path) -> PostprocessingConfig:
         _parse_speed_range(
             velocity_section.get("speed_range_m_s"),
             "cluster_statistics.velocity.speed_range_m_s",
+        ),
+        _boolean(
+            velocity_section.get("share_probability_density_y_axis", False),
+            "cluster_statistics.velocity.share_probability_density_y_axis",
         ),
     )
     statistics_plotting_section = _mapping(

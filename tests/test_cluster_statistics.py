@@ -24,7 +24,7 @@ def _config(*, stop: bool = False, interval: float = 20) -> ClusterStatisticsCon
         time=TimeWindowConfig(np.datetime64("NaT", "ns"), np.datetime64("NaT", "ns")),
         stop_on_member_loss=stop,
         percentiles=(0.0, 25.0, 50.0, 75.0, 100.0),
-        velocity=ClusterVelocityConfig(interval, 10, None),
+        velocity=ClusterVelocityConfig(interval, 10, None, False),
         plotting=ClusterStatisticsPlottingConfig(50, "linear"),
         array_overrides={},
     )

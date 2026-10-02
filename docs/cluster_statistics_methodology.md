@@ -287,7 +287,9 @@ Neither calculation combines clusters.
 Each array receives six figures:
 
 1. `velocity_distributions.png`: absolute and internal platform-speed
-   distributions with common bins across clusters in the array;
+   distributions with common bins across clusters in the array; probability-
+   density y-axes are independently autoscaled by default, or may share one
+   array-wide limit through `share_probability_density_y_axis`;
 2. `absolute_displacement.png`: member displacement envelopes and means plus
    centroid displacement;
 3. `pair_separation.png`: pair-separation envelopes and means;

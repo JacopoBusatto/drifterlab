@@ -175,7 +175,8 @@ def _velocity_distributions(
     bins = np.linspace(lower, upper, config.velocity.histogram_bins + 1)
     rows = len(result.cluster_ids)
     figure, axes = plt.subplots(
-        rows, 1, figsize=(10, max(3.2, 2.7 * rows)), sharex=True, sharey=True,
+        rows, 1, figsize=(10, max(3.2, 2.7 * rows)), sharex=True,
+        sharey=config.velocity.share_probability_density_y_axis,
         squeeze=False,
     )
     for row, cluster_id in enumerate(result.cluster_ids):

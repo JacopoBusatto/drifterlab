@@ -61,6 +61,7 @@ cluster_statistics:
     difference_interval_minutes: 30
     histogram_bins: 50
     speed_range_m_s: null       # or [minimum, maximum], in m/s
+    share_probability_density_y_axis: false
   plotting:
     dpi: 150
     relative_dispersion_yscale: log  # linear or log
@@ -193,7 +194,10 @@ the simultaneous valid cluster-mean velocity.
 `speed_range_m_s` affects histogram display only. CSV statistics always use all
 finite admitted speed samples. When the range is null, one set of bins is derived
 from all absolute and internal speed samples in the current array so cluster
-panels remain comparable.
+panels remain comparable. With `share_probability_density_y_axis: false`, each
+cluster panel autoscales its probability-density y-axis so a narrow peak does not
+flatten other panels. Set it to `true` to use one common y-limit for all clusters
+in the array when direct density-height comparison is more important.
 
 ## Extent, shape, and displacement
 

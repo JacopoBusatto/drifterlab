@@ -85,6 +85,9 @@ cluster_statistics:
     difference_interval_minutes: 30
     histogram_bins: 50
     speed_range_m_s: null
+    # false autoscales probability density per cluster panel; true uses one
+    # common probability-density y-axis for all clusters in an array.
+    share_probability_density_y_axis: false
 
   plotting:
     dpi: 150
