@@ -1,0 +1,35 @@
+input:
+  # Authoritative grouped pair product. Pair membership is not recomputed.
+  pairs_zarr: ../../data/pairs/arcterx_chance/pairs.zarr
+  coordinate_method: linear
+
+analysis:
+  # Thresholds are anchor_scale_km * rho^n, restricted to this range. Using
+  # 1 km as the anchor guarantees an exact 1 km threshold for the reference line.
+  minimum_scale_km: 0.0625
+  maximum_scale_km: 128
+  rho: 1.4142135623730951
+  anchor_scale_km: 1
+
+  # A first-passage clock never crosses or restarts after a missing sample or
+  # a time increment different from this declared trajectory cadence.
+  expected_interval_minutes: 5
+
+  # Numerical rows retain every scale. Figures show a scale only when at least
+  # this many pairs reach its upper threshold.
+  minimum_reached_pairs_per_scale: 3
+
+plotting:
+  dpi: 150
+  x_range_km: null
+  y_range_day_inverse: null
+  # Draw lambda +/- one nominal overshoot-aware standard error. Shared-platform
+  # pairs are correlated, so these bars are not confidence intervals.
+  standard_error_bars: true
+  reference_slope:
+    enabled: true
+    exponent: -0.6666666666666666
+    label: delta^-2/3
+
+output:
+  directory: ../../data/fsle/arcterx_candidate

@@ -33,6 +33,7 @@ SCIENCE
 | Trajectory product | Reconstructed rows | Lean candidate Zarr and per-platform build report | reconstruction workflow | Implemented |
 | Plotting | Validated trajectory Zarr | Overview, combined/per-array exact-start, and optional reconstruction-check PNGs | reconstruction command | Implemented |
 | Candidate pairs | Reconstructed trajectories | Grouped pair Zarr plus diagnostic catalog | `drifterlab.pairs` and pair workflow | Implemented |
+| FSLE spectra | Grouped pair Zarr | First-passage Parquet, spectra CSV, per-array figures, manifest | `drifterlab.fsle` and FSLE workflow | Implemented |
 | Pair science | Grouped pairs | Pair analysis products | future packages | Planned |
 
 The position Parquets are the detailed QC audit record. The trajectory Zarr does

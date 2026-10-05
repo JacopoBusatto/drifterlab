@@ -117,3 +117,7 @@ drifterlab-pairs configs/arcterx/pairs.local.yml
 
 Use `--overwrite` only to atomically replace an existing bundle. Input coordinate
 values and valid lifetimes are never modified.
+
+The completed pair Zarr can be passed directly to `drifterlab-fsle`. That stage
+filters the retained `same_array` and `same_cluster` metadata without rebuilding
+pair membership; see [overshoot-aware FSLE](fsle.md).

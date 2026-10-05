@@ -18,6 +18,8 @@ For the complete operational sequence, review checkpoints, command-line flags,
 and important YAML choices, see [running the complete workflow](docs/running_the_workflow.md).
 The implemented within-array metrics and their equations are documented in
 [cluster-statistics methodology](docs/cluster_statistics_methodology.md).
+The pair-conditioned separation-scale analysis is documented in
+[overshoot-aware FSLE](docs/fsle.md).
 
 Run drogue detection/review first, followed by native-position QC and then
 reconstruction:
@@ -33,6 +35,7 @@ drifterlab-reconstruct-trajectories configs/arcterx/trajectory_reconstruction.lo
 # Add --overwrite only when intentionally replacing a stale reconstruction.
 
 drifterlab-pairs configs/arcterx/pairs.local.yml
+drifterlab-fsle configs/arcterx/fsle.local.yml
 ```
 
 Copy the tracked configurations before changing local data paths. Relative paths
@@ -132,6 +135,12 @@ metadata are retained. Its canonical fields use the selection representation,
 while all available native, linear, and spline coordinates remain explicitly
 available for later analysis. See
 [candidate encounter pairs](docs/candidate_pairs.md).
+
+The FSLE workflow consumes that pair product without repeating pair selection. It
+uses observed shell-entry and shell-exit separations in an overshoot-aware
+discrete estimator, retains censored pair-scale outcomes, and publishes pooled
+within-cluster and individual-cluster spectra for each array. See
+[overshoot-aware FSLE](docs/fsle.md).
 
 ## Campaign-supplied QC diagnostics
 

@@ -267,6 +267,39 @@ Options and behavior:
 The output contains authoritative grouped trajectories in `pairs.zarr` and a
 compact `pair_catalog.csv`. See [candidate encounter pairs](candidate_pairs.md).
 
+## 6. Overshoot-aware FSLE
+
+FSLE reads the completed pair Zarr and does not search for pairs again. Its
+primary analysis filters the stored inventory to pairs whose members share both
+array and candidate-cluster assignments:
+
+```yaml
+input:
+  pairs_zarr: C:/path/to/pairs_chance/pairs.zarr
+  coordinate_method: linear
+analysis:
+  minimum_scale_km: 0.0625
+  maximum_scale_km: 128
+  rho: 1.4142135623730951
+  anchor_scale_km: 1
+  expected_interval_minutes: 5
+  minimum_reached_pairs_per_scale: 3
+plotting:
+  standard_error_bars: true
+```
+
+Run:
+
+```powershell
+drifterlab-fsle configs/arcterx/06_microSVP_fsle.local.yml
+```
+
+It atomically publishes the overshoot spectrum table with nominal standard
+errors, pair-scale first passages including censoring, a pooled same-cluster
+figure, one multi-line cluster figure per array, and a complete manifest. The
+standard-error bars are enabled by default and can be hidden with
+`plotting.standard_error_bars: false`. See [FSLE methodology](fsle.md).
+
 ## Command-line option summary
 
 | Command | Mode/option | Effect |
@@ -277,6 +310,7 @@ compact `pair_catalog.csv`. See [candidate encounter pairs](candidate_pairs.md).
 | `drifterlab-position-qc` | `--overwrite` | Force per-platform recomputation; retain review CSV |
 | `drifterlab-reconstruct-trajectories` | `--overwrite` | Validate a replacement before atomically replacing the bundle |
 | `drifterlab-pairs` | `--overwrite` | Atomically replace the pair bundle |
+| `drifterlab-fsle` | `--overwrite` | Atomically replace the FSLE output bundle |
 
 Every command supports `--help`, for example:
 

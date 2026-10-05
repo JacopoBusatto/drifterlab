@@ -511,12 +511,40 @@ $
 \delta_n=\delta_0\rho^n,
 $
 
-measure the first-passage time from `delta_n` to `rho delta_n` and calculate
+measure the discrete first-passage time from an observed shell entry at
+`delta_n` to the first later stored separation above `rho delta_n`. Retain the
+observed entry and exit separations so threshold overshoot is not discarded, and
+calculate
 
 $
 \lambda(\delta_n)=
-\frac{\ln\rho}{\left\langle T(\delta_n)\right\rangle}.
+\frac{\left\langle\ln\left[r_{out}/r_{in}\right]\right\rangle}
+{\left\langle T(\delta_n)\right\rangle}.
 $
+
+The calculation begins at the selected encounter, uses actual timestamps, and
+does not interpolate crossings or bridge missing coordinates or cadence gaps.
+Within each array, report one pair-weighted spectrum pooling all same-cluster
+pairs and separate spectra for each represented non-singleton cluster.
+
+For reached passages, report the duration-weighted standard error generalized
+to the observed overshoot:
+
+$
+\sigma_\lambda(\delta_n)=
+\sqrt{\frac{1}{M}\left[
+\frac{\left\langle g_i^2/T_i\right\rangle}{\left\langle T_i\right\rangle}
+-\lambda(\delta_n)^2
+\right]},
+\qquad
+g_i=\ln(r_{out,i}/r_{in,i}).
+$
+
+This reduces to the fixed-shell expression in `FSLE_error.pdf` when
+`g_i=ln(rho)`. Plot `lambda +/- sigma_lambda` as a nominal analytical error bar.
+Because pairs sharing platforms are correlated, do not interpret it as a
+confidence interval; platform- or cluster-level resampling remains necessary for
+dependence-aware inference.
 
 Test for:
 
