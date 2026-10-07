@@ -1,0 +1,82 @@
+input:
+  # Completed all-array, 15-minute, 12-day epsilon product. Copy this file to a
+  # local configuration and point it at the actual immutable run directory.
+  epsilon_run: ../../data/epsilon_analysis_poje/completed_epsilon_run
+
+selection:
+  arrays: all
+
+time:
+  window: maximum_configured
+
+figure4:
+  # Poje et al. selected a fixed cohort with r(0) < 300 m.
+  initial_pair_separation_maximum_m: 300
+  absolute_plot_end_days: 8
+  ballistic_fit_end_hours: 12
+  richardson_fit_start_days: 2
+  richardson_fit_end_days: 8
+  bootstrap:
+    replicates: 10000
+    confidence_level: 0.95
+    random_seed: 41723
+    unit: fixed_initial_pair_identity_synchronized_across_times
+  figure:
+    dpi: 160
+
+figure5:
+  separation_memory:
+    # Poje Figure 5a target-time groups; intervals are [start_day, end_day).
+    groups:
+      - id: days_1_2
+        start_day: 1
+        end_day: 2
+      - id: days_5_8
+        start_day: 5
+        end_day: 8
+      - id: days_9_12
+        start_day: 9
+        end_day: 12
+    similarity_bin_count: 100
+    correlation_time_fraction: 0.3333333333333333
+  lagrangian:
+    # Poje's dimensional constant in S_L^2 = C0 epsilon tau.
+    kolmogorov_constant: 6.5
+  figure:
+    dpi: 160
+
+figure6:
+  distributions:
+    # Poje reports rounded centers but not exact edges. Each target resolves to
+    # the nearest geometric bin in the immutable source epsilon configuration.
+    scales:
+      - {id: small_0250m, panel_group: small, target_center_m: 250}
+      - {id: small_0500m, panel_group: small, target_center_m: 500}
+      - {id: small_1000m, panel_group: small, target_center_m: 1000}
+      - {id: large_5000m, panel_group: large, target_center_m: 5000}
+      - {id: large_7000m, panel_group: large, target_center_m: 7000}
+      - {id: large_10000m, panel_group: large, target_center_m: 10000}
+    maximum_center_relative_difference: 0.1
+    normalized_increment_limit: 5
+    histogram_bin_count: 100
+    # Nonlinear least-squares fit to histogram density inside |delta_u_l/sigma| <= 1.5.
+    gaussian_core_maximum_absolute_normalized_increment: 1.5
+  figure:
+    dpi: 160
+
+figure7:
+  structure_functions:
+    # Poje's reported scaling-fit interval. Rossby references use the actual
+    # bin-mean midpoint latitude through f(phi) = 2 Omega sin(phi).
+    fit_minimum_separation_m: 100
+    fit_maximum_separation_m: 10000
+    panel_a_maximum_separation_m: 50000
+    panel_b_maximum_separation_m: 10000
+    rossby_reference_values: [1.0, 0.1]
+  figure:
+    # Signed ARCTERX results require symlog rather than Poje's positive log axis.
+    epsilon_linear_threshold_m2_s3: 0.00000001
+    dpi: 160
+
+output:
+  root: ../../data/poje_analysis

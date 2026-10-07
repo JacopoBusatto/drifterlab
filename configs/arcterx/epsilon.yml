@@ -1,0 +1,92 @@
+input:
+  # Common-grid schema-1.4 reconstruction product. Copy this file to a local
+  # configuration and point it at the reviewed campaign product.
+  trajectories: ../../data/reconstruction/arcterx_trajectories_candidate/trajectories.zarr
+  dataset_label: MicroSVP
+  # Exploratory pilots may opt into a candidate product. Production runs should
+  # leave this false and use a promoted scientific input.
+  allow_candidate_input: false
+
+selection:
+  # Array and cluster IDs are data selections, not constants in the algorithm.
+  arrays: [4]
+  clusters: all
+  pair_scope: within_cluster
+  # Required only by a future all_array mode. It must remain null here.
+  array_anchor: null
+
+activation:
+  minimum_active_members: 2  # integer >=2 or "all"
+  # These reference settings alone define fixed cluster activation anchors.
+  # Analysis reconstruction, source-gap, and speed-mask sensitivities reuse them.
+  reference:
+    position_method: linear
+    velocity_method: centered_difference
+    total_span_minutes: 30
+    maximum_source_gap_minutes: 30
+    require_full_stencil_support: true
+    speed_mask_m_s: null
+
+analysis:
+  position_method: linear  # linear, spline_15, spline_30, or spline_60
+  velocity_method: centered_difference
+  total_span_minutes: 30
+  # Select analyzed vector-velocity timestamps after calculating the derivative.
+  # This must be an integer multiple of the native five-minute grid. It does not
+  # average scalar speed. Use array_anchor only with pair_scope: all_array.
+  sample_cadence_minutes: 5
+  sample_phase_reference: activation_anchor
+  maximum_source_gap_minutes: 30
+  # Set false for an endpoint-only sensitivity that trusts reconstructed
+  # intervening positions and ignores source_gap_minutes.
+  require_full_stencil_support: true
+  speed_mask_m_s: null  # 1.0 is an optional sensitivity, not baseline QC
+  windows:
+    - {id: initial_0_6h, start_hour: 0, end_hour: 6}
+    - {id: initial_0_12h, start_hour: 0, end_hour: 12}
+  # Unknown until a quantitative MicroSVP accuracy is established.
+  minimum_reliable_separation_m: null
+
+separation_bins:
+  mode: geometric
+  minimum_m: 62.5
+  maximum_m: 128000
+  ratio: 1.4142135623730951
+  anchor_m: 1000
+  axis_scale: log
+
+support:
+  # Applied independently inside each temporal separation bin. Snapshot bins are
+  # always descriptive and never receive a temporal confidence interval.
+  observations: 12
+  unique_pairs: 3
+  platforms: 3
+  unique_utc: 12
+
+stage3:
+  enabled: true
+  uncertainty:
+    method: synchronized_utc_block_bootstrap
+    confidence_level: 0.95
+    replicates: 2000
+    random_seed: 41723
+    # The primary duration matches the total centered-derivative span. The
+    # 60-minute case is retained as a provisional dependence sensitivity.
+    primary_block_minutes: 30
+    sensitivity_block_minutes: [60]
+    minimum_contributing_blocks: 6
+    minimum_successful_replicate_fraction: 0.95
+  q_histogram:
+    # Explicit physical construction shared by every selected cluster/window.
+    # Out-of-range q remains counted in underflow/overflow fields.
+    maximum_absolute_m2_s3: 0.005
+    linear_threshold_m2_s3: 0.0000001
+    bins_per_decade: 6
+  figures:
+    dpi: 160
+    scatter_maximum_points: 20000
+    epsilon_linear_threshold_m2_s3: 0.0000001
+    heatmap_probability_maximum: 0.25
+
+output:
+  root: ../../data/epsilon_analysis

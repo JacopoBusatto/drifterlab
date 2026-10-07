@@ -311,6 +311,7 @@ standard-error bars are enabled by default and can be hidden with
 | `drifterlab-reconstruct-trajectories` | `--overwrite` | Validate a replacement before atomically replacing the bundle |
 | `drifterlab-pairs` | `--overwrite` | Atomically replace the pair bundle |
 | `drifterlab-fsle` | `--overwrite` | Atomically replace the FSLE output bundle |
+| `drifterlab-poje` | `--overwrite` | Atomically replace the same deterministic Poje-analysis bundle |
 
 Every command supports `--help`, for example:
 

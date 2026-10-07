@@ -20,6 +20,8 @@ The implemented within-array metrics and their equations are documented in
 [cluster-statistics methodology](docs/cluster_statistics_methodology.md).
 The pair-conditioned separation-scale analysis is documented in
 [overshoot-aware FSLE](docs/fsle.md).
+The trajectory-only Poje-method reproduction is documented in
+[Poje analysis](docs/poje_analysis/README.md).
 
 Run drogue detection/review first, followed by native-position QC and then
 reconstruction:

@@ -26,6 +26,9 @@ drifterlab-reconstruct-trajectories = "drifterlab.cli.reconstruct_trajectories:m
 drifterlab-pairs = "drifterlab.cli.pairs:main"
 drifterlab-fsle = "drifterlab.cli.fsle:main"
 drifterlab-postprocess = "drifterlab.cli.postprocess:main"
+drifterlab-epsilon = "drifterlab.cli.epsilon:main"
+drifterlab-epsilon-diagnostics = "drifterlab.cli.epsilon_diagnostics:main"
+drifterlab-poje = "drifterlab.cli.poje:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
