@@ -18,16 +18,22 @@ dependencies = [
 test = ["pytest>=8", "cartopy>=0.22"]
 diagnostics = ["matplotlib>=3.8"]
 plotting = ["cartopy>=0.22"]
+manual-qc = ["PySide6>=6.8,<6.9", "pyqtgraph>=0.14,<0.15"]
+gui-test = ["pytest-qt>=4.4,<5"]
 
 [project.scripts]
 drifterlab-drogue = "drifterlab.cli.drogue:main"
 drifterlab-position-qc = "drifterlab.cli.position_qc:main"
+drifterlab-manual-position-qc = "drifterlab.cli.manual_position_qc:main"
 drifterlab-reconstruct-trajectories = "drifterlab.cli.reconstruct_trajectories:main"
 drifterlab-pairs = "drifterlab.cli.pairs:main"
 drifterlab-fsle = "drifterlab.cli.fsle:main"
 drifterlab-postprocess = "drifterlab.cli.postprocess:main"
 drifterlab-epsilon = "drifterlab.cli.epsilon:main"
 drifterlab-epsilon-diagnostics = "drifterlab.cli.epsilon_diagnostics:main"
+drifterlab-analyze = "drifterlab.cli.analyze:main"
+drifterlab-import-supplied-qc = "drifterlab.cli.import_supplied_qc:main"
+drifterlab-compare-qc = "drifterlab.cli.compare_qc:main"
 drifterlab-poje = "drifterlab.cli.poje:main"
 
 [tool.setuptools.packages.find]

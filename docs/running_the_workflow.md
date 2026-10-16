@@ -16,6 +16,11 @@ python -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -e ".[test,plotting]"
 ```
 
+For the separate exhaustive manual trajectory reviewer, also install the Qt
+extra with `pip install -e ".[manual-qc]"`. That process reads raw positions and
+the resolved drogue endpoint but is independent of the native-position QC below;
+see [independent manual position QC](manual_position_qc.md).
+
 Activate it if command-line entry points are not already available:
 
 ```powershell
@@ -31,6 +36,8 @@ $configRoot = "configs/arcterx"
 
 $drogueConfig = "$configRoot/01_${dataset}_drogue_detection.local.yml"
 $positionConfig = "$configRoot/02_${dataset}_position_qc.local.yml"
+$manualConfig = "$configRoot/02_bis_microSVP_manual_position_qc.local.yml"  # MicroSVP only
+$analysisConfig = "$configRoot/v2/02a_microsvp_analysis_qc_5min.local.yml"  # grouped v2 only
 $reconstructionConfig = "$configRoot/03_${dataset}_trajectory_reconstruction.local.yml"
 $pairConfig = "$configRoot/04_${dataset}_pairs.local.yml"
 ```
@@ -48,10 +55,18 @@ After defining the variables above, the normal review-oriented sequence is:
 drifterlab-drogue $drogueConfig --automatic
 drifterlab-drogue $drogueConfig --semiautomatic
 
-# 2. Build conservative position QC and finish its review queue.
+# 2a. Existing event-based route: finish position QC, then run step 3.
 drifterlab-position-qc $positionConfig --semiautomatic
 
-# 3. Reconstruct all accepted trajectories.
+# 2b. Alternative independent exhaustive position/SST route. Its GUI builds
+# provisional or complete grouped v2 products; do not also run legacy step 3.
+drifterlab-manual-position-qc $manualConfig
+
+# Analyze the selected grouped product. This works on provisional or complete
+# Zarr stores according to input.allow_provisional in the analysis config.
+drifterlab-analyze $analysisConfig
+
+# 3. Reconstruct the event-based position-QC route only.
 drifterlab-reconstruct-trajectories $reconstructionConfig
 
 # 4. Build candidate pairs when needed.
@@ -221,7 +236,25 @@ scientific input. Full details are in
 Each `starting_positions__array_XX.png` map uses color for elapsed time from the
 array's first observed start and marker shape for candidate cluster number.
 
-## 5. Candidate pairs
+## 5. Unified grouped-product analysis
+
+The manual-QC route writes a grouped v2 Zarr directly, so it does not use the
+legacy spline reconstruction in section 4. Select one group, normally
+`qc_5min`, in `configs/arcterx/v2/02a_microsvp_analysis_qc_5min.local.yml` and run:
+
+```powershell
+drifterlab-analyze $analysisConfig
+```
+
+The command uses one velocity definition for trajectory statistics and epsilon,
+then atomically publishes the enabled modules under `01_trajectory_plots`,
+`02_trajectory_statistics`, `03_epsilon`, and `04_epsilon_diagnostics`.
+Provisional products require an explicit `input.allow_provisional: true`; use
+`false` for the final complete-QC run. See [unified analysis](unified_analysis.md)
+for product selection, the three velocity modes, pilot selections, diagnostics,
+and output provenance.
+
+## 6. Candidate pairs
 
 Pair selection can optionally require matching deployment-array or
 candidate-cluster assignments. Those identifiers are retained for both members in
@@ -267,7 +300,7 @@ Options and behavior:
 The output contains authoritative grouped trajectories in `pairs.zarr` and a
 compact `pair_catalog.csv`. See [candidate encounter pairs](candidate_pairs.md).
 
-## 6. Overshoot-aware FSLE
+## 7. Overshoot-aware FSLE
 
 FSLE reads the completed pair Zarr and does not search for pairs again. Its
 primary analysis filters the stored inventory to pairs whose members share both
@@ -309,6 +342,7 @@ standard-error bars are enabled by default and can be hidden with
 | `drifterlab-position-qc` | exactly one of `--automatic`, `--semiautomatic`, `--manual` | Select aggressive or conservative QC policy |
 | `drifterlab-position-qc` | `--overwrite` | Force per-platform recomputation; retain review CSV |
 | `drifterlab-reconstruct-trajectories` | `--overwrite` | Validate a replacement before atomically replacing the bundle |
+| `drifterlab-analyze` | `--overwrite` | Atomically replace the unified numbered analysis tree |
 | `drifterlab-pairs` | `--overwrite` | Atomically replace the pair bundle |
 | `drifterlab-fsle` | `--overwrite` | Atomically replace the FSLE output bundle |
 | `drifterlab-poje` | `--overwrite` | Atomically replace the same deterministic Poje-analysis bundle |

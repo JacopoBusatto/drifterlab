@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from hashlib import sha256
 import json
@@ -25,8 +25,10 @@ import zarr
 from drifterlab import __version__
 from drifterlab.reconstruction import (
     ArrayAssignment, InitialClusterResult, InitialClusterRule,
-    LinearGridTrack, PlatformReconstruction, assign_initial_clusters, assign_start_arrays,
-    reconstruct_platform, resample_linear_track, validate_cluster_rule,
+    LinearGridSeries, LinearGridTrack, PlatformReconstruction, assign_initial_clusters,
+    assign_start_arrays, reconstruct_platform, resample_linear_series,
+    resample_linear_track, validate_cluster_rule, RegularTrajectoryProduct, TrajectorySource,
+    build_platform_products,
 )
 from drifterlab.workflows.position import POSITION_QC_PRODUCT_LAYOUT, POSITION_QC_SCHEMA_VERSION
 
@@ -36,6 +38,8 @@ RECONSTRUCTION_ALGORITHM_VERSION = (
     "phase-ensemble-natural-cubic-native-grid-arrays-initial-clusters-v5"
 )
 POSITION_QC_METADATA_KEY = b"drifterlab_position_qc"
+MANUAL_QC_METADATA_KEY = b"drifterlab_manual_qc"
+SUPPORTED_MANUAL_QC_SCHEMA_VERSION = "2.2"
 ZARR_NAME = "trajectories.zarr"
 REPORT_NAME = "build_report.csv"
 REQUIRED_COLUMNS = {
@@ -43,6 +47,13 @@ REQUIRED_COLUMNS = {
     "final_position_status", "final_position_valid", "drogue_eligible",
     "valid_timestamp", "source_position_valid", "deployment_eligible", "segment_status",
     "final_drogue_status", "analysis_cutoff_time", "platform_qc_complete",
+}
+MANUAL_REQUIRED_COLUMNS = {
+    "platform_code", "source_sha256", "source_obs_index", "time",
+    "source_lon", "source_lat", "source_sst", "source_gps_pos_qual",
+    "source_gps_num_sat", "in_review_scope",
+    "manual_position_qc_status", "manual_position_qc_accepted",
+    "manual_sst_qc_status", "manual_sst_qc_accepted", "manual_qc_reviewed",
 }
 SUPPORTED_MAP_PROJECTIONS = {
     "PlateCarree", "Mercator", "SouthPolarStereo", "NorthPolarStereo", "Robinson",
@@ -135,6 +146,9 @@ class ReconstructionWorkflowConfig:
     output_directory: Path
     chunk_platform: int
     chunk_time: int
+    sst_enabled: bool
+    sst_maximum_gap_minutes: float | None
+    raw_include: bool
     plotting: TrajectoryPlottingConfig
 
     def effective(self) -> dict[str, Any]:
@@ -162,6 +176,12 @@ class ReconstructionWorkflowConfig:
                 "directory": str(self.output_directory),
                 "chunks": {"platform": self.chunk_platform, "time": self.chunk_time},
             },
+            "sst": {
+                "enabled": self.sst_enabled,
+                "interpolation": "linear",
+                "maximum_gap_minutes": self.sst_maximum_gap_minutes,
+            },
+            "raw": {"include": self.raw_include},
         }
 
 
@@ -206,6 +226,8 @@ class QCInventory:
     first_longitude: float
     first_latitude: float
     metadata: dict[str, Any]
+    raw_count: int = 0
+    sst_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -217,7 +239,47 @@ class AcceptedTrack:
     native_time: np.ndarray
     native_longitude: np.ndarray
     native_latitude: np.ndarray
+    sst_time: np.ndarray = field(default_factory=lambda: np.asarray([], dtype="datetime64[ns]"))
+    sst: np.ndarray = field(default_factory=lambda: np.asarray([], dtype=float))
+    raw_time: np.ndarray = field(default_factory=lambda: np.asarray([], dtype="datetime64[ns]"))
+    raw_longitude: np.ndarray = field(default_factory=lambda: np.asarray([], dtype=float))
+    raw_latitude: np.ndarray = field(default_factory=lambda: np.asarray([], dtype=float))
+    raw_sst: np.ndarray = field(default_factory=lambda: np.asarray([], dtype=float))
+    raw_gps_pos_qual: np.ndarray = field(default_factory=lambda: np.asarray([], dtype=float))
+    raw_gps_num_sat: np.ndarray = field(default_factory=lambda: np.asarray([], dtype=float))
+    raw_source_index: np.ndarray = field(default_factory=lambda: np.asarray([], dtype=np.int64))
+    raw_position_accepted: np.ndarray = field(default_factory=lambda: np.asarray([], dtype=bool))
+    raw_sst_accepted: np.ndarray = field(default_factory=lambda: np.asarray([], dtype=bool))
+    raw_position_status: np.ndarray = field(default_factory=lambda: np.asarray([], dtype="<U1"))
+    raw_sst_status: np.ndarray = field(default_factory=lambda: np.asarray([], dtype="<U1"))
+    native_source_index: np.ndarray = field(default_factory=lambda: np.asarray([], dtype=np.int64))
+    native_position_accepted: np.ndarray = field(default_factory=lambda: np.asarray([], dtype=bool))
+    native_position_status: np.ndarray = field(default_factory=lambda: np.asarray([], dtype="<U1"))
 
+def _build_track_products(
+    track: AcceptedTrack,
+    grids: dict[int, np.ndarray],
+) -> dict[str, RegularTrajectoryProduct]:
+    """Build analysis products from one validated finalized-QC track."""
+
+    raw = TrajectorySource(
+        time=track.native_time,
+        longitude=track.native_longitude,
+        latitude=track.native_latitude,
+    )
+    qc = TrajectorySource(
+        time=track.time,
+        longitude=track.longitude,
+        latitude=track.latitude,
+    )
+
+    return build_platform_products(
+        raw,
+        qc,
+        grids,
+        coverage_start=track.time[0],
+        coverage_end=track.time[-1],
+    )
 
 def _mapping(value: Any, allowed: set[str], name: str) -> dict[str, Any]:
     if not isinstance(value, dict):
@@ -279,7 +341,10 @@ def load_reconstruction_config(path: str | Path) -> ReconstructionWorkflowConfig
         data = yaml.safe_load(stream)
     data = _mapping(
         data,
-        {"input", "grid", "spline", "arrays", "initial_clustering", "output", "plotting"},
+        {
+            "input", "grid", "spline", "arrays", "initial_clustering", "output",
+            "sst", "raw", "plotting",
+        },
         "configuration",
     )
     source = _mapping(data.get("input", {}), {"directory", "pattern"}, "input")
@@ -308,6 +373,11 @@ def load_reconstruction_config(path: str | Path) -> ReconstructionWorkflowConfig
         raise ValueError("initial_clustering.array_overrides must be a mapping")
     output = _mapping(data.get("output", {}), {"directory", "chunks"}, "output")
     chunks = _mapping(output.get("chunks", {}), {"platform", "time"}, "output.chunks")
+    sst = _mapping(
+        data.get("sst", {}), {"enabled", "interpolation", "maximum_gap_minutes"},
+        "sst",
+    )
+    raw_output = _mapping(data.get("raw", {}), {"include"}, "raw")
     plotting = _mapping(
         data.get("plotting", {}),
         {
@@ -375,6 +445,15 @@ def load_reconstruction_config(path: str | Path) -> ReconstructionWorkflowConfig
         arrays.get("maximum_adjacent_start_gap_hours", 24),
         "arrays.maximum_adjacent_start_gap_hours",
     )
+    sst_enabled = _boolean(sst.get("enabled", False), "sst.enabled")
+    if sst.get("interpolation", "linear") != "linear":
+        raise ValueError("sst.interpolation must be linear")
+    raw_sst_gap = sst.get("maximum_gap_minutes", 15)
+    sst_maximum_gap_minutes = (
+        None if raw_sst_gap is None else
+        _positive_number(raw_sst_gap, "sst.maximum_gap_minutes")
+    )
+    raw_include = _boolean(raw_output.get("include", False), "raw.include")
 
     required_cluster_defaults = {
         "maximum_start_time_difference_seconds", "maximum_pair_distance_m",
@@ -605,7 +684,8 @@ def load_reconstruction_config(path: str | Path) -> ReconstructionWorkflowConfig
     return ReconstructionWorkflowConfig(
         input_directory, pattern, start, end, dt_minutes, tuple(periods), thresholds,
         maximum_adjacent_start_gap_hours, initial_clustering_config,
-        output_directory, *chunk_values, plotting_config,
+        output_directory, *chunk_values, sst_enabled, sst_maximum_gap_minutes,
+        raw_include, plotting_config,
     )
 
 
@@ -619,15 +699,201 @@ def _file_sha256(path: Path) -> str:
 
 def _parquet_metadata(path: Path) -> dict[str, Any]:
     try:
-        raw = (pq.read_metadata(path).metadata or {}).get(POSITION_QC_METADATA_KEY)
-        return json.loads(raw.decode()) if raw else {}
+        footer = pq.read_metadata(path).metadata or {}
+        position = footer.get(POSITION_QC_METADATA_KEY)
+        manual = footer.get(MANUAL_QC_METADATA_KEY)
+        if position and manual:
+            raise ValueError("file contains both position-QC and manual-QC metadata")
+        if manual:
+            result = json.loads(manual.decode())
+            result["_qc_kind"] = "manual"
+            return result
+        if position:
+            result = json.loads(position.decode())
+            result["_qc_kind"] = "position"
+            return result
+        return {}
     except Exception as exc:
-        raise ValueError(f"Cannot read position-QC metadata: {path}") from exc
+        raise ValueError(f"Cannot read QC metadata: {path}") from exc
+
+
+def _load_manual_track(
+    path: Path, before: str, metadata: dict[str, Any],
+) -> AcceptedTrack:
+    if metadata.get("schema_version") != SUPPORTED_MANUAL_QC_SCHEMA_VERSION:
+        raise ValueError(
+            f"Manual QC file has unsupported schema {metadata.get('schema_version')!r}: "
+            f"{path.name}"
+        )
+    required_footer = {
+        "algorithm_version", "config_sha256", "platform_code", "product_layout",
+        "resolution_policy", "source_sha256", "manual_qc_complete",
+    }
+    missing_footer = required_footer - set(metadata)
+    if missing_footer:
+        raise ValueError(
+            f"Manual QC footer is missing fields {sorted(missing_footer)}: {path.name}"
+        )
+    if metadata.get("manual_qc_complete") is not True:
+        raise ValueError(f"Manual QC footer is incomplete for {path.name}")
+    columns = set(pq.read_schema(path).names)
+    missing = MANUAL_REQUIRED_COLUMNS - columns
+    if missing:
+        raise ValueError(f"Manual QC file is missing columns {sorted(missing)}: {path.name}")
+    frame = pd.read_parquet(path, columns=sorted(MANUAL_REQUIRED_COLUMNS))
+    if _file_sha256(path) != before:
+        raise ValueError(f"Manual QC input changed while being read: {path}")
+    if frame.empty:
+        raise ValueError(f"Manual QC file is empty: {path.name}")
+
+    identities = frame.platform_code.astype(str).unique().tolist()
+    platform = str(metadata.get("platform_code", ""))
+    if len(identities) != 1 or identities[0] != platform or path.stem != platform:
+        raise ValueError(f"Manual QC filename, footer, and rows disagree: {path.name}")
+    source_hashes = frame.source_sha256.astype(str).unique().tolist()
+    if len(source_hashes) != 1 or source_hashes[0] != str(metadata.get("source_sha256", "")):
+        raise ValueError(f"Inconsistent native-source identity in {path.name}")
+    boolean_columns = (
+        "in_review_scope", "manual_position_qc_accepted",
+        "manual_sst_qc_accepted", "manual_qc_reviewed",
+    )
+    if any(frame[name].isna().any() for name in boolean_columns):
+        raise ValueError(f"Manual QC validity contains missing values for platform {platform}")
+    if frame.source_obs_index.isna().any() or frame.source_obs_index.duplicated().any():
+        raise ValueError(f"Manual QC source indices are missing or duplicated for {platform}")
+
+    in_scope = frame.in_review_scope.to_numpy(dtype=bool)
+    reviewed = frame.manual_qc_reviewed.to_numpy(dtype=bool)
+    if not reviewed[in_scope].all():
+        raise ValueError(f"Manual QC contains unreviewed in-scope observations for {platform}")
+    position_status = frame.manual_position_qc_status.fillna("").astype(str)
+    if not set(position_status).issubset({"accepted", "rejected", "outside_review_scope"}):
+        raise ValueError(f"Manual position status is invalid for platform {platform}")
+    position_accepted = frame.manual_position_qc_accepted.to_numpy(dtype=bool)
+    if not np.array_equal(
+        position_accepted,
+        in_scope & position_status.eq("accepted").to_numpy(),
+    ):
+        raise ValueError(f"Manual position status/validity disagree for platform {platform}")
+    selected = frame.loc[
+        position_accepted, ["time", "source_lon", "source_lat", "source_obs_index"],
+    ].copy()
+    selected["time"] = pd.to_datetime(selected.time, errors="coerce", utc=True)
+    if selected.time.isna().any():
+        raise ValueError(f"Accepted manual positions have invalid timestamps for {platform}")
+    selected = selected.sort_values(["time", "source_obs_index"], kind="stable")
+    if selected.time.duplicated().any() or len(selected) < 2:
+        raise ValueError(
+            f"Platform {platform} needs at least two accepted positions with unique timestamps"
+        )
+    lon = selected.source_lon.to_numpy(dtype=float)
+    lat = selected.source_lat.to_numpy(dtype=float)
+    if (not np.isfinite(lon).all() or not np.isfinite(lat).all()
+            or np.any((lon < -180) | (lon > 180))
+            or np.any((lat < -90) | (lat > 90))):
+        raise ValueError(f"Accepted manual positions contain invalid coordinates for {platform}")
+    time = selected.time.dt.tz_convert(None).to_numpy(dtype="datetime64[ns]")
+
+    parsed_all = pd.to_datetime(frame.time, errors="coerce", utc=True)
+    all_lon = pd.to_numeric(frame.source_lon, errors="coerce").to_numpy(dtype=float)
+    all_lat = pd.to_numeric(frame.source_lat, errors="coerce").to_numpy(dtype=float)
+    coordinate_valid = (
+        np.isfinite(all_lon) & np.isfinite(all_lat)
+        & (all_lon >= -180) & (all_lon <= 180)
+        & (all_lat >= -90) & (all_lat <= 90)
+    )
+    native = frame.loc[
+        in_scope & parsed_all.notna().to_numpy() & coordinate_valid,
+        [
+            "time",
+            "source_lon",
+            "source_lat",
+            "source_obs_index",
+            "manual_position_qc_accepted",
+            "manual_position_qc_status",
+        ],
+    ].copy()
+    native["time"] = pd.to_datetime(native.time, errors="coerce", utc=True)
+    native = native.loc[
+        native.time.between(
+            pd.Timestamp(time[0], tz="UTC"), pd.Timestamp(time[-1], tz="UTC"),
+            inclusive="both",
+        )
+    ]
+    native = native.sort_values(
+        ["time", "manual_position_qc_accepted", "source_obs_index"],
+        ascending=[True, False, True], kind="stable",
+    ).drop_duplicates("time", keep="first")
+    if len(native) < 2:
+        raise ValueError(f"Platform {platform} has fewer than two native manual fixes")
+    native_time = native.time.dt.tz_convert(None).to_numpy(dtype="datetime64[ns]")
+    native_lon = native.source_lon.to_numpy(dtype=float)
+    native_lat = native.source_lat.to_numpy(dtype=float)
+    if native_time[0] != time[0] or native_time[-1] != time[-1]:
+        raise ValueError(f"Native manual positions do not bracket the accepted lifespan for {platform}")
+
+    sst_status = frame.manual_sst_qc_status.fillna("").astype(str)
+    if not set(sst_status).issubset({
+        "accepted", "rejected", "missing", "invalid_time", "outside_review_scope",
+    }):
+        raise ValueError(f"Manual SST status is invalid for platform {platform}")
+    sst_accepted = frame.manual_sst_qc_accepted.to_numpy(dtype=bool)
+    if not np.array_equal(sst_accepted, in_scope & sst_status.eq("accepted").to_numpy()):
+        raise ValueError(f"Manual SST status/validity disagree for platform {platform}")
+    sst_selected = frame.loc[
+        sst_accepted, ["time", "source_sst", "source_obs_index"],
+    ].copy()
+    sst_selected["time"] = pd.to_datetime(sst_selected.time, errors="coerce", utc=True)
+    sst_selected["source_sst"] = pd.to_numeric(
+        sst_selected.source_sst, errors="coerce",
+    )
+    if sst_selected.time.isna().any() or not np.isfinite(sst_selected.source_sst).all():
+        raise ValueError(f"Accepted manual SST contains invalid values for {platform}")
+    sst_selected = sst_selected.sort_values(
+        ["time", "source_obs_index"], kind="stable",
+    )
+    if sst_selected.time.duplicated().any():
+        raise ValueError(f"Accepted manual SST timestamps are duplicated for {platform}")
+    sst_time = sst_selected.time.dt.tz_convert(None).to_numpy(dtype="datetime64[ns]")
+    sst_values = sst_selected.source_sst.to_numpy(dtype=float)
+
+    raw = frame.loc[in_scope].sort_values("source_obs_index", kind="stable")
+    raw_time = pd.to_datetime(raw.time, errors="coerce", utc=True).dt.tz_convert(None).to_numpy(
+        dtype="datetime64[ns]",
+    )
+    raw_sst = pd.to_numeric(raw.source_sst, errors="coerce").to_numpy(dtype=float)
+    raw_gps_pos_qual = pd.to_numeric(
+        raw.source_gps_pos_qual, errors="coerce",
+    ).to_numpy(dtype=float)
+    raw_gps_num_sat = pd.to_numeric(
+        raw.source_gps_num_sat, errors="coerce",
+    ).to_numpy(dtype=float)
+    inventory = QCInventory(
+        path.resolve(), before, platform, source_hashes[0], time[0], time[-1], len(time),
+        len(native_time), float(lon[0]), float(lat[0]), metadata,
+        raw_count=len(raw), sst_count=len(sst_time),
+    )
+    return AcceptedTrack(
+        inventory, time, lon, lat, native_time, native_lon, native_lat,
+        sst_time, sst_values, raw_time,
+        raw.source_lon.to_numpy(dtype=float), raw.source_lat.to_numpy(dtype=float), raw_sst,
+        raw_gps_pos_qual, raw_gps_num_sat,
+        raw.source_obs_index.to_numpy(dtype=np.int64),
+        raw.manual_position_qc_accepted.to_numpy(dtype=bool),
+        raw.manual_sst_qc_accepted.to_numpy(dtype=bool),
+        raw.manual_position_qc_status.fillna("").astype(str).to_numpy(),
+        raw.manual_sst_qc_status.fillna("").astype(str).to_numpy(),
+        native.source_obs_index.to_numpy(dtype=np.int64),
+        native.manual_position_qc_accepted.to_numpy(dtype=bool),
+        native.manual_position_qc_status.astype(str).to_numpy(),
+    )
 
 
 def _load_track(path: Path) -> AcceptedTrack:
     before = _file_sha256(path)
     metadata = _parquet_metadata(path)
+    if metadata.get("_qc_kind") == "manual":
+        return _load_manual_track(path, before, metadata)
     if metadata.get("schema_version") != POSITION_QC_SCHEMA_VERSION:
         raise ValueError(
             f"Position QC file has unsupported schema {metadata.get('schema_version')!r}; "
@@ -1125,6 +1391,8 @@ def _create_store(
         "longitude_native", "latitude_native", "native_source_gap_minutes",
         "longitude_linear", "latitude_linear", "source_gap_minutes",
     ]
+    if config.sst_enabled:
+        variables.extend(["sst_linear", "sst_source_gap_minutes"])
     for period in config.periods_minutes:
         variables.extend([f"longitude_spline_{period}", f"latitude_spline_{period}"])
     for name in variables:
@@ -1132,20 +1400,98 @@ def _create_store(
             name, shape=(len(platforms), len(grid)), chunks=chunks,
             dtype="f8", fill_value=np.nan, compressor=compressor,
         )
-        if name in {"source_gap_minutes", "native_source_gap_minutes"}:
+        if name in {
+            "source_gap_minutes", "native_source_gap_minutes", "sst_source_gap_minutes",
+        }:
             native = name.startswith("native_")
             array.attrs.update({
                 "_ARRAY_DIMENSIONS": ["platform", "time"], "coordinates": "platform_id",
                 "units": "minutes",
                 "long_name": (
+                    "Separation of accepted manual-SST observations bracketing each grid point; zero at an exact observation"
+                    if name == "sst_source_gap_minutes" else
                     "Separation of source-valid pre-point-QC fixes bracketing each native-grid point; zero at an exact source fix"
                     if native else
                     "Separation of accepted QC fixes bracketing each reconstructed point; zero at an exact accepted fix"
                 ),
             })
+        elif name == "sst_linear":
+            array.attrs.update({
+                "_ARRAY_DIMENSIONS": ["platform", "time"],
+                "coordinates": "platform_id",
+                "standard_name": "sea_surface_temperature",
+                "units": "degree_Celsius",
+                "interpolation_method": "linear",
+                "maximum_source_gap_minutes": config.sst_maximum_gap_minutes,
+                "comment": "No endpoint extrapolation; values across wider source gaps are masked",
+            })
         else:
             coordinate, method = name.split("_", 1)
             array.attrs.update(_position_attrs(method, coordinate))
+    if config.raw_include:
+        maximum_raw = max(item.raw_count for item in inventories)
+        if maximum_raw < 1:
+            raise ValueError("raw.include requires manual-QC inputs with reviewed raw observations")
+        raw = root.create_group("raw")
+        raw.attrs.update({
+            "description": "Exact in-scope raw observations and independent manual decisions",
+            "ragged_layout": "padded two-dimensional array with observation_count per platform",
+        })
+        raw_platform = raw.create_dataset(
+            "platform_id", data=np.asarray(platforms, dtype=f"<U{platform_width}"),
+            chunks=(min(config.chunk_platform, len(platforms)),), compressor=compressor,
+        )
+        raw_platform.attrs.update({"_ARRAY_DIMENSIONS": ["platform"], "cf_role": "trajectory_id"})
+        raw_observation = raw.create_dataset(
+            "raw_observation", data=np.arange(maximum_raw, dtype=np.int64),
+            chunks=(min(config.chunk_time, maximum_raw),), compressor=compressor,
+        )
+        raw_observation.attrs.update({"_ARRAY_DIMENSIONS": ["raw_observation"]})
+        observation_count = raw.create_dataset(
+            "observation_count",
+            data=np.asarray([item.raw_count for item in inventories], dtype=np.int64),
+            chunks=(min(config.chunk_platform, len(platforms)),), compressor=compressor,
+            fill_value=None,
+        )
+        observation_count.attrs.update({"_ARRAY_DIMENSIONS": ["platform"]})
+        raw_chunks = (
+            min(config.chunk_platform, len(platforms)), min(config.chunk_time, maximum_raw),
+        )
+        specifications = {
+            "time": ("datetime64[ns]", None),
+            "source_obs_index": ("i8", -1),
+            "longitude": ("f8", np.nan),
+            "latitude": ("f8", np.nan),
+            "sst": ("f8", np.nan),
+            "gps_position_quality": ("f8", np.nan),
+            "gps_num_satellites": ("f8", np.nan),
+            "position_qc_accepted": ("bool", False),
+            "sst_qc_accepted": ("bool", False),
+            "position_qc_status": ("<U24", ""),
+            "sst_qc_status": ("<U24", ""),
+        }
+        for name, (dtype, fill_value) in specifications.items():
+            array = raw.create_dataset(
+                name, shape=(len(platforms), maximum_raw), chunks=raw_chunks,
+                dtype=dtype, fill_value=fill_value, compressor=compressor,
+            )
+            array.attrs.update({
+                "_ARRAY_DIMENSIONS": ["platform", "raw_observation"],
+                "coordinates": "platform_id raw_observation",
+            })
+        raw["time"][:] = np.datetime64("NaT", "ns")
+        raw["time"].attrs.update({"standard_name": "time", "timezone": "UTC"})
+        raw["longitude"].attrs.update({"standard_name": "longitude", "units": "degrees_east"})
+        raw["latitude"].attrs.update({"standard_name": "latitude", "units": "degrees_north"})
+        raw["sst"].attrs.update({"standard_name": "sea_surface_temperature", "units": "degree_Celsius"})
+        raw["gps_position_quality"].attrs.update({
+            "long_name": "source GPS position quality (GpsPosQual)",
+            "comment": "Reference-only source value; not interpreted as HDOP without vendor confirmation",
+        })
+        raw["gps_num_satellites"].attrs.update({
+            "long_name": "number of GPS satellites used by the source observation",
+            "units": "1",
+        })
     return root
 
 
@@ -1171,7 +1517,7 @@ def _gap_fields(track: AcceptedTrack, config: ReconstructionWorkflowConfig) -> d
 def _report_row(
     track: AcceptedTrack, result: PlatformReconstruction, grid: np.ndarray,
     config: ReconstructionWorkflowConfig, native: LinearGridTrack,
-    assignment: ArrayAssignment,
+    assignment: ArrayAssignment, sst: LinearGridSeries | None,
 ) -> dict[str, Any]:
     first_grid = grid[(grid >= track.time[0]) & (grid <= track.time[-1])][0]
     last_grid = grid[(grid >= track.time[0]) & (grid <= track.time[-1])][-1]
@@ -1192,6 +1538,8 @@ def _report_row(
         "accepted_fix_count": track.inventory.accepted_count,
         "native_fix_count": track.inventory.native_count,
         "native_only_fix_count": track.inventory.native_count - track.inventory.accepted_count,
+        "raw_observation_count": track.inventory.raw_count,
+        "accepted_sst_observation_count": track.inventory.sst_count,
         "eligible_start_utc": _format_utc(track.time[0]),
         "eligible_end_utc": _format_utc(track.time[-1]),
         "first_filled_grid_utc": _format_utc(first_grid),
@@ -1203,6 +1551,12 @@ def _report_row(
         "native_interpolated_grid_points": native.filled_grid_points - native.exact_grid_points,
         **_gap_fields(track, config),
     }
+    if sst is not None:
+        row.update({
+            "sst_filled_grid_points": sst.filled_grid_points,
+            "sst_exact_observation_grid_points": sst.exact_grid_points,
+            "sst_masked_or_outside_grid_points": int(len(grid) - sst.filled_grid_points),
+        })
     for period in config.periods_minutes:
         stats = asdict(result.fallback[period])
         row.update({f"spline_{period}_{name}": value for name, value in stats.items()})
@@ -1212,6 +1566,7 @@ def _report_row(
 
 def _write_platform(
     root: zarr.Group, index: int, result: PlatformReconstruction, native: LinearGridTrack,
+    track: AcceptedTrack, sst: LinearGridSeries | None,
 ) -> None:
     root["longitude_native"][index, :] = native.longitude
     root["latitude_native"][index, :] = native.latitude
@@ -1222,6 +1577,23 @@ def _write_platform(
     for period, values in result.longitude_spline.items():
         root[f"longitude_spline_{period}"][index, :] = values
         root[f"latitude_spline_{period}"][index, :] = result.latitude_spline[period]
+    if sst is not None:
+        root["sst_linear"][index, :] = sst.values
+        root["sst_source_gap_minutes"][index, :] = sst.source_gap_minutes
+    if "raw" in root:
+        raw = root["raw"]
+        count = len(track.raw_time)
+        raw["time"][index, :count] = track.raw_time
+        raw["source_obs_index"][index, :count] = track.raw_source_index
+        raw["longitude"][index, :count] = track.raw_longitude
+        raw["latitude"][index, :count] = track.raw_latitude
+        raw["sst"][index, :count] = track.raw_sst
+        raw["gps_position_quality"][index, :count] = track.raw_gps_pos_qual
+        raw["gps_num_satellites"][index, :count] = track.raw_gps_num_sat
+        raw["position_qc_accepted"][index, :count] = track.raw_position_accepted
+        raw["sst_qc_accepted"][index, :count] = track.raw_sst_accepted
+        raw["position_qc_status"][index, :count] = track.raw_position_status
+        raw["sst_qc_status"][index, :count] = track.raw_sst_status
 
 
 def _verify(
@@ -1238,6 +1610,8 @@ def _verify(
         *(f"longitude_spline_{period}" for period in config.periods_minutes),
         *(f"latitude_spline_{period}" for period in config.periods_minutes),
     }
+    if config.sst_enabled:
+        required.update({"sst_linear", "sst_source_gap_minutes"})
     with xr.open_zarr(path, consolidated=True, chunks=None) as dataset:
         if dict(dataset.sizes) != {"platform": len(platforms), "time": len(grid)}:
             raise ValueError("Zarr readback changed the common-grid dimensions")
@@ -1271,6 +1645,7 @@ def _verify(
     position_names = sorted(
         required - {
             "source_gap_minutes", "native_source_gap_minutes",
+            "sst_linear", "sst_source_gap_minutes",
             "start_time", "start_lon", "start_lat", "array_id", "cluster_id",
             "member_id", "cluster_size", "cluster_assignment_status",
         }
@@ -1299,6 +1674,70 @@ def _verify(
                 raise ValueError(f"Zarr readback found invalid longitude in {name}")
             if name.startswith("latitude") and np.any((values[inside] < -90) | (values[inside] > 90)):
                 raise ValueError(f"Zarr readback found invalid latitude in {name}")
+        if config.sst_enabled:
+            track = _load_track(inventory.path)
+            values = np.asarray(root["sst_linear"][index, :], dtype=float)
+            sst_gap = np.asarray(root["sst_source_gap_minutes"][index, :], dtype=float)
+            if len(track.sst_time) < 2:
+                if not np.isnan(values).all() or not np.isnan(sst_gap).all():
+                    raise ValueError(f"Zarr readback found SST values without two anchors for {inventory.platform_id}")
+            else:
+                sst_inside = (grid >= track.sst_time[0]) & (grid <= track.sst_time[-1])
+                if not np.isfinite(sst_gap[sst_inside]).all() or not np.isnan(sst_gap[~sst_inside]).all():
+                    raise ValueError(f"Zarr readback found invalid SST gap coverage for {inventory.platform_id}")
+                if np.isfinite(values[~sst_inside]).any():
+                    raise ValueError(f"Zarr readback extrapolated SST for {inventory.platform_id}")
+                if config.sst_maximum_gap_minutes is not None:
+                    invalid = np.isfinite(values) & (sst_gap > config.sst_maximum_gap_minutes)
+                    if invalid.any():
+                        raise ValueError(f"Zarr readback retained SST across an excessive gap for {inventory.platform_id}")
+    if config.raw_include:
+        if "raw" not in root:
+            raise ValueError("Zarr readback is missing the raw subgroup")
+        raw = root["raw"]
+        required_raw = {
+            "platform_id", "raw_observation", "observation_count", "time",
+            "source_obs_index", "longitude", "latitude", "sst",
+            "gps_position_quality", "gps_num_satellites",
+            "position_qc_accepted", "sst_qc_accepted",
+            "position_qc_status", "sst_qc_status",
+        }
+        if set(raw.array_keys()) != required_raw:
+            raise ValueError("Zarr readback found an unexpected raw subgroup schema")
+        if np.asarray(raw["platform_id"][:]).astype(str).tolist() != platforms:
+            raise ValueError("Raw subgroup platform identifiers changed")
+        for index, inventory in enumerate(inventories):
+            track = _load_track(inventory.path)
+            count = int(raw["observation_count"][index])
+            if count != inventory.raw_count:
+                raise ValueError(f"Raw observation count changed for {inventory.platform_id}")
+            if not np.array_equal(
+                np.asarray(raw["source_obs_index"][index, :count], dtype=np.int64),
+                track.raw_source_index,
+            ):
+                raise ValueError(f"Raw source indices changed for {inventory.platform_id}")
+            if not np.array_equal(
+                np.asarray(raw["time"][index, :count]).astype("datetime64[ns]"),
+                track.raw_time,
+            ):
+                raise ValueError(f"Raw timestamps changed for {inventory.platform_id}")
+            for name, expected in (
+                ("longitude", track.raw_longitude), ("latitude", track.raw_latitude),
+                ("sst", track.raw_sst),
+                ("gps_position_quality", track.raw_gps_pos_qual),
+                ("gps_num_satellites", track.raw_gps_num_sat),
+            ):
+                actual = np.asarray(raw[name][index, :count], dtype=float)
+                if not np.allclose(actual, expected, equal_nan=True):
+                    raise ValueError(f"Raw {name} changed for {inventory.platform_id}")
+            for name, expected in (
+                ("position_qc_accepted", track.raw_position_accepted),
+                ("sst_qc_accepted", track.raw_sst_accepted),
+                ("position_qc_status", track.raw_position_status.astype(str)),
+                ("sst_qc_status", track.raw_sst_status.astype(str)),
+            ):
+                if not np.array_equal(np.asarray(raw[name][index, :count]), expected):
+                    raise ValueError(f"Raw {name} changed for {inventory.platform_id}")
 
 
 def _inventory_inputs(
@@ -1419,11 +1858,12 @@ def _build_bundle(
     report_path = temporary / REPORT_NAME
     try:
         attributes = {
-            "title": "Drifter trajectories reconstructed from finalized position QC",
+            "title": "Drifter trajectories reconstructed from finalized QC",
             "product_status": "candidate_pending_gap_review",
             "schema_version": RECONSTRUCTION_SCHEMA_VERSION,
             "algorithm_version": RECONSTRUCTION_ALGORITHM_VERSION,
             "position_qc_schema_version": POSITION_QC_SCHEMA_VERSION,
+            "manual_qc_schema_version": SUPPORTED_MANUAL_QC_SCHEMA_VERSION,
             "drifterlab_version": __version__,
             "processing_time_utc": datetime.now(timezone.utc).isoformat(),
             "time_convention": "UTC; timezone-naive datetime64 values represent UTC",
@@ -1439,6 +1879,12 @@ def _build_bundle(
                 "overshoot": "Non-finite, invalid, or accepted-fix-envelope-exceeding phase/mean makes the complete portion linear",
                 "longitude": "Fit unwrapped longitude, then wrap published values to [-180, 180)",
                 "median_filter": "none",
+                "sst": (
+                    "Independent accepted manual-SST observations; linear interpolation; "
+                    "no endpoint extrapolation; values masked when the bracketing source gap "
+                    "exceeds the configured maximum"
+                    if config.sst_enabled else "not included"
+                ),
             },
             "effective_configuration": config.effective(),
             "qc_input_hashes": _input_hash_metadata(inventories),
@@ -1461,9 +1907,16 @@ def _build_bundle(
                 track.native_time, track.native_longitude, track.native_latitude, grid,
                 coverage_start=track.time[0], coverage_end=track.time[-1],
             )
-            _write_platform(root, index, reconstructed, native)
+            sst = (
+                resample_linear_series(
+                    track.sst_time, track.sst, grid,
+                    maximum_gap_minutes=config.sst_maximum_gap_minutes,
+                )
+                if config.sst_enabled else None
+            )
+            _write_platform(root, index, reconstructed, native, track, sst)
             rows.append(_report_row(
-                track, reconstructed, grid, config, native, assignments[index],
+                track, reconstructed, grid, config, native, assignments[index], sst,
             ))
             report(f"Reconstructed {index + 1}/{len(inventories)}: {inventory.platform_id}")
         cluster_result = _assign_clusters_from_store(

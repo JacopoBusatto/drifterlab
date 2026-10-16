@@ -11,6 +11,8 @@ from uuid import uuid4
 import numpy as np
 import pandas as pd
 from pyproj import CRS, Transformer
+
+from drifterlab.trajectories.kinematics import stored_forward_velocity_in_projection
 from scipy.spatial import ConvexHull, QhullError
 
 from .config import ClusterStatisticsConfig, percentile_suffix
@@ -123,7 +125,9 @@ def _empty_metric_values(percentiles: tuple[float, ...]) -> dict[str, float]:
     return {name: np.nan for name in _metric_columns(percentiles)}
 
 
-def _projection(data: ClusterArrayTrajectoryData) -> tuple[np.ndarray, np.ndarray, str]:
+def _projection(
+    data: ClusterArrayTrajectoryData,
+) -> tuple[np.ndarray, np.ndarray, str, Transformer]:
     definition = (
         f"+proj=aeqd +lat_0={data.projection_origin_latitude:.15g} "
         f"+lon_0={data.projection_origin_longitude:.15g} "
@@ -140,7 +144,7 @@ def _projection(data: ClusterArrayTrajectoryData) -> tuple[np.ndarray, np.ndarra
     )
     if not np.isfinite(x[finite]).all() or not np.isfinite(y[finite]).all():
         raise ValueError(f"Array {data.array_id} projection produced non-finite coordinates")
-    return x, y, definition
+    return x, y, definition, transformer
 
 
 def _membership_interval(
@@ -333,7 +337,7 @@ def calculate_array_cluster_statistics(
     data: ClusterArrayTrajectoryData, config: ClusterStatisticsConfig,
 ) -> ClusterStatisticsArrayResult:
     """Calculate all requested statistics without combining arrays or clusters."""
-    x, y, crs_definition = _projection(data)
+    x, y, crs_definition, transformer = _projection(data)
     cluster_order = tuple(dict.fromkeys(data.cluster_ids))
     timeseries_rows: list[dict[str, object]] = []
     summary_rows: list[dict[str, object]] = []
@@ -361,10 +365,39 @@ def calculate_array_cluster_statistics(
                 stacklevel=2,
             )
 
-        u, v = _velocity_components(
-            cluster_x, cluster_y, data.times, included,
-            config.velocity.difference_interval_minutes,
-        )
+        if config.velocity.method == "stored_forward":
+            if any(value is None for value in (
+                data.source_gap_minutes,
+                data.eastward_velocity,
+                data.northward_velocity,
+                data.velocity_dt_seconds,
+            )):
+                raise ValueError(
+                    "stored_forward cluster statistics require a grouped trajectory product"
+                )
+            forward = stored_forward_velocity_in_projection(
+                data.longitude[member_indices],
+                data.latitude[member_indices],
+                cluster_x,
+                cluster_y,
+                data.eastward_velocity[member_indices],
+                data.northward_velocity[member_indices],
+                data.velocity_dt_seconds[member_indices],
+                data.source_gap_minutes[member_indices],
+                transformer,
+                maximum_source_gap_minutes=(
+                    config.velocity.maximum_source_gap_minutes
+                ),
+            )
+            u = forward.u_m_s.copy()
+            v = forward.v_m_s.copy()
+            u[:, ~included] = np.nan
+            v[:, ~included] = np.nan
+        else:
+            u, v = _velocity_components(
+                cluster_x, cluster_y, data.times, included,
+                config.velocity.difference_interval_minutes,
+            )
         speed = np.hypot(u, v)
         internal_speed = np.full(speed.shape, np.nan, dtype=float)
         mean_u = np.full(len(data.times), np.nan, dtype=float)

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections import Counter
 from collections.abc import Callable
+from contextlib import nullcontext
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from hashlib import sha256
@@ -43,8 +44,6 @@ from drifterlab.epsilon_figures import (
 from drifterlab.epsilon_stage3 import (
     BootstrapSpec,
     conditional_q_histogram,
-    leave_one_platform_out,
-    summarize_platform_influence,
     symmetric_log_edges,
     synchronized_block_bootstrap,
 )
@@ -53,6 +52,11 @@ from drifterlab.trajectories.kinematics import (
     CenteredVelocityResult,
     centered_supported_velocity,
     project_array_positions,
+    stored_forward_velocity_in_projection,
+)
+from drifterlab.trajectories.product_store import (
+    SUPPORTED_PRODUCT_STORE_SCHEMA_VERSION,
+    load_trajectory_product,
 )
 
 
@@ -67,7 +71,8 @@ PROGRESS_NAME = "progress.md"
 @dataclass(frozen=True)
 class VelocitySpec:
     position_method: str
-    total_span_minutes: float
+    velocity_method: str
+    total_span_minutes: float | None
     maximum_source_gap_minutes: float
     require_full_stencil_support: bool
     speed_mask_m_s: float | None
@@ -111,7 +116,7 @@ class FigureConfig:
 
 
 @dataclass(frozen=True)
-class Stage3Config:
+class ReviewProductsConfig:
     enabled: bool
     bootstrap: BootstrapSpec
     q_histogram: QHistogramConfig
@@ -122,6 +127,7 @@ class Stage3Config:
 class EpsilonWorkflowConfig:
     source_path: Path
     trajectory_path: Path
+    trajectory_product: str | None
     dataset_label: str
     allow_candidate_input: bool
     arrays: tuple[int, ...]
@@ -136,13 +142,14 @@ class EpsilonWorkflowConfig:
     bins: SeparationBinConfig
     minimum_reliable_separation_m: float | None
     support: BinSupportRequirements
-    stage3: Stage3Config
+    review_products: ReviewProductsConfig
     output_root: Path
 
     def effective(self) -> dict[str, Any]:
         return {
             "input": {
                 "trajectories": str(self.trajectory_path),
+                "trajectory_product": self.trajectory_product,
                 "dataset_label": self.dataset_label,
                 "allow_candidate_input": self.allow_candidate_input,
             },
@@ -191,14 +198,18 @@ class EpsilonWorkflowConfig:
                 "membership": "left_closed_right_open_with_final_edge_inclusive",
             },
             "support": asdict(self.support),
-            "stage3": {
-                "enabled": self.stage3.enabled,
-                "uncertainty": {
-                    "method": "synchronized_utc_block_bootstrap",
-                    **asdict(self.stage3.bootstrap),
-                },
-                "q_histogram": asdict(self.stage3.q_histogram),
-                "figures": asdict(self.stage3.figures),
+            "uncertainty": {
+                "enabled": self.review_products.enabled,
+                "method": "synchronized_utc_block_bootstrap",
+                **asdict(self.review_products.bootstrap),
+            },
+            "q_distribution": {
+                "enabled": self.review_products.enabled,
+                **asdict(self.review_products.q_histogram),
+            },
+            "figures": {
+                "enabled": self.review_products.enabled,
+                **asdict(self.review_products.figures),
             },
             "output": {"root": str(self.output_root)},
         }
@@ -234,6 +245,18 @@ class EpsilonWorkflowResult:
 
 
 def _velocity_effective(value: VelocitySpec) -> dict[str, Any]:
+    if value.velocity_method == "stored_forward":
+        return {
+            "position_method": value.position_method,
+            "velocity_method": "stored_forward_difference",
+            "total_span_minutes": None,
+            "maximum_source_gap_minutes": value.maximum_source_gap_minutes,
+            "require_full_stencil_support": False,
+            "maximum_source_gap_applied": True,
+            "speed_mask_m_s": value.speed_mask_m_s,
+            "stencil_validity": "both adjacent product positions must be source-supported",
+            "endpoint_policy": "forward_interval_assigned_to_earlier_endpoint",
+        }
     return {
         "position_method": value.position_method,
         "velocity_method": "centered_two_endpoint_finite_difference",
@@ -326,23 +349,30 @@ def _parse_velocity(value: Any, name: str, *, allow_speed_mask: bool) -> Velocit
         section.get("velocity_method", "centered_difference"),
         f"{name}.velocity_method",
     )
-    if velocity_method != "centered_difference":
-        raise ValueError(f"{name}.velocity_method currently supports centered_difference only")
+    if velocity_method not in {"centered_difference", "stored_forward"}:
+        raise ValueError(
+            f"{name}.velocity_method must be centered_difference or stored_forward"
+        )
     speed_raw = section.get("speed_mask_m_s")
     if speed_raw is not None and not allow_speed_mask:
         raise ValueError(f"{name}.speed_mask_m_s must be null for reference activation")
     return VelocitySpec(
         position_method=method,
-        total_span_minutes=_positive(
-            section.get("total_span_minutes", 30), f"{name}.total_span_minutes",
+        velocity_method=velocity_method,
+        total_span_minutes=(
+            None if velocity_method == "stored_forward" else _positive(
+                section.get("total_span_minutes", 30), f"{name}.total_span_minutes",
+            )
         ),
         maximum_source_gap_minutes=_positive(
             section.get("maximum_source_gap_minutes", 30),
             f"{name}.maximum_source_gap_minutes",
         ),
-        require_full_stencil_support=_boolean(
-            section.get("require_full_stencil_support", True),
-            f"{name}.require_full_stencil_support",
+        require_full_stencil_support=(
+            False if velocity_method == "stored_forward" else _boolean(
+                section.get("require_full_stencil_support", True),
+                f"{name}.require_full_stencil_support",
+            )
         ),
         speed_mask_m_s=(
             None if speed_raw is None else _positive(speed_raw, f"{name}.speed_mask_m_s")
@@ -404,9 +434,13 @@ def _parse_bins(value: Any) -> SeparationBinConfig:
     )
 
 
-def _parse_stage3(value: Any, windows: tuple[WindowConfig, ...]) -> Stage3Config:
+def _parse_review_products(
+    value: Any, windows: tuple[WindowConfig, ...],
+) -> ReviewProductsConfig:
     section = _mapping(
-        value, {"enabled", "uncertainty", "q_histogram", "figures"}, "stage3",
+        value,
+        {"enabled", "uncertainty", "q_distribution", "figures"},
+        "epsilon review products",
     )
     uncertainty = _mapping(
         section.get("uncertainty", {}),
@@ -415,23 +449,23 @@ def _parse_stage3(value: Any, windows: tuple[WindowConfig, ...]) -> Stage3Config
             "primary_block_minutes", "sensitivity_block_minutes",
             "minimum_contributing_blocks", "minimum_successful_replicate_fraction",
         },
-        "stage3.uncertainty",
+        "uncertainty",
     )
     method = _nonempty(
         uncertainty.get("method", "synchronized_utc_block_bootstrap"),
-        "stage3.uncertainty.method",
+        "uncertainty.method",
     )
     if method != "synchronized_utc_block_bootstrap":
-        raise ValueError("stage3.uncertainty.method is not supported")
+        raise ValueError("uncertainty.method is not supported")
     primary_block = _positive_integer(
         uncertainty.get("primary_block_minutes", 30),
-        "stage3.uncertainty.primary_block_minutes",
+        "uncertainty.primary_block_minutes",
     )
     raw_sensitivity = uncertainty.get("sensitivity_block_minutes", [60])
     if not isinstance(raw_sensitivity, list):
-        raise ValueError("stage3.uncertainty.sensitivity_block_minutes must be a list")
+        raise ValueError("uncertainty.sensitivity_block_minutes must be a list")
     sensitivity = tuple(
-        _positive_integer(item, "stage3.uncertainty.sensitivity_block_minutes")
+        _positive_integer(item, "uncertainty.sensitivity_block_minutes")
         for item in raw_sensitivity
     )
     if len(set(sensitivity)) != len(sensitivity) or primary_block in sensitivity:
@@ -445,54 +479,54 @@ def _parse_stage3(value: Any, windows: tuple[WindowConfig, ...]) -> Stage3Config
                     f"Bootstrap block duration {block} does not divide window {window.identifier}"
                 )
     histogram = _mapping(
-        section.get("q_histogram", {}),
+        section.get("q_distribution", {}),
         {"maximum_absolute_m2_s3", "linear_threshold_m2_s3", "bins_per_decade"},
-        "stage3.q_histogram",
+        "q_distribution",
     )
     maximum_q = _positive(
         histogram.get("maximum_absolute_m2_s3", 0.005),
-        "stage3.q_histogram.maximum_absolute_m2_s3",
+        "q_distribution.maximum_absolute_m2_s3",
     )
     q_threshold = _positive(
         histogram.get("linear_threshold_m2_s3", 1e-7),
-        "stage3.q_histogram.linear_threshold_m2_s3",
+        "q_distribution.linear_threshold_m2_s3",
     )
     if q_threshold >= maximum_q:
-        raise ValueError("stage3 q histogram threshold must be below its maximum")
+        raise ValueError("q-distribution threshold must be below its maximum")
     figures = _mapping(
         section.get("figures", {}),
         {
             "dpi", "scatter_maximum_points", "epsilon_linear_threshold_m2_s3",
             "heatmap_probability_maximum",
         },
-        "stage3.figures",
+        "figures",
     )
     heatmap_maximum = _unit_interval(
         figures.get("heatmap_probability_maximum", 0.25),
-        "stage3.figures.heatmap_probability_maximum",
+        "figures.heatmap_probability_maximum",
     )
-    return Stage3Config(
-        enabled=_boolean(section.get("enabled", False), "stage3.enabled"),
+    return ReviewProductsConfig(
+        enabled=_boolean(section.get("enabled", False), "review products enabled"),
         bootstrap=BootstrapSpec(
             confidence_level=_unit_interval(
                 uncertainty.get("confidence_level", 0.95),
-                "stage3.uncertainty.confidence_level",
+                "uncertainty.confidence_level",
             ),
             replicates=_positive_integer(
-                uncertainty.get("replicates", 2000), "stage3.uncertainty.replicates",
+                uncertainty.get("replicates", 2000), "uncertainty.replicates",
             ),
             random_seed=_nonnegative_integer(
-                uncertainty.get("random_seed", 41723), "stage3.uncertainty.random_seed",
+                uncertainty.get("random_seed", 41723), "uncertainty.random_seed",
             ),
             primary_block_minutes=primary_block,
             sensitivity_block_minutes=sensitivity,
             minimum_contributing_blocks=_positive_integer(
                 uncertainty.get("minimum_contributing_blocks", 6),
-                "stage3.uncertainty.minimum_contributing_blocks",
+                "uncertainty.minimum_contributing_blocks",
             ),
             minimum_successful_replicate_fraction=_unit_interval(
                 uncertainty.get("minimum_successful_replicate_fraction", 0.95),
-                "stage3.uncertainty.minimum_successful_replicate_fraction",
+                "uncertainty.minimum_successful_replicate_fraction",
             ),
         ),
         q_histogram=QHistogramConfig(
@@ -500,22 +534,61 @@ def _parse_stage3(value: Any, windows: tuple[WindowConfig, ...]) -> Stage3Config
             linear_threshold_m2_s3=q_threshold,
             bins_per_decade=_positive_integer(
                 histogram.get("bins_per_decade", 6),
-                "stage3.q_histogram.bins_per_decade",
+                "q_distribution.bins_per_decade",
             ),
         ),
         figures=FigureConfig(
-            dpi=_positive_integer(figures.get("dpi", 160), "stage3.figures.dpi"),
+            dpi=_positive_integer(figures.get("dpi", 160), "figures.dpi"),
             scatter_maximum_points=_positive_integer(
                 figures.get("scatter_maximum_points", 20000),
-                "stage3.figures.scatter_maximum_points",
+                "figures.scatter_maximum_points",
             ),
             epsilon_linear_threshold_m2_s3=_positive(
                 figures.get("epsilon_linear_threshold_m2_s3", 1e-7),
-                "stage3.figures.epsilon_linear_threshold_m2_s3",
+                "figures.epsilon_linear_threshold_m2_s3",
             ),
             heatmap_probability_maximum=heatmap_maximum,
         ),
     )
+
+
+def _normalized_review_values(values: dict[str, Any]) -> dict[str, Any]:
+    legacy = values.get("stage3")
+    named_present = any(
+        name in values for name in ("uncertainty", "q_distribution", "figures")
+    )
+    if legacy is not None:
+        if named_present:
+            raise ValueError(
+                "Legacy stage3 cannot be combined with uncertainty, q_distribution, or figures"
+            )
+        legacy_section = _mapping(
+            legacy,
+            {"enabled", "uncertainty", "q_histogram", "figures"},
+            "legacy stage3",
+        )
+        return {
+            "enabled": legacy_section.get("enabled", False),
+            "uncertainty": legacy_section.get("uncertainty", {}),
+            "q_distribution": legacy_section.get("q_histogram", {}),
+            "figures": legacy_section.get("figures", {}),
+        }
+
+    sections: dict[str, dict[str, Any]] = {}
+    flags: list[bool] = []
+    for name in ("uncertainty", "q_distribution", "figures"):
+        raw_section = values.get(name, {})
+        if not isinstance(raw_section, dict):
+            raise ValueError(f"{name} must be a mapping")
+        section = dict(raw_section)
+        flags.append(_boolean(section.pop("enabled", False), f"{name}.enabled"))
+        sections[name] = section
+    if len(set(flags)) != 1:
+        raise ValueError(
+            "uncertainty, q_distribution, and figures must currently be enabled "
+            "or disabled together"
+        )
+    return {"enabled": flags[0], **sections}
 
 
 def load_epsilon_config(path: str | Path) -> EpsilonWorkflowConfig:
@@ -527,13 +600,17 @@ def load_epsilon_config(path: str | Path) -> EpsilonWorkflowConfig:
         raw,
         {
             "input", "selection", "activation", "analysis", "separation_bins",
-            "support", "stage3", "output",
+            "support", "uncertainty", "q_distribution", "figures", "stage3",
+            "output",
         },
         "configuration",
     )
     input_section = _mapping(
         values.get("input", {}),
-        {"trajectories", "dataset_label", "allow_candidate_input"},
+        {
+            "trajectories", "trajectory_product", "dataset_label",
+            "allow_candidate_input",
+        },
         "input",
     )
     selection = _mapping(
@@ -566,6 +643,15 @@ def load_epsilon_config(path: str | Path) -> EpsilonWorkflowConfig:
         return (source_path.parent / candidate).resolve()
 
     trajectory_path = resolved(input_section.get("trajectories"), "input.trajectories")
+    product_raw = input_section.get("trajectory_product")
+    trajectory_product = (
+        None if product_raw is None
+        else _nonempty(product_raw, "input.trajectory_product")
+    )
+    if trajectory_product is not None and (
+        "/" in trajectory_product or "\\" in trajectory_product
+    ):
+        raise ValueError("input.trajectory_product must be one direct product-group name")
     output_root = resolved(output.get("root"), "output.root")
     if trajectory_path == output_root or trajectory_path in output_root.parents:
         raise ValueError("Epsilon output root must be outside the input trajectory store")
@@ -636,6 +722,22 @@ def load_epsilon_config(path: str | Path) -> EpsilonWorkflowConfig:
         "analysis",
         allow_speed_mask=True,
     )
+    if trajectory_product is not None:
+        selected_methods = {
+            reference.position_method,
+            analysis_velocity.position_method,
+        }
+        if selected_methods != {"product"}:
+            raise ValueError(
+                "activation.reference.position_method and analysis.position_method "
+                "must both be 'product' when trajectory_product is selected"
+            )
+    elif "stored_forward" in {
+        reference.velocity_method, analysis_velocity.velocity_method,
+    }:
+        raise ValueError(
+            "stored_forward velocity requires input.trajectory_product from a grouped v2 Zarr"
+        )
     sample_cadence_minutes = _positive_integer(
         analysis.get("sample_cadence_minutes", 5),
         "analysis.sample_cadence_minutes",
@@ -680,6 +782,7 @@ def load_epsilon_config(path: str | Path) -> EpsilonWorkflowConfig:
     return EpsilonWorkflowConfig(
         source_path=source_path,
         trajectory_path=trajectory_path,
+        trajectory_product=trajectory_product,
         dataset_label=_nonempty(
             input_section.get("dataset_label", "current"), "input.dataset_label",
         ),
@@ -704,7 +807,9 @@ def load_epsilon_config(path: str | Path) -> EpsilonWorkflowConfig:
             platforms=_positive_integer(support.get("platforms", 3), "support.platforms"),
             unique_utc=_positive_integer(support.get("unique_utc", 12), "support.unique_utc"),
         ),
-        stage3=_parse_stage3(values.get("stage3", {}), resolved_windows),
+        review_products=_parse_review_products(
+            _normalized_review_values(values), resolved_windows,
+        ),
         output_root=output_root,
     )
 
@@ -729,8 +834,12 @@ def _format_utc(value: np.datetime64) -> str:
 
 
 def _coordinate_names(dataset: xr.Dataset, method: str) -> tuple[str, str]:
-    longitude = f"longitude_{method}"
-    latitude = f"latitude_{method}"
+    if method == "product":
+        longitude = "longitude"
+        latitude = "latitude"
+    else:
+        longitude = f"longitude_{method}"
+        latitude = f"latitude_{method}"
     if longitude not in dataset or latitude not in dataset:
         methods = sorted(
             name.removeprefix("longitude_")
@@ -747,13 +856,21 @@ def _coordinate_names(dataset: xr.Dataset, method: str) -> tuple[str, str]:
 
 
 def _validate_dataset(dataset: xr.Dataset, config: EpsilonWorkflowConfig) -> None:
-    if dataset.attrs.get("schema_version") != SUPPORTED_RECONSTRUCTION_SCHEMA_VERSION:
+    expected_schema = (
+        SUPPORTED_PRODUCT_STORE_SCHEMA_VERSION
+        if config.trajectory_product is not None
+        else SUPPORTED_RECONSTRUCTION_SCHEMA_VERSION
+    )
+    if dataset.attrs.get("schema_version") != expected_schema:
         raise ValueError(
-            f"Unsupported reconstruction schema {dataset.attrs.get('schema_version')!r}; "
-            f"expected {SUPPORTED_RECONSTRUCTION_SCHEMA_VERSION!r}"
+            f"Unsupported trajectory schema {dataset.attrs.get('schema_version')!r}; "
+            f"expected {expected_schema!r}"
         )
     status = str(dataset.attrs.get("product_status", ""))
-    if "candidate" in status.lower() and not config.allow_candidate_input:
+    status_is_provisional = any(
+        marker in status.lower() for marker in ("candidate", "provisional", "partial")
+    )
+    if status_is_provisional and not config.allow_candidate_input:
         raise ValueError(
             f"Trajectory product status is {status!r}; set allow_candidate_input explicitly"
         )
@@ -1285,24 +1402,23 @@ def _coverage_identity(
     return result[leading + [name for name in result if name not in leading]]
 
 
-def _stage3_array_products(
+def _epsilon_review_products(
     *,
     array_id: int,
     pair_observations: pd.DataFrame,
     epsilon_by_scale: pd.DataFrame,
     config: EpsilonWorkflowConfig,
     array_directory: Path,
-) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, list[Path]]:
-    """Add Stage-3 uncertainty, influence, histograms, and review figures."""
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, list[Path]]:
+    """Add uncertainty, signed-q distributions, and review figures."""
     edges = np.asarray(config.bins.edges_m, dtype=float)
     q_edges = symmetric_log_edges(
-        config.stage3.q_histogram.maximum_absolute_m2_s3,
-        config.stage3.q_histogram.linear_threshold_m2_s3,
-        config.stage3.q_histogram.bins_per_decade,
+        config.review_products.q_histogram.maximum_absolute_m2_s3,
+        config.review_products.q_histogram.linear_threshold_m2_s3,
+        config.review_products.q_histogram.bins_per_decade,
     )
     histogram_frames: list[pd.DataFrame] = []
     bootstrap_frames: list[pd.DataFrame] = []
-    influence_frames: list[pd.DataFrame] = []
     enriched_frames: list[pd.DataFrame] = []
     figure_paths: list[Path] = []
     window_lookup = {item.identifier: item for item in config.windows}
@@ -1332,24 +1448,8 @@ def _stage3_array_products(
         ]
         histogram_frames.append(histogram)
 
-        influence = leave_one_platform_out(
-            selected, edges,
-            support_minimum_observations=config.support.observations,
-            support_minimum_pairs=config.support.unique_pairs,
-            support_minimum_platforms=config.support.platforms,
-            support_minimum_utc=config.support.unique_utc,
-        )
-        for name, value in reversed(tuple(zip(identity_columns, identity))):
-            influence.insert(0, name, value)
-        influence_frames.append(influence)
-        influence_summary = summarize_platform_influence(influence)
-
         enriched = summary.copy()
         enriched = enriched.drop(columns=["confidence_interval_status"], errors="ignore")
-        if not influence_summary.empty:
-            enriched = enriched.merge(
-                influence_summary, on="separation_bin_id", how="left", validate="one_to_one",
-            )
         if analysis_type == "snapshot":
             enriched["bootstrap_block_minutes"] = np.nan
             enriched["scheduled_block_count"] = np.nan
@@ -1357,7 +1457,7 @@ def _stage3_array_products(
             enriched["bootstrap_replicates_requested"] = 0
             enriched["successful_bootstrap_replicates"] = 0
             enriched["successful_bootstrap_fraction"] = np.nan
-            enriched["confidence_level"] = config.stage3.bootstrap.confidence_level
+            enriched["confidence_level"] = config.review_products.bootstrap.confidence_level
             enriched["epsilon_ci_lower_m2_s3"] = np.nan
             enriched["epsilon_ci_upper_m2_s3"] = np.nan
             enriched["confidence_interval_status"] = "not_applicable_snapshot"
@@ -1367,33 +1467,33 @@ def _stage3_array_products(
             ))
             primary: pd.DataFrame | None = None
             for block_minutes in (
-                config.stage3.bootstrap.primary_block_minutes,
-                *config.stage3.bootstrap.sensitivity_block_minutes,
+                config.review_products.bootstrap.primary_block_minutes,
+                *config.review_products.bootstrap.sensitivity_block_minutes,
             ):
                 bootstrap = synchronized_block_bootstrap(
                     selected, edges,
                     window_start_hour=window.start_hour,
                     window_end_hour=window.end_hour,
                     block_minutes=block_minutes,
-                    confidence_level=config.stage3.bootstrap.confidence_level,
-                    replicates=config.stage3.bootstrap.replicates,
-                    random_seed=config.stage3.bootstrap.random_seed,
+                    confidence_level=config.review_products.bootstrap.confidence_level,
+                    replicates=config.review_products.bootstrap.replicates,
+                    random_seed=config.review_products.bootstrap.random_seed,
                     identity="|".join(map(str, identity)),
                     minimum_contributing_blocks=(
-                        config.stage3.bootstrap.minimum_contributing_blocks
+                        config.review_products.bootstrap.minimum_contributing_blocks
                     ),
                     minimum_successful_replicate_fraction=(
-                        config.stage3.bootstrap.minimum_successful_replicate_fraction
+                        config.review_products.bootstrap.minimum_successful_replicate_fraction
                     ),
                     support_by_bin=support_by_bin,
                 )
                 bootstrap["is_primary_block_duration"] = (
-                    block_minutes == config.stage3.bootstrap.primary_block_minutes
+                    block_minutes == config.review_products.bootstrap.primary_block_minutes
                 )
                 for name, value in reversed(tuple(zip(identity_columns, identity))):
                     bootstrap.insert(0, name, value)
                 bootstrap_frames.append(bootstrap)
-                if block_minutes == config.stage3.bootstrap.primary_block_minutes:
+                if block_minutes == config.review_products.bootstrap.primary_block_minutes:
                     primary = bootstrap
             if primary is None:
                 raise RuntimeError("Primary bootstrap duration was not evaluated")
@@ -1424,14 +1524,16 @@ def _stage3_array_products(
             activation_time_utc=str(activation.iloc[0]) if len(activation) else "unavailable",
             separation_edges_m=edges,
             q_edges_m2_s3=q_edges,
-            q_linear_threshold_m2_s3=config.stage3.q_histogram.linear_threshold_m2_s3,
-            epsilon_linear_threshold_m2_s3=(
-                config.stage3.figures.epsilon_linear_threshold_m2_s3
+            q_linear_threshold_m2_s3=(
+                config.review_products.q_histogram.linear_threshold_m2_s3
             ),
-            scatter_maximum_points=config.stage3.figures.scatter_maximum_points,
-            dpi=config.stage3.figures.dpi,
+            epsilon_linear_threshold_m2_s3=(
+                config.review_products.figures.epsilon_linear_threshold_m2_s3
+            ),
+            scatter_maximum_points=config.review_products.figures.scatter_maximum_points,
+            dpi=config.review_products.figures.dpi,
             heatmap_probability_maximum=(
-                config.stage3.figures.heatmap_probability_maximum
+                config.review_products.figures.heatmap_probability_maximum
             ),
         )
         figure_paths.append(figure_path)
@@ -1444,13 +1546,6 @@ def _stage3_array_products(
             *identity_columns, "separation_bin_id", "bootstrap_block_minutes",
         ))
     )
-    influence_all = (
-        pd.concat(influence_frames, ignore_index=True)
-        if influence_frames else pd.DataFrame(columns=(
-            *identity_columns, "separation_bin_id", "removed_platform_id",
-        ))
-    )
-
     temporal = enriched_all[enriched_all.analysis_type == "window"]
     comparison_directory = array_directory / "figures" / "comparisons"
     comparison_subject = "population" if config.pair_scope == "all_array" else "cluster"
@@ -1460,9 +1555,9 @@ def _stage3_array_products(
             group, output_path=path, array_id=array_id, window_id=str(window_id),
             separation_edges_m=edges,
             epsilon_linear_threshold_m2_s3=(
-                config.stage3.figures.epsilon_linear_threshold_m2_s3
+                config.review_products.figures.epsilon_linear_threshold_m2_s3
             ),
-            dpi=config.stage3.figures.dpi,
+            dpi=config.review_products.figures.dpi,
         )
         figure_paths.append(path)
     if len(temporal):
@@ -1471,9 +1566,9 @@ def _stage3_array_products(
             temporal, output_path=path, array_id=array_id,
             separation_edges_m=edges,
             epsilon_linear_threshold_m2_s3=(
-                config.stage3.figures.epsilon_linear_threshold_m2_s3
+                config.review_products.figures.epsilon_linear_threshold_m2_s3
             ),
-            dpi=config.stage3.figures.dpi,
+            dpi=config.review_products.figures.dpi,
         )
         figure_paths.append(path)
     guide_path = array_directory / "figures" / "README.md"
@@ -1486,7 +1581,7 @@ def _stage3_array_products(
         encoding="utf-8",
     )
     figure_paths.append(guide_path)
-    return enriched_all, histograms_all, bootstrap_all, influence_all, figure_paths
+    return enriched_all, histograms_all, bootstrap_all, figure_paths
 
 
 def _write_csv(frame: pd.DataFrame, path: Path) -> Path:
@@ -1549,9 +1644,59 @@ def _run_id(
 
 
 def _velocity_directory_name(config: EpsilonWorkflowConfig) -> str:
-    span = f"{config.analysis.total_span_minutes:g}".replace(".", "p")
     cadence = f"{config.sample_cadence_minutes}min"
+    if config.analysis.velocity_method == "stored_forward":
+        return f"stored_forward_on_{cadence}_grid"
+    assert config.analysis.total_span_minutes is not None
+    span = f"{config.analysis.total_span_minutes:g}".replace(".", "p")
     return f"centered_difference_{span}min_on_{cadence}_grid"
+
+
+def _velocity_from_spec(
+    specification: VelocitySpec,
+    *,
+    longitude: np.ndarray,
+    latitude: np.ndarray,
+    projection,
+    times: np.ndarray,
+    source_gap_minutes: np.ndarray,
+    eastward_velocity: np.ndarray | None,
+    northward_velocity: np.ndarray | None,
+    velocity_dt_seconds: np.ndarray | None,
+) -> CenteredVelocityResult:
+    if specification.velocity_method == "stored_forward":
+        if (
+            eastward_velocity is None
+            or northward_velocity is None
+            or velocity_dt_seconds is None
+        ):
+            raise ValueError(
+                "Selected trajectory product lacks its stored forward-velocity variables"
+            )
+        return stored_forward_velocity_in_projection(
+            longitude,
+            latitude,
+            projection.x_m,
+            projection.y_m,
+            eastward_velocity,
+            northward_velocity,
+            velocity_dt_seconds,
+            source_gap_minutes,
+            projection.forward,
+            maximum_source_gap_minutes=specification.maximum_source_gap_minutes,
+            speed_mask_m_s=specification.speed_mask_m_s,
+        )
+    assert specification.total_span_minutes is not None
+    return centered_supported_velocity(
+        projection.x_m,
+        projection.y_m,
+        times,
+        source_gap_minutes,
+        total_span_minutes=specification.total_span_minutes,
+        maximum_source_gap_minutes=specification.maximum_source_gap_minutes,
+        speed_mask_m_s=specification.speed_mask_m_s,
+        require_full_stencil_support=specification.require_full_stencil_support,
+    )
 
 
 def run_epsilon_workflow(
@@ -1560,13 +1705,17 @@ def run_epsilon_workflow(
     overwrite: bool = False,
     progress: Callable[[str], None] | None = None,
 ) -> EpsilonWorkflowResult:
-    """Run numerical epsilon products and optional Stage-3 review products."""
+    """Run epsilon estimation and its optional uncertainty and figure products."""
     config = load_epsilon_config(config_path)
     report = progress or (lambda message: None)
     if not config.trajectory_path.is_dir():
         raise ValueError(f"Trajectory Zarr does not exist: {config.trajectory_path}")
     metadata_sha256 = _input_metadata_hash(config.trajectory_path)
-    build_report_path = config.trajectory_path.parent / "build_report.csv"
+    internal_build_report = config.trajectory_path / "build_report.csv"
+    legacy_build_report = config.trajectory_path.parent / "build_report.csv"
+    build_report_path = (
+        internal_build_report if internal_build_report.is_file() else legacy_build_report
+    )
     build_report_sha256 = _file_sha256(build_report_path) if build_report_path.is_file() else None
     run_id = _run_id(config, metadata_sha256, build_report_sha256)
     target = (
@@ -1590,9 +1739,20 @@ def run_epsilon_workflow(
     unified_pair_count = 0
     activated_count = 0
     input_attrs: dict[str, Any] = {}
+    reference_velocity_shape: tuple[int, int] | None = None
+    analysis_velocity_shape: tuple[int, int] | None = None
     try:
         report(f"Opening {config.trajectory_path}")
-        with xr.open_zarr(config.trajectory_path, consolidated=True, chunks=None) as dataset:
+        if config.trajectory_product is None:
+            dataset_context = xr.open_zarr(
+                config.trajectory_path, consolidated=True, chunks=None,
+            )
+        else:
+            loaded, _product_info = load_trajectory_product(
+                config.trajectory_path, config.trajectory_product,
+            )
+            dataset_context = nullcontext(loaded)
+        with dataset_context as dataset:
             _validate_dataset(dataset, config)
             input_attrs = dict(dataset.attrs)
             times = dataset.time.values.astype("datetime64[ns]")
@@ -1613,6 +1773,25 @@ def run_epsilon_workflow(
             ref_lat_all = dataset[ref_lat_name].values.astype(float)
             analysis_lon_all = dataset[analysis_lon_name].values.astype(float)
             analysis_lat_all = dataset[analysis_lat_name].values.astype(float)
+            stored_velocity_requested = "stored_forward" in {
+                config.activation.reference.velocity_method,
+                config.analysis.velocity_method,
+            }
+            if stored_velocity_requested:
+                stored_required = (
+                    "eastward_velocity", "northward_velocity", "velocity_dt_seconds",
+                )
+                missing_stored = [name for name in stored_required if name not in dataset]
+                if missing_stored:
+                    raise ValueError(
+                        "Selected trajectory product lacks stored velocity variables: "
+                        f"{missing_stored}"
+                    )
+                eastward_all = dataset.eastward_velocity.values.astype(float)
+                northward_all = dataset.northward_velocity.values.astype(float)
+                velocity_dt_all = dataset.velocity_dt_seconds.values.astype(float)
+            else:
+                eastward_all = northward_all = velocity_dt_all = None
 
             for array_id in config.arrays:
                 array_mask = arrays_all == array_id
@@ -1633,23 +1812,47 @@ def run_epsilon_workflow(
                     origin_longitude=reference_projection.origin_longitude,
                     origin_latitude=reference_projection.origin_latitude,
                 )
-                reference_velocity = centered_supported_velocity(
-                    reference_projection.x_m, reference_projection.y_m, times, gaps,
-                    total_span_minutes=config.activation.reference.total_span_minutes,
-                    maximum_source_gap_minutes=(
-                        config.activation.reference.maximum_source_gap_minutes
+                reference_velocity = _velocity_from_spec(
+                    config.activation.reference,
+                    longitude=ref_lon_all[array_mask],
+                    latitude=ref_lat_all[array_mask],
+                    projection=reference_projection,
+                    times=times,
+                    source_gap_minutes=gaps,
+                    eastward_velocity=(
+                        None if eastward_all is None else eastward_all[array_mask]
                     ),
-                    speed_mask_m_s=None,
-                    require_full_stencil_support=(
-                        config.activation.reference.require_full_stencil_support
+                    northward_velocity=(
+                        None if northward_all is None else northward_all[array_mask]
+                    ),
+                    velocity_dt_seconds=(
+                        None if velocity_dt_all is None else velocity_dt_all[array_mask]
                     ),
                 )
-                analysis_velocity = centered_supported_velocity(
-                    analysis_projection.x_m, analysis_projection.y_m, times, gaps,
-                    total_span_minutes=config.analysis.total_span_minutes,
-                    maximum_source_gap_minutes=config.analysis.maximum_source_gap_minutes,
-                    speed_mask_m_s=config.analysis.speed_mask_m_s,
-                    require_full_stencil_support=config.analysis.require_full_stencil_support,
+                analysis_velocity = _velocity_from_spec(
+                    config.analysis,
+                    longitude=analysis_longitude,
+                    latitude=analysis_latitude,
+                    projection=analysis_projection,
+                    times=times,
+                    source_gap_minutes=gaps,
+                    eastward_velocity=(
+                        None if eastward_all is None else eastward_all[array_mask]
+                    ),
+                    northward_velocity=(
+                        None if northward_all is None else northward_all[array_mask]
+                    ),
+                    velocity_dt_seconds=(
+                        None if velocity_dt_all is None else velocity_dt_all[array_mask]
+                    ),
+                )
+                reference_velocity_shape = (
+                    reference_velocity.stencil_point_count,
+                    reference_velocity.required_validity_point_count,
+                )
+                analysis_velocity_shape = (
+                    analysis_velocity.stencil_point_count,
+                    analysis_velocity.required_validity_point_count,
                 )
                 array_directory = temporary / f"array_{array_id:03d}"
                 data_directory = array_directory / "data"
@@ -2048,34 +2251,32 @@ def run_epsilon_workflow(
                         "coverage_level", "pair_id",
                     ))
                 )
-                stage3_detail_paths: list[Path] = []
-                stage3_figure_paths: list[Path] = []
-                if config.stage3.enabled:
-                    report(f"Array {array_id}: Stage 3 bootstrap, influence, and figures")
+                review_detail_paths: list[Path] = []
+                review_figure_paths: list[Path] = []
+                if config.review_products.enabled:
+                    report(
+                        f"Array {array_id}: bootstrap uncertainty, signed-q distributions, "
+                        "and figures"
+                    )
                     (
                         epsilon_by_scale,
                         q_histograms,
                         bootstrap_sensitivity,
-                        platform_influence,
-                        stage3_figure_paths,
-                    ) = _stage3_array_products(
+                        review_figure_paths,
+                    ) = _epsilon_review_products(
                         array_id=array_id,
                         pair_observations=pair_observations,
                         epsilon_by_scale=epsilon_by_scale,
                         config=config,
                         array_directory=array_directory,
                     )
-                    stage3_detail_paths = [
+                    review_detail_paths = [
                         _write_parquet(
                             q_histograms, data_directory / "q_histograms.parquet",
                         ),
                         _write_parquet(
                             bootstrap_sensitivity,
                             data_directory / "bootstrap_sensitivity.parquet",
-                        ),
-                        _write_parquet(
-                            platform_influence,
-                            data_directory / "leave_one_platform_out.parquet",
                         ),
                     ]
                 array_products = [
@@ -2087,8 +2288,8 @@ def run_epsilon_workflow(
                     _write_parquet(
                         platform_diagnostics, data_directory / "platform_diagnostics.parquet",
                     ),
-                    *stage3_detail_paths,
-                    *stage3_figure_paths,
+                    *review_detail_paths,
+                    *review_figure_paths,
                 ]
                 product_paths.extend(array_products)
                 relative_clusters_paths.append(array_products[0].relative_to(temporary))
@@ -2112,7 +2313,7 @@ def run_epsilon_workflow(
                     },
                     "files": [str(path.relative_to(temporary)) for path in array_products],
                     "figures_directory": str((array_directory / "figures").relative_to(temporary)),
-                    "stage3_figure_count": len(stage3_figure_paths),
+                    "review_figure_count": len(review_figure_paths),
                     "clusters": cluster_entries,
                 })
 
@@ -2130,18 +2331,21 @@ def run_epsilon_workflow(
         )
         product_paths.append(resolved_path)
         progress_path = temporary / PROGRESS_NAME
-        stage_label = "Stage 3 reviewable pilot" if config.stage3.enabled else "Stage 2 numerical pilot"
+        analysis_label = (
+            "epsilon estimation with uncertainty and figures"
+            if config.review_products.enabled else "epsilon numerical estimation"
+        )
         population_label = (
             "array-wide populations" if config.pair_scope == "all_array" else "clusters"
         )
-        stage_lines = (
+        optional_product_lines = (
             (
                 "- Synchronized UTC block-bootstrap intervals with configured duration sensitivity.",
-                "- Conditional signed-q histograms, leave-one-platform-out checks, and figures.",
+                "- Conditional signed-q histograms and review figures.",
                 "- Snapshot products remain descriptive without temporal confidence intervals.",
             )
-            if config.stage3.enabled else
-            ("- Confidence intervals and plots are intentionally not computed in Stage 2.",)
+            if config.review_products.enabled else
+            ("- Confidence intervals and plots are disabled by configuration.",)
         )
         progress_path.write_text(
             "\n".join((
@@ -2149,11 +2353,11 @@ def run_epsilon_workflow(
                 "",
                 "## Completed",
                 "",
-                f"- {stage_label}.",
+                f"- {analysis_label}.",
                 "- Per-array readable tables and normalized observation/diagnostic Parquet data.",
                 f"- Fixed reference anchors for {population_label}, elapsed windows, support, coverage,",
-                "  structure functions, signed epsilon, moments, and influence diagnostics.",
-                *stage_lines,
+                "  structure functions, signed epsilon, and moments.",
+                *optional_product_lines,
                 "",
                 "## Validation",
                 "",
@@ -2170,12 +2374,12 @@ def run_epsilon_workflow(
                 "- Scientific primary reconstruction awaits linear versus spline_30 comparison.",
                 "- q histogram edges and bootstrap block lengths remain provisional choices.",
                 "",
-                "## Next stage",
+                "## Optional follow-up analyses",
                 "",
                 (
-                    "- Stage 4 configured reconstruction and mask comparisons."
-                    if config.stage3.enabled else
-                    "- Stage 3 plots, synchronized UTC block bootstrap, and leave-one-platform-out checks."
+                    "- Configured reconstruction and mask comparisons."
+                    if config.review_products.enabled else
+                    "- Figures and synchronized UTC block-bootstrap uncertainty."
                 ),
                 "",
             )) + "\n",
@@ -2209,9 +2413,8 @@ def run_epsilon_workflow(
                         [
                             "data/q_histograms.parquet",
                             "data/bootstrap_sensitivity.parquet",
-                            "data/leave_one_platform_out.parquet",
                         ]
-                        if config.stage3.enabled else []
+                        if config.review_products.enabled else []
                     ),
                 ],
                 "raw_window_membership": (
@@ -2221,6 +2424,7 @@ def run_epsilon_workflow(
             },
             "input": {
                 "trajectory_zarr": str(config.trajectory_path),
+                "trajectory_product": config.trajectory_product,
                 "consolidated_metadata_sha256": metadata_sha256,
                 "build_report_sha256": build_report_sha256,
                 "schema_version": input_attrs.get("schema_version"),
@@ -2235,7 +2439,11 @@ def run_epsilon_workflow(
                 "coefficient_label": "3D four-fifths-law convention",
                 "epsilon_interpretation": "signed effective transfer diagnostic, not local viscous dissipation",
                 "velocity_formula_baseline": (
-                    "u(t) = [x(t + 15 min) - x(t - 15 min)] / 1800 s"
+                    "stored forward velocity over [t, t + product cadence], assigned at t"
+                    if config.analysis.velocity_method == "stored_forward"
+                    else (
+                        "u(t) = [x(t + span/2) - x(t - span/2)] / span"
+                    )
                 ),
                 "sample_cadence_minutes": config.sample_cadence_minutes,
                 "sample_phase_reference": config.sample_phase_reference,
@@ -2243,13 +2451,15 @@ def run_epsilon_workflow(
                     "synchronized timestamp selection after vector-velocity calculation; "
                     "no scalar-speed averaging"
                 ),
-                "velocity_stencil_point_count": 7,
+                "velocity_stencil_point_count": (
+                    None if analysis_velocity_shape is None else analysis_velocity_shape[0]
+                ),
                 "velocity_numerator_point_count": 2,
                 "reference_required_validity_point_count": (
-                    7 if config.activation.reference.require_full_stencil_support else 2
+                    None if reference_velocity_shape is None else reference_velocity_shape[1]
                 ),
                 "analysis_required_validity_point_count": (
-                    7 if config.analysis.require_full_stencil_support else 2
+                    None if analysis_velocity_shape is None else analysis_velocity_shape[1]
                 ),
                 "transverse_unit_vector": "(-r_y, r_x) / separation",
                 "units": {
@@ -2267,16 +2477,16 @@ def run_epsilon_workflow(
                 "stored_unique_pair_observation_count": unified_pair_count,
                 "confidence_intervals": (
                     "synchronized_utc_block_bootstrap"
-                    if config.stage3.enabled else "not_computed_stage_2"
+                    if config.review_products.enabled else "not_computed"
                 ),
                 "figures": (
                     (
-                        "stage3_population_products_and_comparisons"
+                        "population_products_and_comparisons"
                         if config.pair_scope == "all_array"
-                        else "stage3_cluster_products_and_comparisons"
+                        else "cluster_products_and_comparisons"
                     )
-                    if config.stage3.enabled
-                    else "directory_created_empty_stage_2"
+                    if config.review_products.enabled
+                    else "not_computed"
                 ),
                 "arrays": array_manifests,
             },

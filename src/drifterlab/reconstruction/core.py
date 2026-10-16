@@ -6,7 +6,9 @@ from dataclasses import dataclass
 
 import numpy as np
 from scipy.interpolate import CubicSpline
+from pyproj import Geod
 
+WGS84 = Geod(ellps="WGS84")
 
 MINUTES_PER_NS = 1 / 60_000_000_000
 OVERSHOOT_TOLERANCE_DEGREES = 1e-10
@@ -47,6 +49,88 @@ class LinearGridTrack:
     exact_grid_points: int
     filled_grid_points: int
 
+@dataclass(frozen=True)
+class ForwardVelocity:
+    """Forward velocity assigned to the earlier position of each edge."""
+
+    dt_seconds: np.ndarray
+    east_m_s: np.ndarray
+    north_m_s: np.ndarray
+    speed_m_s: np.ndarray
+
+@dataclass(frozen=True)
+class RegularTrajectoryProduct:
+    """One trajectory resampled onto a regular grid with forward velocity."""
+
+    time: np.ndarray
+    position: LinearGridTrack
+    velocity: ForwardVelocity
+
+@dataclass(frozen=True)
+class LinearGridSeries:
+    """One scalar observation series linearly resampled without extrapolation."""
+
+    values: np.ndarray
+    source_gap_minutes: np.ndarray
+    exact_grid_points: int
+    filled_grid_points: int
+
+
+def resample_linear_series(
+    time: np.ndarray,
+    values: np.ndarray,
+    grid: np.ndarray,
+    *,
+    maximum_gap_minutes: float | None = None,
+) -> LinearGridSeries:
+    """Interpolate a scalar series and mask intervals wider than ``maximum_gap_minutes``."""
+    time = np.asarray(time, dtype="datetime64[ns]")
+    values = np.asarray(values, dtype=float)
+    grid = np.asarray(grid, dtype="datetime64[ns]")
+    if not (time.ndim == values.ndim == grid.ndim == 1):
+        raise ValueError("Scalar resampling inputs must be one-dimensional")
+    if len(time) != len(values):
+        raise ValueError("Scalar source times and values must have equal length")
+    if maximum_gap_minutes is not None:
+        maximum_gap_minutes = float(maximum_gap_minutes)
+        if not np.isfinite(maximum_gap_minutes) or maximum_gap_minutes <= 0:
+            raise ValueError("maximum_gap_minutes must be finite and positive")
+
+    result = np.full(len(grid), np.nan, dtype=np.float64)
+    gap = np.full(len(grid), np.nan, dtype=np.float64)
+    if len(time) < 2:
+        return LinearGridSeries(result, gap, 0, 0)
+    time_ns = time.astype(np.int64)
+    if np.isnat(time).any() or np.any(np.diff(time_ns) <= 0):
+        raise ValueError("Scalar source times must be valid and strictly increasing")
+    if not np.isfinite(values).all():
+        raise ValueError("Scalar source values must be finite")
+
+    grid_ns = grid.astype(np.int64)
+    inside = (grid_ns >= time_ns[0]) & (grid_ns <= time_ns[-1])
+    inside_indices = np.flatnonzero(inside)
+    if not len(inside_indices):
+        return LinearGridSeries(result, gap, 0, 0)
+    relative_time = (time_ns - time_ns[0]) / 1e9
+    relative_grid = (grid_ns[inside] - time_ns[0]) / 1e9
+    result[inside] = np.interp(relative_grid, relative_time, values)
+
+    targets = grid_ns[inside]
+    right = np.searchsorted(time_ns, targets, side="left")
+    clipped = np.minimum(right, len(time_ns) - 1)
+    exact = (right < len(time_ns)) & (time_ns[clipped] == targets)
+    gap[inside_indices[exact]] = 0.0
+    between = ~exact
+    if between.any():
+        gap[inside_indices[between]] = (
+            time_ns[right[between]] - time_ns[right[between] - 1]
+        ) * MINUTES_PER_NS
+    if maximum_gap_minutes is not None:
+        result[gap > maximum_gap_minutes] = np.nan
+    return LinearGridSeries(
+        result, gap, int(exact.sum()), int(np.isfinite(result).sum()),
+    )
+
 
 def wrap_longitude(longitude: np.ndarray) -> np.ndarray:
     """Wrap finite longitude to the half-open interval [-180, 180)."""
@@ -64,6 +148,7 @@ def resample_linear_track(
     *,
     coverage_start: np.datetime64,
     coverage_end: np.datetime64,
+    maximum_gap_minutes: float | None = None,
 ) -> LinearGridTrack:
     """Linearly resample fixes only inside an explicit, source-bracketed span."""
     time = np.asarray(time, dtype="datetime64[ns]")
@@ -87,6 +172,12 @@ def resample_linear_track(
             or coverage_start > coverage_end
             or coverage_start < time[0] or coverage_end > time[-1]):
         raise ValueError("Linear coverage must be ordered and bracketed by source fixes")
+    if maximum_gap_minutes is not None:
+        maximum_gap_minutes = float(maximum_gap_minutes)
+        if not np.isfinite(maximum_gap_minutes) or maximum_gap_minutes <= 0:
+            raise ValueError(
+                "maximum_gap_minutes must be finite and positive"
+            )
 
     grid_ns = grid.astype(np.int64)
     inside = (grid >= coverage_start) & (grid <= coverage_end)
@@ -112,9 +203,13 @@ def resample_linear_track(
         if between.any():
             gap_ns = time_ns[right[between]] - time_ns[right[between] - 1]
             gap[inside_indices[between]] = gap_ns * MINUTES_PER_NS
+    if maximum_gap_minutes is not None:
+        too_wide = gap > maximum_gap_minutes
+        result_lon[too_wide] = np.nan
+        result_lat[too_wide] = np.nan
     return LinearGridTrack(
         wrap_longitude(result_lon), result_lat, gap,
-        int(exact.sum()), int(inside.sum()),
+        int(exact.sum()), int((np.isfinite(result_lon) & np.isfinite(result_lat)).sum()),
     )
 
 
@@ -274,4 +369,111 @@ def reconstruct_platform(
     return PlatformReconstruction(
         wrap_longitude(linear_lon), linear_lat, spline_lon, spline_lat,
         source_gap, int(exact.sum()), int(inside.sum()), fallback_stats,
+    )
+
+
+def forward_velocity(
+    time: np.ndarray,
+    longitude: np.ndarray,
+    latitude: np.ndarray,
+) -> ForwardVelocity:
+    """Calculate forward velocity without bridging missing positions."""
+
+    time = np.asarray(time, dtype="datetime64[ns]")
+    longitude = np.asarray(longitude, dtype=float)
+    latitude = np.asarray(latitude, dtype=float)
+
+    if not (
+        time.ndim == longitude.ndim == latitude.ndim == 1
+        and len({len(time), len(longitude), len(latitude)}) == 1
+    ):
+        raise ValueError(
+            "Velocity inputs must be equally sized one-dimensional arrays"
+        )
+
+    count = len(time)
+    dt = np.full(count, np.nan)
+    east = np.full(count, np.nan)
+    north = np.full(count, np.nan)
+    speed = np.full(count, np.nan)
+
+    if count < 2:
+        return ForwardVelocity(dt, east, north, speed)
+
+    time_ns = time.astype(np.int64)
+    edge_dt = np.asarray(
+        time_ns[1:].astype(object) - time_ns[:-1].astype(object),
+        dtype=float,
+    ) / 1e9
+
+    valid_coordinates = (
+        np.isfinite(longitude)
+        & np.isfinite(latitude)
+        & (longitude >= -180)
+        & (longitude <= 180)
+        & (latitude >= -90)
+        & (latitude <= 90)
+    )
+    valid_edges = (
+        ~np.isnat(time[:-1])
+        & ~np.isnat(time[1:])
+        & valid_coordinates[:-1]
+        & valid_coordinates[1:]
+        & (edge_dt > 0)
+    )
+
+    indices = np.flatnonzero(valid_edges)
+    if len(indices):
+        azimuth, _back, distance = WGS84.inv(
+            longitude[indices],
+            latitude[indices],
+            longitude[indices + 1],
+            latitude[indices + 1],
+        )
+        values = np.asarray(distance) / edge_dt[indices]
+        radians = np.deg2rad(azimuth)
+
+        # Store at the earlier endpoint: velocity from t to t + dt.
+        dt[indices] = edge_dt[indices]
+        speed[indices] = values
+        east[indices] = values * np.sin(radians)
+        north[indices] = values * np.cos(radians)
+
+    return ForwardVelocity(dt, east, north, speed)
+
+
+
+def build_regular_product(
+    source_time: np.ndarray,
+    source_longitude: np.ndarray,
+    source_latitude: np.ndarray,
+    grid: np.ndarray,
+    *,
+    coverage_start: np.datetime64,
+    coverage_end: np.datetime64,
+    maximum_gap_minutes: float,
+) -> RegularTrajectoryProduct:
+    """Build gap-limited positions and their forward velocity."""
+
+    grid = np.asarray(grid, dtype="datetime64[ns]")
+
+    position = resample_linear_track(
+        source_time,
+        source_longitude,
+        source_latitude,
+        grid,
+        coverage_start=coverage_start,
+        coverage_end=coverage_end,
+        maximum_gap_minutes=maximum_gap_minutes,
+    )
+    velocity = forward_velocity(
+        grid,
+        position.longitude,
+        position.latitude,
+    )
+
+    return RegularTrajectoryProduct(
+        time=grid,
+        position=position,
+        velocity=velocity,
     )

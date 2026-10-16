@@ -5,12 +5,17 @@ products created by `drifterlab-epsilon`. The workflow reads the common-grid
 reconstruction directly; it does not use encounter-selected pairs and never
 edits the trajectory product.
 
-The initial implementation is deliberately staged:
+The current grouped-product workflow is organized by scientific purpose:
 
-- Stage 2 calculates and saves numerical snapshot and initial-evolution products.
-- Stage 3 adds figures, synchronized UTC block-bootstrap intervals, saved
-  conditional histograms, and leave-one-platform-out influence checks.
-- Stage 4 will run configured reconstruction and sensitivity comparisons.
+- core epsilon estimation and support/coverage tables;
+- synchronized UTC block-bootstrap uncertainty;
+- signed-q distributions;
+- epsilon figures;
+- a separate, compact diagnostic set.
+
+It is run as part of `drifterlab-analyze`; see the
+[unified analysis guide](../unified_analysis.md). The earlier numbered-stage
+reports below are retained only as historical pilot records.
 
 See [methodology](methodology.md) for the complete definitions, formulas,
 validity rules, coverage denominators, support flags, and file organization.
@@ -19,17 +24,17 @@ the differences in the ARCTERX implementation, read the
 [interpretation and Poje comparison](interpretation_and_poje_comparison.md).
 The first linear Array 4 numerical run is recorded in the
 [Stage 2 pilot report](stage2_array4_pilot.md).
-The [figure guide](figure_guide.md) explains every Stage 3 panel, comparison
-figure, uncertainty label, and visual support convention.
+The [figure guide](figure_guide.md) explains the legacy pilot panels, comparison
+figures, uncertainty labels, and visual support conventions.
 The first uncertainty-aware Array 4 result is recorded in the
 [Stage 3 pilot report](stage3_array4_pilot.md).
 
-Each array now exposes four inspection tables (`clusters.csv`,
+Each legacy standalone epsilon array exposes four inspection tables (`clusters.csv`,
 `epsilon_by_scale.csv`, `statistics.csv`, and `coverage.csv`) plus normalized
-pair and platform Parquet data. Stage 3 adds detailed histogram, bootstrap
-sensitivity, and leave-one-platform-out Parquet data without adding more routine
-inspection CSVs. Snapshot and nested-window observations are not duplicated in
-the raw pair table.
+pair and platform Parquet data. The unified workflow retains the histogram and
+bootstrap-sensitivity products but does not publish the former
+leave-one-platform-out influence product. Snapshot and nested-window
+observations are not duplicated in the raw pair table.
 
 Run a configured analysis with:
 
@@ -65,6 +70,7 @@ drifterlab-epsilon-diagnostics configs/arcterx/09_microSVP_epsilon_diagnostics.l
 This creates a separate diagnostic bundle and does not rerun or modify the
 source epsilon product.
 
-The tracked `configs/arcterx/epsilon.yml` is a path-neutral template. Local
-configurations and scientific outputs are intentionally ignored by Git. Set
-`stage3.enabled: false` for a numerical-only Stage 2 product.
+The tracked `configs/arcterx/epsilon.yml` is a path-neutral legacy-command
+template. Local configurations and scientific outputs are intentionally ignored
+by Git. In the unified configuration, `uncertainty`, `q_distribution`, and
+`figures` are named directly; there is no numbered analysis stage.

@@ -85,6 +85,8 @@ class ClusterVelocityConfig:
     histogram_bins: int
     speed_range_m_s: tuple[float, float] | None
     share_probability_density_y_axis: bool
+    method: str = "centered_difference"
+    maximum_source_gap_minutes: float = 30.0
 
 
 @dataclass(frozen=True)
@@ -108,9 +110,12 @@ class ClusterStatisticsConfig:
 class PostprocessingConfig:
     source_path: Path
     trajectory_path: Path
+    trajectory_product: str | None
     dataset_label: str
     coordinate_method: str
     output_directory: Path
+    selected_arrays: str | tuple[int, ...]
+    selected_clusters: str | tuple[str, ...]
     arrays: dict[int, ArrayMetadataConfig]
     trajectory_plotting: TrajectoryPlottingConfig
     cluster_statistics: ClusterStatisticsConfig
@@ -122,10 +127,21 @@ class PostprocessingConfig:
         return {
             "input": {
                 "trajectories": str(self.trajectory_path),
+                "trajectory_product": self.trajectory_product,
                 "dataset_label": self.dataset_label,
                 "coordinate_method": self.coordinate_method,
             },
             "output": {"directory": str(self.output_directory)},
+            "selection": {
+                "arrays": (
+                    self.selected_arrays if isinstance(self.selected_arrays, str)
+                    else list(self.selected_arrays)
+                ),
+                "clusters": (
+                    self.selected_clusters if isinstance(self.selected_clusters, str)
+                    else list(self.selected_clusters)
+                ),
+            },
             "arrays": {
                 _array_key(array_id): {
                     "nominal_deployment_time": _optional_utc(item.nominal_deployment_time),
@@ -180,8 +196,12 @@ class PostprocessingConfig:
                 "stop_on_member_loss": statistics.stop_on_member_loss,
                 "percentiles": list(statistics.percentiles),
                 "velocity": {
+                    "method": statistics.velocity.method,
                     "difference_interval_minutes": (
                         statistics.velocity.difference_interval_minutes
+                    ),
+                    "maximum_source_gap_minutes": (
+                        statistics.velocity.maximum_source_gap_minutes
                     ),
                     "histogram_bins": statistics.velocity.histogram_bins,
                     "speed_range_m_s": (
@@ -367,15 +387,21 @@ def load_postprocessing_config(path: str | Path) -> PostprocessingConfig:
         data = yaml.safe_load(stream)
     data = _mapping(
         data,
-        {"input", "output", "arrays", "trajectory_plotting", "cluster_statistics"},
+        {
+            "input", "output", "selection", "arrays", "trajectory_plotting",
+            "cluster_statistics",
+        },
         "configuration",
     )
     input_section = _mapping(
         data.get("input", {}),
-        {"trajectories", "dataset_label", "coordinate_method"},
+        {"trajectories", "trajectory_product", "dataset_label", "coordinate_method"},
         "input",
     )
     output_section = _mapping(data.get("output", {}), {"directory"}, "output")
+    selection_section = _mapping(
+        data.get("selection", {}), {"arrays", "clusters"}, "selection",
+    )
 
     def resolved(value: Any, name: str) -> Path:
         text = _nonempty_string(value, name)
@@ -386,14 +412,52 @@ def load_postprocessing_config(path: str | Path) -> PostprocessingConfig:
     dataset_label = _nonempty_string(
         input_section.get("dataset_label", "current"), "input.dataset_label",
     )
-    coordinate_method = _nonempty_string(
-        input_section.get("coordinate_method", "linear"), "input.coordinate_method",
+    product_raw = input_section.get("trajectory_product")
+    trajectory_product = (
+        None if product_raw is None
+        else _nonempty_string(product_raw, "input.trajectory_product")
     )
+    if trajectory_product is not None and (
+        "/" in trajectory_product or "\\" in trajectory_product
+    ):
+        raise ValueError("input.trajectory_product must be one direct product-group name")
+    coordinate_method = _nonempty_string(
+        input_section.get(
+            "coordinate_method", "product" if trajectory_product is not None else "linear",
+        ),
+        "input.coordinate_method",
+    )
+    if trajectory_product is not None and coordinate_method != "product":
+        raise ValueError(
+            "input.coordinate_method must be 'product' when trajectory_product is selected"
+        )
     if not METHOD_PATTERN.fullmatch(coordinate_method):
         raise ValueError("input.coordinate_method must contain only letters, digits, and underscores")
     output_directory = resolved(output_section.get("directory"), "output.directory")
     if output_directory == trajectory_path or trajectory_path in output_directory.parents:
         raise ValueError("Postprocessing output must be outside the input trajectory store")
+
+    def selected(value: Any, name: str, *, identifiers: bool):
+        if value == "all":
+            return "all"
+        if not isinstance(value, list) or not value:
+            raise ValueError(f"{name} must be 'all' or a nonempty list")
+        if identifiers:
+            if any(isinstance(item, bool) or not isinstance(item, int) or item < 1 for item in value):
+                raise ValueError(f"{name} must contain positive integers")
+            parsed = tuple(value)
+        else:
+            parsed = tuple(_nonempty_string(item, name) for item in value)
+        if len(set(parsed)) != len(parsed):
+            raise ValueError(f"{name} contains duplicates")
+        return parsed
+
+    selected_arrays = selected(
+        selection_section.get("arrays", "all"), "selection.arrays", identifiers=True,
+    )
+    selected_clusters = selected(
+        selection_section.get("clusters", "all"), "selection.clusters", identifiers=False,
+    )
 
     raw_arrays = data.get("arrays", {})
     if not isinstance(raw_arrays, dict):
@@ -552,27 +616,40 @@ def load_postprocessing_config(path: str | Path) -> PostprocessingConfig:
     velocity_section = _mapping(
         statistics_section.get("velocity", {}),
         {
-            "difference_interval_minutes", "histogram_bins", "speed_range_m_s",
-            "share_probability_density_y_axis",
+            "method", "difference_interval_minutes", "maximum_source_gap_minutes",
+            "histogram_bins", "speed_range_m_s", "share_probability_density_y_axis",
         },
         "cluster_statistics.velocity",
     )
+    velocity_method = _nonempty_string(
+        velocity_section.get("method", "centered_difference"),
+        "cluster_statistics.velocity.method",
+    )
+    if velocity_method not in {"centered_difference", "stored_forward"}:
+        raise ValueError(
+            "cluster_statistics.velocity.method must be centered_difference or stored_forward"
+        )
     velocity = ClusterVelocityConfig(
-        _positive_number(
+        difference_interval_minutes=_positive_number(
             velocity_section.get("difference_interval_minutes", 30),
             "cluster_statistics.velocity.difference_interval_minutes",
         ),
-        _positive_integer(
+        histogram_bins=_positive_integer(
             velocity_section.get("histogram_bins", 50),
             "cluster_statistics.velocity.histogram_bins",
         ),
-        _parse_speed_range(
+        speed_range_m_s=_parse_speed_range(
             velocity_section.get("speed_range_m_s"),
             "cluster_statistics.velocity.speed_range_m_s",
         ),
-        _boolean(
+        share_probability_density_y_axis=_boolean(
             velocity_section.get("share_probability_density_y_axis", False),
             "cluster_statistics.velocity.share_probability_density_y_axis",
+        ),
+        method=velocity_method,
+        maximum_source_gap_minutes=_positive_number(
+            velocity_section.get("maximum_source_gap_minutes", 30),
+            "cluster_statistics.velocity.maximum_source_gap_minutes",
         ),
     )
     statistics_plotting_section = _mapping(
@@ -624,6 +701,7 @@ def load_postprocessing_config(path: str | Path) -> PostprocessingConfig:
         statistics_overrides,
     )
     return PostprocessingConfig(
-        source_path, trajectory_path, dataset_label, coordinate_method,
-        output_directory, arrays, trajectory_plotting, cluster_statistics,
+        source_path, trajectory_path, trajectory_product, dataset_label, coordinate_method,
+        output_directory, selected_arrays, selected_clusters, arrays,
+        trajectory_plotting, cluster_statistics,
     )

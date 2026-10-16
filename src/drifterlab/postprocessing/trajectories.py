@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import xarray as xr
+
+from drifterlab.trajectories.product_store import load_trajectory_product
 
 from .config import PostprocessingConfig, TimeWindowConfig
 
@@ -57,11 +60,15 @@ class ClusterArrayTrajectoryData:
     latitude: np.ndarray
     projection_origin_longitude: float
     projection_origin_latitude: float
+    source_gap_minutes: np.ndarray | None = None
+    eastward_velocity: np.ndarray | None = None
+    northward_velocity: np.ndarray | None = None
+    velocity_dt_seconds: np.ndarray | None = None
 
 
 def _coordinate_names(dataset: xr.Dataset, method: str) -> tuple[str, str]:
     candidates = (
-        (("longitude", "latitude"),) if method == "native" else ()
+        (("longitude", "latitude"),) if method in {"native", "product"} else ()
     ) + ((f"longitude_{method}", f"latitude_{method}"),)
     for longitude, latitude in candidates:
         if longitude in dataset.variables and latitude in dataset.variables:
@@ -74,6 +81,18 @@ def _coordinate_names(dataset: xr.Dataset, method: str) -> tuple[str, str]:
     raise ValueError(
         f"Trajectory store has no coordinate method {method!r}; available methods are {available}"
     )
+
+
+def _dataset_context(config: PostprocessingConfig):
+    """Open a legacy reconstruction or load one selected grouped product."""
+    path = config.trajectory_path
+    if config.trajectory_product is not None:
+        dataset, _info = load_trajectory_product(path, config.trajectory_product)
+        return nullcontext(dataset)
+    try:
+        return xr.open_zarr(path, consolidated=True, chunks=None)
+    except Exception as exc:
+        raise ValueError(f"Cannot open consolidated trajectory Zarr {path}: {exc}") from exc
 
 
 def _merged_time_window(
@@ -106,7 +125,15 @@ def _validate_base_dataset(dataset: xr.Dataset, path: Path) -> tuple[np.ndarray,
     if len(times) == 0 or np.isnat(times).any() or np.any(np.diff(times.astype(np.int64)) <= 0):
         raise ValueError("Trajectory time must be nonempty, finite, and strictly increasing")
     array_values = dataset.array_id.values
-    if not np.issubdtype(array_values.dtype, np.integer) or np.any(array_values < 1):
+    try:
+        array_numbers = np.asarray(array_values, dtype=float)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Trajectory array_id must be numeric") from exc
+    if (
+        not np.isfinite(array_numbers).all()
+        or np.any(array_numbers < 1)
+        or np.any(array_numbers != np.floor(array_numbers))
+    ):
         raise ValueError("Trajectory array_id must contain positive integers")
     starts = dataset.start_time.values.astype("datetime64[ns]")
     if np.isnat(starts).any():
@@ -173,10 +200,7 @@ def load_cluster_statistic_trajectories(
     path = config.trajectory_path
     if not path.is_dir():
         raise ValueError(f"Trajectory Zarr does not exist: {path}")
-    try:
-        context = xr.open_zarr(path, consolidated=True, chunks=None)
-    except Exception as exc:
-        raise ValueError(f"Cannot open consolidated trajectory Zarr {path}: {exc}") from exc
+    context = _dataset_context(config)
     with context as dataset:
         platform_ids, times = _validate_base_dataset(dataset, path)
         longitude_name, latitude_name = _coordinate_names(dataset, config.coordinate_method)
@@ -194,6 +218,16 @@ def load_cluster_statistic_trajectories(
 
         longitude_all = dataset[longitude_name].values.astype(float)
         latitude_all = dataset[latitude_name].values.astype(float)
+        stored_names = (
+            "source_gap_minutes", "eastward_velocity", "northward_velocity",
+            "velocity_dt_seconds",
+        )
+        stored_velocity = (
+            {name: dataset[name].values.astype(float) for name in stored_names}
+            if all(name in dataset and dataset[name].dims == ("platform", "time")
+                   for name in stored_names)
+            else None
+        )
         finite_all = _validate_coordinates(
             longitude_all, latitude_all, method=config.coordinate_method,
         )
@@ -228,9 +262,22 @@ def load_cluster_statistic_trajectories(
         cluster_sizes_all = raw_sizes.astype(np.int64)
 
         array_values = dataset.array_id.values.astype(int)
-        array_ids = tuple(sorted(set(array_values.tolist())))
+        available_array_ids = tuple(sorted(set(array_values.tolist())))
+        if isinstance(config.selected_arrays, tuple):
+            missing_arrays = sorted(set(config.selected_arrays) - set(available_array_ids))
+            if missing_arrays:
+                raise ValueError(f"Selected arrays are unavailable: {missing_arrays}")
+            array_ids = config.selected_arrays
+        else:
+            array_ids = available_array_ids
+        if isinstance(config.selected_clusters, tuple):
+            selected_scope = np.isin(array_values, np.asarray(array_ids))
+            available_clusters = set(cluster_ids_all[selected_scope].tolist())
+            missing_clusters = sorted(set(config.selected_clusters) - available_clusters)
+            if missing_clusters:
+                raise ValueError(f"Selected clusters are unavailable: {missing_clusters}")
         configured_ids = set(config.arrays) | set(config.cluster_statistics.array_overrides)
-        unknown = sorted(configured_ids - set(array_ids))
+        unknown = sorted(configured_ids - set(available_array_ids))
         if unknown:
             raise ValueError(f"Postprocessing configuration references unknown arrays: {unknown}")
 
@@ -254,6 +301,12 @@ def load_cluster_statistic_trajectories(
         statistics = config.cluster_statistics
         for array_id in array_ids:
             platform_mask = array_values == array_id
+            if isinstance(config.selected_clusters, tuple):
+                platform_mask &= np.isin(
+                    cluster_ids_all, np.asarray(config.selected_clusters, dtype=object),
+                )
+            if not platform_mask.any():
+                raise ValueError(f"Array {array_id} contains no selected clusters")
             longitude_full = longitude_all[platform_mask]
             latitude_full = latitude_all[platform_mask]
             finite_full = finite_all[platform_mask]
@@ -286,6 +339,22 @@ def load_cluster_statistic_trajectories(
                 latitude=latitude_full[:, time_mask].copy(),
                 projection_origin_longitude=origin_longitude,
                 projection_origin_latitude=origin_latitude,
+                source_gap_minutes=(
+                    None if stored_velocity is None else
+                    stored_velocity["source_gap_minutes"][platform_mask][:, time_mask].copy()
+                ),
+                eastward_velocity=(
+                    None if stored_velocity is None else
+                    stored_velocity["eastward_velocity"][platform_mask][:, time_mask].copy()
+                ),
+                northward_velocity=(
+                    None if stored_velocity is None else
+                    stored_velocity["northward_velocity"][platform_mask][:, time_mask].copy()
+                ),
+                velocity_dt_seconds=(
+                    None if stored_velocity is None else
+                    stored_velocity["velocity_dt_seconds"][platform_mask][:, time_mask].copy()
+                ),
             ))
         return tuple(result), _input_metadata(dataset, array_ids)
 
@@ -298,10 +367,7 @@ def load_array_trajectories(
     if not path.is_dir():
         raise ValueError(f"Trajectory Zarr does not exist: {path}")
     plotting = config.trajectory_plotting
-    try:
-        context = xr.open_zarr(path, consolidated=True, chunks=None)
-    except Exception as exc:
-        raise ValueError(f"Cannot open consolidated trajectory Zarr {path}: {exc}") from exc
+    context = _dataset_context(config)
     with context as dataset:
         platform_ids, times = _validate_base_dataset(dataset, path)
         longitude_name, latitude_name = _coordinate_names(dataset, config.coordinate_method)
@@ -318,9 +384,23 @@ def load_array_trajectories(
             )
 
         array_values = dataset.array_id.values.astype(int)
-        array_ids = tuple(sorted(set(array_values.tolist())))
+        cluster_values = dataset.cluster_id.values.astype(str)
+        available_array_ids = tuple(sorted(set(array_values.tolist())))
+        if isinstance(config.selected_arrays, tuple):
+            missing_arrays = sorted(set(config.selected_arrays) - set(available_array_ids))
+            if missing_arrays:
+                raise ValueError(f"Selected arrays are unavailable: {missing_arrays}")
+            array_ids = config.selected_arrays
+        else:
+            array_ids = available_array_ids
+        if isinstance(config.selected_clusters, tuple):
+            selected_scope = np.isin(array_values, np.asarray(array_ids))
+            available_clusters = set(cluster_values[selected_scope].tolist())
+            missing_clusters = sorted(set(config.selected_clusters) - available_clusters)
+            if missing_clusters:
+                raise ValueError(f"Selected clusters are unavailable: {missing_clusters}")
         configured_ids = set(config.arrays) | set(plotting.array_overrides)
-        unknown = sorted(configured_ids - set(array_ids))
+        unknown = sorted(configured_ids - set(available_array_ids))
         if unknown:
             raise ValueError(f"Postprocessing configuration references unknown arrays: {unknown}")
 
@@ -331,6 +411,12 @@ def load_array_trajectories(
         result: list[ArrayTrajectoryData] = []
         for array_id in array_ids:
             platform_mask = array_values == array_id
+            if isinstance(config.selected_clusters, tuple):
+                platform_mask &= np.isin(
+                    cluster_values, np.asarray(config.selected_clusters),
+                )
+            if not platform_mask.any():
+                raise ValueError(f"Array {array_id} contains no selected clusters")
             longitude = longitude_all[platform_mask]
             latitude = latitude_all[platform_mask]
             finite = np.isfinite(longitude) & np.isfinite(latitude)

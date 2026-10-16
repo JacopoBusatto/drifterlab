@@ -12,6 +12,10 @@ python -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -e ".[test,plotting]"
 ```
 
+The independent desktop manual-QC application additionally requires
+`pip install -e ".[manual-qc]"`; its controls, persistence, and output contract
+are documented in [independent manual position QC](docs/manual_position_qc.md).
+
 ## Production commands
 
 For the complete operational sequence, review checkpoints, command-line flags,
@@ -33,6 +37,20 @@ drifterlab-drogue configs/arcterx/drogue_detection.local.yml --semiautomatic
 drifterlab-position-qc configs/arcterx/position_qc.local.yml --automatic
 # Or finish the conservative queue with --semiautomatic / --manual.
 
+# Independent exhaustive position/SST review (no detection thresholds/events).
+# The button can build a provisional grouped Zarr from current finalized platforms;
+# the complete grouped Zarr builds automatically after the last finalization.
+drifterlab-manual-position-qc configs/arcterx/02_bis_microSVP_manual_position_qc.local.yml
+
+# Analyze one grouped v2 trajectory product after building it in the GUI.
+drifterlab-analyze configs/arcterx/v2/02a_microsvp_analysis_qc_5min.local.yml
+
+# Import and analyze campaign-supplied automatic QC without changing v2.
+# See docs/supplied_qc_comparison.md for the complete 9-product x 2-mode matrix.
+drifterlab-import-supplied-qc configs/arcterx/automatic_qc/00_microsvp_import.local.yml
+drifterlab-analyze configs/arcterx/automatic_qc/02_ar_qc_5min_analysis.local.yml
+drifterlab-compare-qc configs/arcterx/automatic_qc/03_ar_qc_5min_comparison.local.yml
+
 drifterlab-reconstruct-trajectories configs/arcterx/trajectory_reconstruction.local.yml
 # Add --overwrite only when intentionally replacing a stale reconstruction.
 
@@ -47,6 +65,16 @@ Zarr products are ignored by Git.
 The raw-MAT drogue and position readers remain the upstream source adapters. See
 [drogue-loss detection](docs/drogue_loss_review.md) and
 [native-position QC](docs/native_position_qc.md) for those stages.
+
+## Grouped v2 trajectory analysis
+
+The manual-QC Zarr is analyzed directly with `drifterlab-analyze`; it does not
+pass through the spline reconstruction workflow. One configuration selects a
+group such as `qc_5min`, one shared velocity definition, optional array/cluster
+subsets, and all four analysis modules. Results are published as
+`01_trajectory_plots`, `02_trajectory_statistics`, `03_epsilon`, and
+`04_epsilon_diagnostics` with one root manifest. See
+[unified grouped-product analysis](docs/unified_analysis.md).
 
 ## Position-QC input contract
 
@@ -148,9 +176,15 @@ within-cluster and individual-cluster spectra for each array. See
 
 The delivered ARCTERX QC MATLAB adapter and the investigative tools under
 [`scripts/diagnostics/`](scripts/diagnostics/README.md) remain available for
-read-only historical comparisons. They are not production inputs and no installed
-MAT-to-Zarr command remains. Existing legacy master stores can still be inspected;
-tests create a synthetic legacy store without restoring the removed producer.
+read-only historical comparisons. Existing legacy master stores can still be
+inspected; tests create a synthetic legacy store without restoring that removed
+producer.
+
+The separate supplied-QC importer can now normalize a new delivered MAT set into
+the grouped v2 analysis contract without restoring the legacy master format or
+changing the v2 analysis. Its native-start and optional manual-reference modes,
+product definitions, and comparison workflow are documented in
+[supplied automatic-QC comparison](docs/supplied_qc_comparison.md).
 
 The inspected delivered-MAT layout is documented in
 [ARCTERX supplied-QC schema](docs/arcterx_schema.md). This provenance does not imply

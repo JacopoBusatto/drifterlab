@@ -451,7 +451,14 @@ def _source_derivative_span_minutes(
             "pair_relative_motion.derivative_span currently supports "
             "source_analysis_velocity only"
         )
-    raw = resolved.get("analysis", {}).get("total_span_minutes")
+    analysis = resolved.get("analysis", {})
+    raw = analysis.get("total_span_minutes")
+    if raw is None and analysis.get("velocity_method") in {
+        "stored_forward", "stored_forward_difference",
+    }:
+        # A stored forward velocity is assigned to the earlier endpoint and
+        # represents one selected-product sampling interval.
+        raw = analysis.get("sample_cadence_minutes")
     if isinstance(raw, bool) or not isinstance(raw, Real):
         raise ValueError("Source resolved config has no numeric analysis velocity span")
     result = float(raw)
@@ -728,6 +735,14 @@ def run_epsilon_diagnostics(
     pair_derivative_span_minutes = _source_derivative_span_minutes(
         source_resolved, config.pair_relative_motion.derivative_span,
     ) if config.pair_relative_motion.enabled else None
+    source_velocity_method = source_resolved.get("analysis", {}).get(
+        "velocity_method"
+    )
+    pair_derivative_time_assignment = (
+        "earlier_endpoint"
+        if source_velocity_method in {"stored_forward", "stored_forward_difference"}
+        else "center_timestamp"
+    )
     if config.time_scale_contributions.enabled or config.influence_audit.enabled:
         (
             separation_edges_m,
@@ -1020,6 +1035,9 @@ def run_epsilon_diagnostics(
                             activation_time_utc=str(activation),
                             window_end_hour=window_end_hour,
                             derivative_span_minutes=float(pair_derivative_span_minutes),
+                            derivative_time_assignment=(
+                                pair_derivative_time_assignment
+                            ),
                             dpi=config.pair_relative_motion.dpi,
                         )
                         products.append(pair_figure_path)

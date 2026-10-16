@@ -6,7 +6,7 @@ from dataclasses import dataclass
 import math
 
 import numpy as np
-from pyproj import CRS, Transformer
+from pyproj import CRS, Geod, Transformer
 
 
 PROJECTION_ORIGIN_METHOD = "equal_weight_spherical_mean_of_platform_first_finite_positions"
@@ -39,6 +39,104 @@ class CenteredVelocityResult:
     stencil_point_count: int
     required_validity_point_count: int
     full_stencil_support_required: bool
+
+
+def stored_forward_velocity_in_projection(
+    longitude: np.ndarray,
+    latitude: np.ndarray,
+    x_m: np.ndarray,
+    y_m: np.ndarray,
+    eastward_velocity_m_s: np.ndarray,
+    northward_velocity_m_s: np.ndarray,
+    velocity_dt_seconds: np.ndarray,
+    source_gap_minutes: np.ndarray,
+    transformer: Transformer,
+    *,
+    maximum_source_gap_minutes: float,
+    speed_mask_m_s: float | None = None,
+) -> CenteredVelocityResult:
+    """Express stored geographic forward velocities in one array projection.
+
+    The Zarr stores east/north components for the interval from each timestamp
+    to the next.  A one-second geodesic displacement converts those components
+    into the fixed array projection without recalculating their magnitude from
+    the positions.
+    """
+
+    arrays = [
+        np.asarray(value, dtype=float)
+        for value in (
+            longitude, latitude, x_m, y_m, eastward_velocity_m_s,
+            northward_velocity_m_s, velocity_dt_seconds, source_gap_minutes,
+        )
+    ]
+    shape = arrays[0].shape
+    if any(value.shape != shape for value in arrays) or len(shape) != 2:
+        raise ValueError("Stored forward-velocity inputs must be platform-by-time peers")
+    (
+        lon, lat, x, y, east, north, duration, gaps,
+    ) = arrays
+    if not math.isfinite(maximum_source_gap_minutes) or maximum_source_gap_minutes <= 0:
+        raise ValueError("Maximum source gap must be finite and positive")
+
+    valid = (
+        np.isfinite(lon) & np.isfinite(lat) & np.isfinite(x) & np.isfinite(y)
+        & np.isfinite(east) & np.isfinite(north)
+        & np.isfinite(duration) & (duration > 0)
+    )
+    gap_valid = np.isfinite(gaps) & (gaps <= maximum_source_gap_minutes)
+    # Each stored forward interval depends on its current and following product
+    # positions.  Apply the source-support threshold to both endpoints.
+    endpoint_support = np.zeros(shape, dtype=bool)
+    endpoint_support[:, :-1] = gap_valid[:, :-1] & gap_valid[:, 1:]
+    valid &= endpoint_support
+
+    reason = np.full(shape, "missing_stored_forward_velocity", dtype="<U40")
+    reason[np.isfinite(east) & np.isfinite(north)] = "missing_forward_endpoint_support"
+    reason[valid] = "valid"
+
+    speed = np.hypot(east, north)
+    if speed_mask_m_s is not None:
+        if not math.isfinite(speed_mask_m_s) or speed_mask_m_s <= 0:
+            raise ValueError("Speed mask must be finite and positive or null")
+        exceeded = valid & (speed > speed_mask_m_s)
+        valid[exceeded] = False
+        reason[exceeded] = "speed_mask_exceeded"
+
+    u = np.full(shape, np.nan, dtype=float)
+    v = np.full(shape, np.nan, dtype=float)
+    indices = np.flatnonzero(valid)
+    if len(indices):
+        flat_lon = lon.ravel()[indices]
+        flat_lat = lat.ravel()[indices]
+        flat_speed = speed.ravel()[indices]
+        azimuth = np.rad2deg(np.arctan2(east.ravel()[indices], north.ravel()[indices]))
+        displaced_lon, displaced_lat, _ = Geod(ellps="WGS84").fwd(
+            flat_lon, flat_lat, azimuth, flat_speed,
+        )
+        displaced_x, displaced_y = transformer.transform(
+            displaced_lon, displaced_lat,
+        )
+        u.ravel()[indices] = np.asarray(displaced_x) - x.ravel()[indices]
+        v.ravel()[indices] = np.asarray(displaced_y) - y.ravel()[indices]
+        finite_projected = np.isfinite(u) & np.isfinite(v)
+        reason[valid & ~finite_projected] = "nonfinite_velocity"
+        valid &= finite_projected
+
+    finite_duration = duration[np.isfinite(duration) & (duration > 0)]
+    cadence_seconds = float(np.median(finite_duration)) if len(finite_duration) else np.nan
+    return CenteredVelocityResult(
+        u_m_s=u,
+        v_m_s=v,
+        valid=valid,
+        invalid_reason=reason,
+        cadence_seconds=cadence_seconds,
+        total_span_seconds=cadence_seconds,
+        half_span_steps=0,
+        stencil_point_count=2,
+        required_validity_point_count=2,
+        full_stencil_support_required=False,
+    )
 
 
 def spherical_mean(longitude: np.ndarray, latitude: np.ndarray) -> tuple[float, float]:

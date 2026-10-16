@@ -65,7 +65,7 @@ def _write_trajectory_store(path: Path) -> None:
     dataset.to_zarr(path, mode="w", consolidated=True)
 
 
-def test_stage_2_workflow_keeps_singletons_and_uses_full_pair_coverage_denominator(
+def test_epsilon_workflow_keeps_singletons_and_uses_full_pair_coverage_denominator(
     tmp_path: Path,
 ) -> None:
     store = tmp_path / "trajectories.zarr"
@@ -112,26 +112,27 @@ support:
   unique_pairs: 3
   platforms: 3
   unique_utc: 12
-stage3:
+uncertainty:
   enabled: true
-  uncertainty:
-    method: synchronized_utc_block_bootstrap
-    confidence_level: 0.95
-    replicates: 100
-    random_seed: 7
-    primary_block_minutes: 30
-    sensitivity_block_minutes: [60]
-    minimum_contributing_blocks: 2
-    minimum_successful_replicate_fraction: 0.9
-  q_histogram:
-    maximum_absolute_m2_s3: 0.01
-    linear_threshold_m2_s3: 0.00000001
-    bins_per_decade: 2
-  figures:
-    dpi: 72
-    scatter_maximum_points: 100
-    epsilon_linear_threshold_m2_s3: 0.00000001
-    heatmap_probability_maximum: 0.5
+  method: synchronized_utc_block_bootstrap
+  confidence_level: 0.95
+  replicates: 100
+  random_seed: 7
+  primary_block_minutes: 30
+  sensitivity_block_minutes: [60]
+  minimum_contributing_blocks: 2
+  minimum_successful_replicate_fraction: 0.9
+q_distribution:
+  enabled: true
+  maximum_absolute_m2_s3: 0.01
+  linear_threshold_m2_s3: 0.00000001
+  bins_per_decade: 2
+figures:
+  enabled: true
+  dpi: 72
+  scatter_maximum_points: 100
+  epsilon_linear_threshold_m2_s3: 0.00000001
+  heatmap_probability_maximum: 0.5
 output:
   root: {output.as_posix()}
 """,
@@ -183,7 +184,7 @@ output:
     assert manifest["input"]["product_status"] == "candidate_pending_gap_review"
     assert manifest["scientific_conventions"]["velocity_stencil_point_count"] == 7
     assert manifest["scientific_conventions"]["analysis_required_validity_point_count"] == 7
-    assert manifest["analysis"]["figures"] == "stage3_cluster_products_and_comparisons"
+    assert manifest["analysis"]["figures"] == "cluster_products_and_comparisons"
     assert set(manifest["output_layout"]["readable_tables"]) == {
         "clusters.csv", "epsilon_by_scale.csv", "statistics.csv", "coverage.csv",
     }
@@ -194,10 +195,13 @@ output:
     ).is_file()
     assert (array_directory / "data" / "q_histograms.parquet").is_file()
     assert (array_directory / "data" / "bootstrap_sensitivity.parquet").is_file()
-    assert (array_directory / "data" / "leave_one_platform_out.parquet").is_file()
-    assert {"epsilon_ci_lower_m2_s3", "maximum_lopo_absolute_change_m2_s3"} <= set(
-        pd.read_csv(array_directory / "epsilon_by_scale.csv").columns
-    )
+    assert not (array_directory / "data" / "leave_one_platform_out.parquet").exists()
+    assert "epsilon_ci_lower_m2_s3" in pd.read_csv(
+        array_directory / "epsilon_by_scale.csv"
+    ).columns
+    assert "maximum_lopo_absolute_change_m2_s3" not in pd.read_csv(
+        array_directory / "epsilon_by_scale.csv"
+    ).columns
     assert not any(array_directory.glob("cluster_*"))
     statistics = pd.read_csv(array_directory / "statistics.csv")
     assert set(statistics.population_level) == {"pair", "platform"}

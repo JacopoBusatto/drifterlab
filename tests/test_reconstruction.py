@@ -1,9 +1,13 @@
 """Focused numerical tests for common-grid trajectory reconstruction."""
 
 import numpy as np
-
-from drifterlab.reconstruction.core import reconstruct_platform, resample_linear_track
-
+import pytest
+from drifterlab.reconstruction.core import (
+    build_regular_product,
+    forward_velocity,
+    reconstruct_platform,
+    resample_linear_track,
+)
 
 def times(minutes):
     return np.datetime64("2025-01-12T00:00:00", "ns") + np.asarray(minutes).astype("timedelta64[m]")
@@ -76,6 +80,36 @@ def test_phase_overshoot_falls_back_for_the_complete_portion():
     assert result.fallback[15].overshoot_portions == 1
     assert result.fallback[15].overshoot_points == 13
 
+def test_linear_track_masks_interpolation_across_large_source_gaps():
+    grid = times(range(0, 46, 5))
+    result = resample_linear_track(
+        times([0, 5, 40, 45]),
+        [0.0, 0.1, 0.8, 0.9],
+        [0.0, 0.1, 0.8, 0.9],
+        grid,
+        coverage_start=grid[0],
+        coverage_end=grid[-1],
+        maximum_gap_minutes=30,
+    )
+
+    expected_valid = np.asarray([
+        True, True,
+        False, False, False, False, False, False,
+        True, True,
+    ])
+    np.testing.assert_array_equal(
+        np.isfinite(result.longitude),
+        expected_valid,
+    )
+    np.testing.assert_array_equal(
+        np.isfinite(result.latitude),
+        expected_valid,
+    )
+    np.testing.assert_allclose(
+        result.source_gap_minutes[2:8],
+        35,
+    )
+    assert result.filled_grid_points == 4
 
 def test_native_linear_resampling_uses_explicit_span_and_unwraps_dateline():
     result = resample_linear_track(
@@ -88,3 +122,51 @@ def test_native_linear_resampling_uses_explicit_span_and_unwraps_dateline():
     np.testing.assert_allclose(result.longitude[1:4], [179, -179, -170])
     np.testing.assert_array_equal(result.source_gap_minutes, [np.nan, 0, 0, 0, np.nan])
     assert result.filled_grid_points == 3 and result.exact_grid_points == 3
+
+def test_forward_velocity_requires_both_endpoints_and_uses_actual_dt():
+    result = forward_velocity(
+        times([0, 5, 15, 20]),
+        [0.0, 0.01, 0.02, np.nan],
+        [0.0, 0.0, 0.0, 0.0],
+    )
+
+    np.testing.assert_array_equal(
+        np.isfinite(result.speed_m_s),
+        [True, True, False, False],
+    )
+    np.testing.assert_allclose(
+        result.dt_seconds[:2],
+        [300, 600],
+    )
+    assert result.speed_m_s[0] == pytest.approx(
+        2 * result.speed_m_s[1],
+    )
+    assert result.east_m_s[0] > 0
+    assert abs(result.north_m_s[0]) < 1e-10
+
+def test_regular_product_does_not_create_velocity_across_masked_gap():
+    grid = times(range(0, 46, 5))
+    product = build_regular_product(
+        times([0, 5, 40, 45]),
+        [0.0, 0.1, 0.8, 0.9],
+        [0.0, 0.0, 0.0, 0.0],
+        grid,
+        coverage_start=grid[0],
+        coverage_end=grid[-1],
+        maximum_gap_minutes=30,
+    )
+
+    np.testing.assert_array_equal(
+        np.isfinite(product.position.longitude),
+        [True, True, False, False, False,
+         False, False, False, True, True],
+    )
+    np.testing.assert_array_equal(
+        np.isfinite(product.velocity.speed_m_s),
+        [True, False, False, False, False,
+         False, False, False, True, False],
+    )
+    np.testing.assert_allclose(
+        product.velocity.dt_seconds[[0, 8]],
+        [300, 300],
+    )

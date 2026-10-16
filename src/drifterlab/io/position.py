@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 import numpy as np
 import pandas as pd
@@ -23,6 +24,9 @@ class NativeTrajectory:
     source_obs_index: np.ndarray
     source_path: Path
     source_sha256: str
+    sst: np.ndarray | None = None
+    gps_pos_qual: np.ndarray | None = None
+    gps_num_sat: np.ndarray | None = None
 
     def __post_init__(self) -> None:
         lengths = {
@@ -31,6 +35,14 @@ class NativeTrajectory:
         }
         if len(lengths) != 1:
             raise ValueError("Native trajectory arrays must have equal lengths")
+        for name in ("sst", "gps_pos_qual", "gps_num_sat"):
+            value = getattr(self, name)
+            if value is not None:
+                array = np.asarray(value)
+                if array.ndim != 1 or len(array) != len(np.asarray(self.time)):
+                    raise ValueError(
+                        f"Native trajectory {name} must match the observation axis"
+                    )
         indices = np.asarray(self.source_obs_index)
         if indices.ndim != 1 or len(np.unique(indices)) != len(indices) or (indices < 0).any():
             raise ValueError("source_obs_index must contain unique nonnegative values")
@@ -54,13 +66,12 @@ def _identifier(value: Any, name: str) -> str:
 def read_microsvp_position_mat(
     path: str | Path, *, missing_value: float = -999,
 ) -> NativeTrajectory:
-    """Read raw MicroSVP positions without sorting or changing coordinates.
+    """Read aligned raw MicroSVP position, SST, and GPS references unchanged.
 
-    ``missing_value`` is accepted as a reader option for symmetry with the raw
-    signal reader.  It is deliberately not substituted in longitude/latitude:
-    source validity is a QC result, not an I/O mutation.
+    The source missing sentinel is normalized for optional scalar series.
+    Longitude and latitude remain byte-for-byte numeric source values because
+    their validity is a manual-QC decision rather than an I/O mutation.
     """
-    del missing_value
     path = Path(path).resolve()
     loaded = read_matlab(path)
     dataset = loaded.values.get("dataset")
@@ -91,9 +102,24 @@ def read_microsvp_position_mat(
     lat = np.asarray(track["GpsLatitude"]).reshape(-1).astype(float, copy=True)
     if len(lon) != len(time) or len(lat) != len(time):
         raise ValueError("Raw position lengths do not match ObsTimestamp")
+
+    def optional_series(source_name: str) -> np.ndarray:
+        if source_name not in track:
+            return np.full(len(time), np.nan, dtype=float)
+        values = np.asarray(track[source_name]).reshape(-1).astype(float, copy=True)
+        if len(values) != len(time):
+            raise ValueError(
+                f"Raw {source_name} length does not match ObsTimestamp"
+            )
+        values[values == float(missing_value)] = np.nan
+        return values
+
+    sst = optional_series("SST")
+    gps_pos_qual = optional_series("GpsPosQual")
+    gps_num_sat = optional_series("GpsNumSat")
     return NativeTrajectory(
         platform, time, lon, lat, np.arange(len(time), dtype=np.int64),
-        path, loaded.sha256,
+        path, loaded.sha256, sst, gps_pos_qual, gps_num_sat,
     )
 
 
@@ -111,4 +137,3 @@ def get_position_reader(name: str) -> PositionReader:
         raise ValueError(
             f"Unsupported position input reader {name!r}; supported readers: {supported}"
         ) from exc
-

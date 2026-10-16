@@ -20,6 +20,63 @@ Q_LABEL = r"$q=-\frac{5}{4}(\Delta u_L)^3/\delta$  [m$^2$ s$^{-3}$]"
 EPSILON_LABEL = r"$\widehat{\varepsilon}_{\mathrm{eff}}$  [m$^2$ s$^{-3}$]"
 
 
+def plot_spatial_q(
+    observations: pd.DataFrame,
+    *,
+    output_path: Path,
+    bounds_km: tuple[float, ...],
+    title: str,
+    start_utc: str,
+    end_utc: str,
+    available_count: int,
+    stride: int,
+    maximum_absolute_m2_s3: float,
+    linear_threshold_m2_s3: float,
+    dpi: int,
+) -> None:
+    """Place signed pairwise q at projected midpoints with fixed color limits."""
+    norm = SymLogNorm(
+        linthresh=linear_threshold_m2_s3, base=10,
+        vmin=-maximum_absolute_m2_s3, vmax=maximum_absolute_m2_s3,
+    )
+    figure, axis = plt.subplots(figsize=(8, 7))
+    try:
+        points = axis.scatter(
+            observations.midpoint_x_m.to_numpy(dtype=float) / 1000,
+            observations.midpoint_y_m.to_numpy(dtype=float) / 1000,
+            c=observations.q_m2_s3.to_numpy(dtype=float), s=9,
+            cmap="coolwarm", norm=norm, linewidths=0, rasterized=True,
+        )
+        figure.colorbar(points, ax=axis, label=Q_LABEL, extend="both", shrink=0.85)
+        axis.set_xlim(*bounds_km[:2])
+        axis.set_ylim(*bounds_km[2:])
+        axis.set_aspect("equal", adjustable="box")
+        axis.set_xlabel("Local projected x [km]")
+        axis.set_ylabel("Local projected y [km]")
+        axis.grid(alpha=0.2)
+        axis.set_title(f"{title}\n[{start_utc}, {end_utc})", fontsize=10)
+        if not len(observations):
+            axis.text(
+                0.5, 0.5, "No observations at selected timestamps",
+                transform=axis.transAxes, ha="center", va="center",
+            )
+        negative = int((observations.q_m2_s3 < -maximum_absolute_m2_s3).sum())
+        positive = int((observations.q_m2_s3 > maximum_absolute_m2_s3).sum())
+        figure.text(
+            0.5, 0.025,
+            f"Shown {len(observations):,} / {available_count:,} pair observations | "
+            f"timestamp stride {stride}\n"
+            f"Beyond color limits: {negative:,} negative, {positive:,} positive | "
+            "Pairwise q located at separation midpoints",
+            ha="center", fontsize=8,
+        )
+        figure.tight_layout(rect=(0, 0.085, 1, 1))
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        figure.savefig(output_path, dpi=dpi)
+    finally:
+        plt.close(figure)
+
+
 def _display_sample(frame: pd.DataFrame, maximum: int, identity: str) -> pd.DataFrame:
     if len(frame) <= maximum:
         return frame
@@ -330,6 +387,7 @@ def plot_cluster_pair_relative_motion(
     activation_time_utc: str,
     window_end_hour: float,
     derivative_span_minutes: float,
+    derivative_time_assignment: str = "center_timestamp",
     dpi: int,
 ) -> None:
     """Plot pair separation, relative velocities, availability, and cubic sign driver."""
@@ -357,11 +415,35 @@ def plot_cluster_pair_relative_motion(
     cadence_seconds = float(
         np.median(np.diff(timeline_index.asi8)) / 1_000_000_000
     )
-    half_span_seconds = derivative_span_minutes * 60 / 2
-    half_steps_float = half_span_seconds / cadence_seconds
-    half_steps = int(round(half_steps_float))
-    if half_steps < 1 or not math.isclose(half_steps_float, half_steps, abs_tol=1e-9):
-        raise ValueError("Velocity half-span must be an integer multiple of diagnostic cadence")
+    derivative_seconds = derivative_span_minutes * 60
+    if derivative_time_assignment == "center_timestamp":
+        half_span_seconds = derivative_seconds / 2
+        half_steps_float = half_span_seconds / cadence_seconds
+        half_steps = int(round(half_steps_float))
+        if half_steps < 1 or not math.isclose(
+            half_steps_float, half_steps, abs_tol=1e-9,
+        ):
+            raise ValueError(
+                "Velocity half-span must be an integer multiple of diagnostic cadence"
+            )
+        derivative_title = (
+            f"Centered separation rate ({derivative_span_minutes:g}-minute span)"
+        )
+    elif derivative_time_assignment == "earlier_endpoint":
+        forward_steps_float = derivative_seconds / cadence_seconds
+        forward_steps = int(round(forward_steps_float))
+        if forward_steps < 1 or not math.isclose(
+            forward_steps_float, forward_steps, abs_tol=1e-9,
+        ):
+            raise ValueError(
+                "Forward velocity span must be an integer multiple of diagnostic cadence"
+            )
+        derivative_title = (
+            f"Forward separation rate ({derivative_span_minutes:g}-minute span; "
+            "earlier endpoint)"
+        )
+    else:
+        raise ValueError(f"Unsupported derivative time assignment: {derivative_time_assignment}")
 
     figure, axes = plt.subplots(
         6, 1, figsize=(14, 16), sharex=True,
@@ -376,10 +458,15 @@ def plot_cluster_pair_relative_motion(
         longitudinal = aligned.delta_u_l_m_s.to_numpy(dtype=float)
         transverse = aligned.delta_u_t_m_s.to_numpy(dtype=float)
         separation_rate = np.full(len(aligned), np.nan, dtype=float)
-        if len(aligned) > 2 * half_steps:
-            separation_rate[half_steps:-half_steps] = (
-                separation[2 * half_steps:] - separation[:-2 * half_steps]
-            ) / (2 * half_span_seconds)
+        if derivative_time_assignment == "center_timestamp":
+            if len(aligned) > 2 * half_steps:
+                separation_rate[half_steps:-half_steps] = (
+                    separation[2 * half_steps:] - separation[:-2 * half_steps]
+                ) / derivative_seconds
+        elif len(aligned) > forward_steps:
+            separation_rate[:-forward_steps] = (
+                separation[forward_steps:] - separation[:-forward_steps]
+            ) / derivative_seconds
         first_id = str(pair.platform_id_1.dropna().iloc[0])
         second_id = str(pair.platform_id_2.dropna().iloc[0])
         label = f"{first_id[-5:]}–{second_id[-5:]}"
@@ -395,7 +482,7 @@ def plot_cluster_pair_relative_motion(
     axes[1].set_title("B  Longitudinal relative velocity", loc="left", fontsize=10)
     axes[1].set_ylabel(r"$\Delta u_L$ [m s$^{-1}$]")
     axes[2].set_title(
-        f"C  Centered separation rate ({derivative_span_minutes:g}-minute span)",
+        f"C  {derivative_title}",
         loc="left", fontsize=10,
     )
     axes[2].set_ylabel(r"$d\delta/dt$ [m s$^{-1}$]")
