@@ -30,7 +30,7 @@ def resolve_spatial_maps(raw: Any, epsilon: dict[str, Any]) -> dict[str, Any]:
     """Validate the opt-in map block and resolve inherited window definitions."""
     name = "analyses.epsilon.spatial_maps"
     section = _mapping(
-        raw, {"enabled", "couples", "windows", "resample_stride", "color", "dpi"}, name,
+        raw, {"enabled", "couples", "windows", "resample_stride", "color", "dpi", "daily_maps", "scatter_maps"}, name,
     )
     couples = _mapping(
         section.get("couples", {}), {"between", "max_initial_distance_m"}, f"{name}.couples",
@@ -98,11 +98,18 @@ def resolve_spatial_maps(raw: Any, epsilon: dict[str, Any]) -> dict[str, Any]:
         windows.append({"id": identifier, "start_hour": start, "end_hour": end})
     if len({item["id"] for item in windows}) != len(windows):
         raise ValueError(f"{name}.windows contains duplicate IDs")
+    daily_maps = None
+    if section.get("daily_maps") is not None:
+        from .spatial_grid import resolve_daily_maps
+
+        daily_maps = resolve_daily_maps(section["daily_maps"])
     return {
         "enabled": _boolean(section.get("enabled", False), f"{name}.enabled"),
         "couples": {"between": between, "max_initial_distance_m": maximum_distance},
         "windows": windows,
         "resample_stride": stride,
+        "scatter_maps": _boolean(section.get("scatter_maps", True), f"{name}.scatter_maps"),
+        "daily_maps": daily_maps,
         "color": {
             "maximum_absolute_m2_s3": maximum,
             "linear_threshold_m2_s3": threshold,
@@ -202,13 +209,14 @@ def spatial_pair_observations(
             "midpoint_x_m": midpoint_x, "midpoint_y_m": midpoint_y,
             "midpoint_longitude": midpoint_lon, "midpoint_latitude": midpoint_lat,
             "delta_x_m": values["delta_x_m"][valid], "delta_y_m": values["delta_y_m"][valid],
+            "delta_u_l_cube_m3_s3": values["delta_u_l_cube_m3_s3"][valid],
             "separation_m": values["separation_m"][valid], "q_m2_s3": values["q_m2_s3"][valid],
         }))
     columns = [
         "pair_id", "platform_id_1", "platform_id_2", "source_cluster_id_1", "source_cluster_id_2",
         "pair_cluster_relation", "time_utc", "array_age_hours", "schedule_index", "midpoint_x_m",
         "midpoint_y_m", "midpoint_longitude", "midpoint_latitude", "delta_x_m", "delta_y_m",
-        "separation_m", "q_m2_s3",
+        "delta_u_l_cube_m3_s3", "separation_m", "q_m2_s3",
     ]
     observations = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(columns=columns)
     inventory_columns = [
@@ -249,7 +257,7 @@ def run_spatial_maps(
     sample_steps = round(epsilon.sample_cadence_minutes / cadence_minutes)
     figure_count = observation_count = 0
     for array_id in epsilon.arrays:
-        progress(f"Spatial q maps: array {array_id:03d}")
+        progress(f"Spatial maps: array {array_id:03d}")
         array = dataset.isel(platform=np.flatnonzero(dataset.array_id.values == array_id))
         longitude = array.longitude.values.astype(float)
         latitude = array.latitude.values.astype(float)
@@ -277,14 +285,23 @@ def run_spatial_maps(
             velocity, u_m_s=velocity.u_m_s[members], v_m_s=velocity.v_m_s[members],
             valid=velocity.valid[members], invalid_reason=velocity.invalid_reason[members],
         )
-        minimum = max(epsilon.bins.edges_m[0], epsilon.minimum_reliable_separation_m or 0)
+        daily = settings.get("daily_maps")
+        windows = settings["windows"]
+        if daily is not None:
+            from .spatial_grid import daily_windows
+
+            windows = daily_windows(windows, daily["window_hours"])
+        minimum = epsilon.minimum_reliable_separation_m or 0
+        if daily is None:
+            minimum = max(epsilon.bins.edges_m[0], minimum)
+        maximum_separation = np.inf if daily is not None else epsilon.bins.edges_m[-1]
         observations, inventory = spatial_pair_observations(
             platform_ids=array.platform_id.values.astype(str)[members],
             cluster_ids=cluster_ids[members], times=times, projection=selected_projection,
             velocity=selected_velocity, reference_index=reference_index, sample_steps=sample_steps,
-            windows=settings["windows"], between=settings["couples"]["between"],
+            windows=windows, between=settings["couples"]["between"],
             max_initial_distance_m=settings["couples"]["max_initial_distance_m"],
-            minimum_separation_m=minimum, maximum_separation_m=epsilon.bins.edges_m[-1],
+            minimum_separation_m=minimum, maximum_separation_m=maximum_separation,
         )
         observations.insert(0, "array_id", array_id)
         inventory.insert(0, "array_id", array_id)
@@ -294,6 +311,31 @@ def run_spatial_maps(
         data.mkdir(parents=True, exist_ok=True)
         observations.to_parquet(data / "spatial_pair_observations.parquet", index=False)
         inventory.to_csv(directory / "spatial_pair_selection.csv", index=False)
+        if daily is not None:
+            from .spatial_grid import write_daily_maps
+
+            ages = (times - times[reference_index]) / np.timedelta64(1, "h")
+            period = (ages >= windows[0]["start_hour"]) & (ages < windows[-1]["end_hour"])
+            fallback_x = selected_projection.x_m[:, period]
+            fallback_y = selected_projection.y_m[:, period]
+            if not np.isfinite(fallback_x).any():
+                # An entirely empty requested period still gets a labelled map
+                # near the selected platforms' first positions, not their full tracks.
+                first = np.argmax(np.isfinite(selected_projection.x_m), axis=1)
+                rows = np.arange(len(members))
+                fallback_x = selected_projection.x_m[rows, first]
+                fallback_y = selected_projection.y_m[rows, first]
+            figure_count += write_daily_maps(
+                observations, projection=projection, reference=reference,
+                windows=windows, settings=settings, support=epsilon.support,
+                directory=directory, array_id=array_id, dataset_label=epsilon.dataset_label,
+                fallback=(fallback_x, fallback_y),
+                minimum_reliable_separation_m=epsilon.minimum_reliable_separation_m,
+                sample_cadence_minutes=epsilon.sample_cadence_minutes,
+                progress=progress,
+            )
+        if not settings.get("scatter_maps", True):
+            continue
         figures = directory / "figures" / "spatial_q"
         figures.mkdir(parents=True, exist_ok=True)
         populations = [("array", "all_selected_pairs", observations, members)]
@@ -347,7 +389,8 @@ def run_spatial_maps(
             "time_reference": "first_finite_position_entry_of_array",
             "initial_distance_reference": "first_simultaneous_finite_position_per_pair",
             "sample_cadence_minutes": epsilon.sample_cadence_minutes,
-            "minimum_separation_m": minimum, "maximum_separation_m": epsilon.bins.edges_m[-1],
+            "minimum_separation_m": minimum,
+            "maximum_separation_m": None if daily is not None else epsilon.bins.edges_m[-1],
             "cluster_maps": "within_cluster_pairs_only",
             "projection": {
                 "crs_definition": projection.crs_definition,
@@ -355,5 +398,10 @@ def run_spatial_maps(
                 "origin_latitude": projection.origin_latitude,
             },
         }
-        (data / "spatial_metadata.json").write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
+        metadata_path = data / "spatial_metadata.json"
+        if daily is not None:
+            daily_metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            daily_metadata["scatter_maps"] = metadata
+            metadata = daily_metadata
+        metadata_path.write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
     return {"enabled": True, "figure_count": figure_count, "observation_count": observation_count}

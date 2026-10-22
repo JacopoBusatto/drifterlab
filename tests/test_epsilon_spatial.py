@@ -12,6 +12,7 @@ from drifterlab.analysis.spatial import (
     run_spatial_maps,
     spatial_pair_observations,
 )
+from drifterlab.epsilon import BinSupportRequirements
 from drifterlab.workflows.epsilon import VelocitySpec
 
 
@@ -129,7 +130,11 @@ def test_spatial_config_rejects_invalid_controls(settings, match):
         resolve_spatial_maps(settings, {})
 
 
-def test_empty_spatial_run_anchors_to_first_array_entry_before_cluster_selection(tmp_path):
+@pytest.mark.parametrize("daily", [False, True])
+def test_empty_spatial_run_anchors_to_first_array_entry_before_cluster_selection(tmp_path, monkeypatch, daily):
+    from cartopy.mpl.geoaxes import GeoAxes
+
+    monkeypatch.setattr(GeoAxes, "coastlines", lambda *args, **kwargs: None)
     times = np.datetime64("2025-01-01") + np.arange(6) * np.timedelta64(1, "h")
     # The unselected cluster has the first finite entry at 01:00 UTC.
     # The selected singleton starts at 02:00 UTC and has no internal pairs.
@@ -152,14 +157,19 @@ def test_empty_spatial_run_anchors_to_first_array_entry_before_cluster_selection
         analysis=VelocitySpec("product", "centered_difference", 120, 120, True, None),
         minimum_reliable_separation_m=None, bins=SimpleNamespace(edges_m=(1, 10000)),
         dataset_label="Empty diagnostic",
+        support=BinSupportRequirements(1, 1, 2, 1),
     )
-    settings = resolve_spatial_maps({
+    raw = {
         "enabled": True, "dpi": 30,
         "windows": [{"id": "first_hour", "start_hour": 0, "end_hour": 1}],
-    }, {})
+    }
+    if daily:
+        raw["daily_maps"] = {"window_hours": 24, "manual_cell_size_m": 500}
+    settings = resolve_spatial_maps(raw, {})
     summary = run_spatial_maps(dataset, epsilon, settings, tmp_path, progress=lambda _: None)
-    assert summary == {"enabled": True, "figure_count": 2, "observation_count": 0}
-    figures = pd.read_csv(tmp_path / "array_003/spatial_figures.csv")
+    assert summary == {"enabled": True, "figure_count": 3 if daily else 2, "observation_count": 0}
+    assert len(list((tmp_path / "array_003/figures/spatial_q").rglob("*.png"))) == 2
+    figures = pd.read_csv(tmp_path / "array_003" / ("spatial_daily_figures.csv" if daily else "spatial_figures.csv"))
     assert set(figures.reference_time_utc) == {"2025-01-01T01:00:00+00:00"}
     assert set(figures.window_end_utc) == {"2025-01-01T02:00:00+00:00"}
     assert len(pd.read_parquet(tmp_path / "array_003/data/spatial_pair_observations.parquet")) == 0

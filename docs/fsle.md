@@ -1,5 +1,9 @@
 # Overshoot-aware finite-size Lyapunov exponent
 
+This page documents the legacy pair-Zarr command. For grouped v2 trajectories,
+use the direct `drifterlab-analyze` module described in [v2 FSLE](fsle_v2.md),
+which does not require a pair Zarr.
+
 The FSLE workflow reads an existing authoritative `pairs.zarr`. It never searches
 for pairs again and never changes the pair or reconstruction products. Run it with:
 

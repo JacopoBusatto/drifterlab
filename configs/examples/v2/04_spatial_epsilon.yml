@@ -1,0 +1,137 @@
+﻿# v2 step 04: daily geographic epsilon and optional signed-q scatter maps.
+# Run: drifterlab-analyze configs/examples/v2/04_spatial_epsilon.yml
+# Relative paths resolve beside this YAML. Input is the grouped store from 01.
+
+schema_version: 1 # Unified-analysis configuration schema.
+input: # Shared input for epsilon and diagnostics.
+  trajectory_zarr: ../../../data/examples/v2/02_trajectory_products/trajectories.zarr # Built in 01.
+  trajectory_product: qc_30min # Product group name; must exist in store.
+  dataset_label: Example manual QC, 30-minute positions # Figure/metadata label.
+  allow_provisional: false # true explicitly permits partial-QC exploratory runs.
+output: # Separate roots keep analysis runs independently reproducible.
+  root: ../../../data/examples/v2/06_spatial_epsilon/qc_30min/centered_60min # Existing output requires --overwrite.
+selection: # Uses local store identities.
+  arrays: all # all | nonempty list such as [1].
+  clusters: all # all | exact cluster IDs such as [array_001__cluster_001].
+kinematics: # Also used for activation without the analysis speed mask.
+  method: centered_fixed_span # centered_fixed_span | centered_adjacent | stored_forward.
+  total_span_minutes: 60 # Total centred span; null/omit for adjacent or forward modes.
+  maximum_source_gap_minutes: 121 # Velocity support source-gap ceiling, in minutes.
+  require_full_stencil_support: false # true checks full stencil; stored_forward requires true.
+  speed_mask_m_s: null # Positive analysis speed ceiling in m/s; null disables.
+analyses: # Epsilon is required for spatial maps; diagnostics are optional here.
+  trajectory_plots: # Full plot options in 02_trajectories.yml.
+    enabled: false # Skip trajectory maps.
+  trajectory_statistics: # Full statistics options in 02_trajectories.yml.
+    enabled: false # Skip descriptive cluster statistics.
+  epsilon: # Pair-conditioned third-order separation-scale estimator.
+    enabled: true # Publish 03_epsilon products.
+    pair_scope: within_cluster # within_cluster | all_array (includes cross-cluster pairs).
+    array_anchor: null # Must be null for within_cluster; all_array requires mapping below.
+    # For all_array also set minimum_active_members: all and sample_phase_reference: array_anchor.
+    # array_anchor: # First common reference-valid time across selected array members.
+    #   method: first_time_all_selected_platforms_reference_valid # Only supported array-anchor rule.
+    minimum_active_members: 2 # Integer >=2 | all; reference-valid members needed for activation.
+    sample_cadence_minutes: 30 # Integer multiple of product cadence; omit to use product cadence.
+    sample_phase_reference: activation_anchor # activation_anchor for within_cluster; array_anchor for all_array.
+    windows: # Core windows use activation; spatial maps reinterpret these hours on the array UTC clock.
+      - id: initial_0_6h # Unique path-safe window name.
+        start_hour: 0 # Inclusive elapsed-hour start, >=0.
+        end_hour: 6 # Exclusive elapsed-hour end, greater than start.
+      - id: initial_0_24h # First-day cumulative window.
+        start_hour: 0 # Start at activation.
+        end_hour: 24 # End after one day.
+      - id: initial_0_720h # Requested 30-day period; actual support can be shorter.
+        start_hour: 0 # Start at activation.
+        end_hour: 720 # End after 30 days.
+    minimum_reliable_separation_m: null # Positive reliability threshold in metres; null disables.
+    separation_bins: # Core estimator separation bands.
+      mode: geometric # geometric | linear | explicit; alternatives below.
+      minimum_m: 256 # Requested lower separation bound in metres.
+      maximum_m: 128000 # Requested upper separation bound in metres.
+      ratio: 1.4142135623730951 # Geometric ratio >1, here sqrt(2).
+      anchor_m: 1000 # Geometric edge anchor in metres.
+      axis_scale: log # log | linear; presentation independent of bin mode.
+      # For linear mode replace ratio/anchor_m with:
+      # width_m: 500 # Positive constant bin width in metres.
+      # For explicit mode replace minimum_m/maximum_m/ratio/anchor_m with:
+      # edges_m: [250, 500, 1000, 2000] # Strictly increasing nonnegative edges in metres.
+    support: # All thresholds must be met for a supported bin.
+      observations: 12 # Pair-time observations.
+      unique_pairs: 3 # Distinct platform pairs.
+      platforms: 3 # Distinct contributing platforms.
+      unique_utc: 12 # Distinct UTC timestamps.
+    # Current code requires uncertainty, q_distribution, and figures to be
+    # enabled together or disabled together; their settings remain validated.
+    uncertainty: # Synchronized UTC block-bootstrap intervals.
+      enabled: false # Must match q_distribution.enabled and figures.enabled.
+      method: synchronized_utc_block_bootstrap # Only supported method.
+      confidence_level: 0.95 # Confidence probability in (0,1].
+      replicates: 2000 # Positive replicate count.
+      random_seed: 41723 # Nonnegative reproducibility seed.
+      primary_block_minutes: 30 # Must divide each window duration in minutes.
+      sensitivity_block_minutes: [60] # Extra unique block lengths; [] skips sensitivity runs.
+      minimum_contributing_blocks: 6 # Minimum contributing time blocks for an interval.
+      minimum_successful_replicate_fraction: 0.95 # Required successful fraction in (0,1].
+    q_distribution: # Signed q = (-5/4) * longitudinal relative velocity cubed / separation.
+      enabled: false # Must match uncertainty.enabled and figures.enabled.
+      maximum_absolute_m2_s3: 0.005 # Symmetric q histogram range in m^2/s^3.
+      linear_threshold_m2_s3: 0.00000001 # Linear signed-log centre; below maximum_absolute.
+      bins_per_decade: 6 # Positive logarithmic histogram resolution.
+    figures: # Main epsilon review figures.
+      enabled: false # Must match uncertainty.enabled and q_distribution.enabled.
+      dpi: 160 # Figure resolution in dots per inch.
+      scatter_maximum_points: 20000 # Display cap; estimator still uses all observations.
+      epsilon_linear_threshold_m2_s3: 0.00000001 # Symmetric-log linear centre for epsilon axes.
+      heatmap_probability_maximum: 0.25 # Probability color ceiling in (0,1].
+    spatial_maps: # Geographic diagnostics calculated from scheduled pair observations.
+      enabled: true # Requires epsilon.enabled: true.
+      scatter_maps: true # Also render cluster/array signed-q midpoint scatter maps.
+      couples: # Spatial pair selection, independent of core epsilon.pair_scope.
+        between: cluster # cluster | array; array also includes cross-cluster pairs.
+        max_initial_distance_m: null # Positive cross-cluster first-common-position distance limit; null no limit.
+      windows: all # all | list of epsilon window IDs | list of {id,start_hour,end_hour} mappings.
+      # Spatial hours start at the array's first finite position, NOT cluster activation.
+      # Daily windows cover earliest selected start through latest selected end;
+      # overlapping requested windows do not cause duplicate daily observations.
+      resample_stride: 1 # Display every Nth scheduled timestamp in scatter maps only.
+      daily_maps: # Omit or set null for scatter-only maps.
+        window_hours: 24 # Positive duration; 0-720 hours produces 30 daily windows.
+        separation_edges_m: [250, 500, 1000, 2000] # Interior edges: <250, 250-500, 500-1000, 1000-2000, >=2000 m.
+        # null edges selects one all-separations panel and requires manual_cell_size_m.
+        manual_cell_size_m: 5000 # Positive scalar for all bands, or one size per band (here 5 sizes).
+        # Automatic sizing: set manual_cell_size_m: null and enable the following:
+        # cell_size_factor: 1 # Positive multiplier of each band lower edge; first band uses first positive edge.
+        # Example manual sizes: [250, 250, 500, 1000, 2000].
+        # manual_cell_size_m and cell_size_factor are mutually exclusive.
+        # minimum_cell_size_m is obsolete and rejected by the current parser.
+        enforce_support: true # Apply epsilon.support thresholds to cell display; false shows finite estimates.
+      color: # Shared signed color scale; affects display, not estimated values.
+        maximum_absolute_m2_s3: 0.000005 # Symmetric magnitude limit in m^2/s^3.
+        linear_threshold_m2_s3: 0.00000001 # Symmetric-log linear centre; must be below maximum.
+      dpi: 160 # Spatial figure resolution in dots per inch.
+  epsilon_diagnostics: # Requires epsilon.enabled: true; uses this same run's products.
+    enabled: false # Enable to add 04_epsilon_diagnostics; requires epsilon.enabled.
+    time: # Diagnostic span and elapsed-hour marks.
+      window: maximum_configured # Only supported span selector.
+      mark_elapsed_hours: [0, 6, 12] # Unique increasing nonnegative annotations.
+    trajectory_windows: # Projected trajectories and estimator-valid positions.
+      enabled: true # Required true when diagnostics are enabled.
+      coordinates: local_projected_xy # Only supported coordinates.
+      equal_aspect: true # Required true to preserve metric geometry.
+      show_analysis_valid: true # Required true to expose estimator-valid positions.
+      show_invalid_reconstructed_positions: true # Also show positions failing analysis support.
+      label_platforms: true # Annotate trajectories with platform IDs.
+      mark_activation: true # Mark each activation location/time.
+      mark_window_boundaries: true # Mark estimator window edges.
+      dpi: 160 # Figure resolution in dots per inch.
+    velocity_availability: # Reference/analysis velocity support through time.
+      enabled: true # Generate availability figures.
+      dpi: 160 # Figure resolution in dots per inch.
+    pair_relative_motion: # Relative separation and velocity diagnostics.
+      enabled: true # Generate relative-motion figures.
+      derivative_span: source_analysis_velocity # Only supported derivative definition.
+      dpi: 160 # Figure resolution in dots per inch.
+  fsle: # Independent position-only analysis in 05_fsle.yml.
+    enabled: false # No FSLE in this run.
+

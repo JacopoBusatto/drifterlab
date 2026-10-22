@@ -1,4 +1,4 @@
-"""Run the unified v2 trajectory and epsilon analysis."""
+"""Run unified v2 trajectory, epsilon, and FSLE analyses."""
 
 from __future__ import annotations
 

@@ -1,0 +1,54 @@
+﻿# v2 step 05: direct position-only FSLE; no pair Zarr or epsilon run needed.
+# Run: drifterlab-analyze configs/examples/v2/05_fsle.yml
+# Uses the store from 01. Relative paths resolve beside this YAML.
+
+schema_version: 1 # Unified-analysis config schema.
+input: # FSLE reads positions and timestamps directly from one product group.
+  trajectory_zarr: ../../../data/examples/v2/02_trajectory_products/trajectories.zarr # Built in 01.
+  trajectory_product: qc_30min # raw_5min | qc_5min | qc_15min | qc_30min.
+  dataset_label: Example manual QC, 30-minute positions # Figure/metadata label.
+  allow_provisional: false # true explicitly permits a partial-QC store.
+output: # Separate FSLE run output.
+  root: ../../../data/examples/v2/05_fsle/qc_30min # Contains 05_fsle/ and a root manifest.
+selection: # Restrict platforms before calculating pair populations.
+  arrays: all # all | list of positive local array IDs, e.g. [1].
+  clusters: all # all | list of exact cluster IDs.
+# No kinematics block is needed for a position-only FSLE run.
+analyses: # Both within-cluster and cross-cluster array populations are calculated separately.
+  fsle: # Overshoot-aware observed-shell passage estimator.
+    enabled: true # Publish pair/shell tables, spectra, fits, and plots.
+    passage_policy: strict_observed # strict_observed | bridge_missing; handles internal gaps.
+    # strict_observed censors an open passage at missing/unsupported samples.
+    # bridge_missing retains its original clock through gaps; no interpolation.
+    # New shell entries are never inferred across missing samples in either mode.
+    maximum_source_gap_minutes: null # Positive optional support ceiling; null adds no extra gap limit.
+    chance_pair_threshold_km: 10 # Cross-cluster closest-approach ceiling; no within-cluster filter.
+    # Within-cluster pairs start at first common supported position.
+    # Cross-cluster pairs start at their earliest global closest approach.
+    minimum_scale_km: 0.0625 # Requested minimum shell threshold in km.
+    maximum_scale_km: 1024 # Requested maximum shell threshold in km.
+    rho: 1.4142135623730951 # Adjacent-threshold ratio >1, here sqrt(2).
+    anchor_scale_km: 1 # Geometric threshold anchor in km.
+    minimum_reached_pairs_per_scale: 3 # Completed passages required for a supported shell.
+    time: # UTC crop before pair selection and passage search.
+      start: null # Inclusive UTC ISO timestamp; null keeps available beginning.
+      end: null # Exclusive UTC ISO timestamp; null keeps available end.
+    fits: # Fixed exponents, fitted amplitudes; >=2 supported shells fully inside range.
+      - id: small_richardson # Unique letters/digits/underscore/hyphen identifier.
+        power: -0.6666666666666666 # lambda proportional to r^power; numeric, not string -2/3.
+        scale_min_km: 0.05 # Fit-range lower edge in km.
+        scale_max_km: 1 # Fit-range upper edge in km, greater than lower edge.
+      - id: small_shear # Alternative prescribed small-scale law.
+        power: -1 # Fixed exponent; no regime is inferred automatically.
+        scale_min_km: 0.05 # Fit-range lower edge in km.
+        scale_max_km: 1 # Fit-range upper edge in km.
+      - id: large_richardson # Candidate large-scale law.
+        power: -0.6666666666666666 # Fixed exponent.
+        scale_min_km: 10 # Fit-range lower edge in km.
+        scale_max_km: 513 # Fit-range upper edge in km.
+    plotting: # Set fits: [] above to skip all prescribed-law fits.
+      enabled: true # false retains numerical products while skipping figures.
+      dpi: 150 # Positive resolution in dots per inch.
+      standard_error_bars: true # Nominal errors; pairs sharing platforms are correlated.
+      x_range_km: [0.05, 2000] # Positive [min,max] separation axis; null uses shared automatic limits.
+      y_range_day_inverse: [0.05, 10] # Positive [min,max] FSLE axis in day^-1; null automatic.

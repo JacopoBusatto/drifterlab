@@ -1,0 +1,85 @@
+﻿# v2 step 02: trajectory maps, optional movies, and cluster statistics.
+# Run: drifterlab-analyze configs/examples/v2/02_trajectories.yml
+# Uses the grouped Zarr from 01. Relative paths resolve beside this YAML.
+
+schema_version: 1 # Unified-analysis config schema, even for v2 trajectory products.
+input: # Shared source for every enabled module.
+  trajectory_zarr: ../../../data/examples/v2/02_trajectory_products/trajectories.zarr # Store from 01.
+  trajectory_product: qc_30min # raw_5min | qc_5min | qc_15min | qc_30min.
+  dataset_label: Example manual QC, 30-minute positions # Figure/metadata label.
+  allow_provisional: false # true permits partial QC; false requires completed QC.
+output: # Outside source Zarr; existing output requires CLI --overwrite.
+  root: ../../../data/examples/v2/03_trajectories/qc_30min/centered_60min # Unique output for this run.
+selection: # Local store IDs; subset builds may renumber arrays/clusters.
+  arrays: all # all | list of positive IDs, e.g. [1].
+  clusters: all # all | list of exact IDs, e.g. [array_001__cluster_001].
+kinematics: # Shared velocity definition.
+  method: centered_fixed_span # centered_fixed_span | centered_adjacent | stored_forward.
+  total_span_minutes: 60 # Positions at +/-30 min; null/omit for the other methods.
+  maximum_source_gap_minutes: 121 # Source-gap ceiling for velocity support, in minutes.
+  require_full_stencil_support: false # true checks full stencil; stored_forward requires true.
+  speed_mask_m_s: null # Optional positive epsilon analysis-speed ceiling; null disables.
+analyses: # Modules can be combined; at least one must be enabled.
+  trajectory_plots: # Maps of selected position product.
+    enabled: true # Publish 01_trajectory_plots.
+    color_by: cluster_id # Field constant per platform, e.g. platform_id or array_id; time-varying fields are invalid.
+    color_mode: categorical # auto | categorical | numeric; numeric for continuous fields.
+    cmap: tab20 # Matplotlib colormap name.
+    color_label: Initial deployment cluster # Legend/colorbar title; null derives label.
+    vmin: null # Lower numeric color limit; null uses data.
+    vmax: null # Upper numeric color limit; must exceed vmin.
+    time: # Optional map/movie time crop.
+      start: null # Inclusive UTC ISO timestamp, e.g. "2025-01-12T00:00:00Z"; null unbounded.
+      end: null # Exclusive UTC ISO timestamp; null unbounded.
+    movie: # MP4 output requires an available ffmpeg encoder.
+      enabled: false # true generates movies as well as static maps.
+      format: mp4 # Currently only mp4 is supported.
+      frame_interval_minutes: 60 # Simulation-time spacing between displayed frames.
+      fps: 15 # Playback frames per second.
+      tail_hours: 24 # Trailing track history in each frame.
+      dpi: 120 # Movie resolution in dots per inch.
+    map: # Geographic presentation for maps and movies.
+      projection: PlateCarree # PlateCarree | Mercator | NorthPolarStereo | SouthPolarStereo | Robinson.
+      central_longitude: 0 # Projection centre longitude in degrees, [-180,180].
+      extent: null # [west,east,south,north] degrees; null fits selected data.
+      padding_fraction: 0.05 # Fractional padding of automatic extent, [0,1].
+      figsize: [12, 8] # Figure width and height in inches.
+      dpi: 150 # Static map resolution in dots per inch.
+      land: true # Draw land polygons.
+      coastlines: true # Draw coastlines.
+      gridlines: true # Draw geographic gridlines.
+      scale_bar: true # Draw a distance scale bar.
+    array_overrides: {} # Override time and/or map.extent by local array_NNN.
+    # Replace {} with this structure to crop one array:
+    #   array_001: # Local array receiving these settings.
+    #     time: # Replaces global map time window for this array.
+    #       start: "2025-01-12T00:00:00Z" # Inclusive UTC start.
+    #       end: "2025-01-13T00:00:00Z" # Exclusive UTC end.
+    #     map: # Only extent can be overridden here.
+    #       extent: [120, 130, 10, 20] # Geographic bounds in degrees.
+  trajectory_statistics: # Within-cluster descriptive statistics and figures.
+    enabled: true # Publish 02_trajectory_statistics.
+    time: # Independent of trajectory_plots.time.
+      start: null # Inclusive UTC timestamp; null uses available beginning.
+      end: null # Exclusive UTC timestamp; null uses available end.
+    stop_on_member_loss: false # true ends cluster statistics at first member loss.
+    percentiles: [0, 25, 50, 75, 100] # Unique increasing percentiles in [0,100].
+    velocity: # Histogram settings; method/span/gap come from shared kinematics.
+      histogram_bins: 50 # Positive number of histogram bins.
+      speed_range_m_s: null # [min,max] speed histogram range; null fits data.
+      share_probability_density_y_axis: false # Share histogram density-axis limits.
+    plotting: # Statistics figure presentation.
+      dpi: 150 # Figure resolution in dots per inch.
+      relative_dispersion_yscale: log # log | linear for relative-dispersion axes.
+    array_overrides: {} # Per-array time windows; empty uses global statistics.time.
+    #   array_001: # Local array ID.
+    #     time: # Statistics time crop for this array.
+    #       start: null # Inclusive UTC timestamp or null.
+    #       end: null # Exclusive UTC timestamp or null.
+  epsilon: # All estimator options are documented in 03_epsilon.yml.
+    enabled: false # Enable with epsilon settings to compute the estimator.
+  epsilon_diagnostics: # Requires epsilon.enabled: true when enabled.
+    enabled: false # See 03_epsilon.yml for all diagnostic options.
+  fsle: # Position-only FSLE is independently configured in 05_fsle.yml.
+    enabled: false # No FSLE in this trajectory/statistics run.
+

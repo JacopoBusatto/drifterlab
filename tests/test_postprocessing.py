@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 import json
 from hashlib import sha256
 from pathlib import Path
@@ -12,6 +13,7 @@ import pytest
 import xarray as xr
 import yaml
 
+from drifterlab.plotting import array_trajectories
 from drifterlab.plotting.array_trajectories import (
     build_color_encoding,
     movie_frame_indices,
@@ -210,6 +212,67 @@ def test_movie_frame_indices_require_grid_multiple_and_include_end():
     assert movie_frame_indices(times, 10).tolist() == [0, 2, 3]
     with pytest.raises(ValueError, match="integer multiple"):
         movie_frame_indices(times, 7)
+
+
+def test_movie_handles_long_output_path(tmp_path):
+    if not array_trajectories.animation.writers.is_available("ffmpeg"):
+        pytest.skip("FFmpeg is not installed")
+    _write_store(tmp_path / "trajectories.zarr")
+    values = _configuration(tmp_path, movie={
+        "enabled": True, "frame_interval_minutes": 5, "fps": 2, "dpi": 50,
+    })
+    config = load_postprocessing_config(_write_config(tmp_path, values))
+    arrays, _ = load_array_trajectories(config)
+    directory = tmp_path
+    while len(str(directory)) < 280:
+        directory /= "nested_analysis_output"
+    path = directory / "trajectories.mp4"
+
+    result = array_trajectories.render_array_trajectory_movie(
+        arrays[0], config.trajectory_plotting, path,
+    )
+
+    assert result == path
+    assert path.read_bytes()[4:8] == b"ftyp"
+    assert list(directory.iterdir()) == [path]
+
+
+def test_failed_movie_preserves_previous_output_and_cleans_temporary_files(
+    tmp_path, monkeypatch,
+):
+    _write_store(tmp_path / "trajectories.zarr")
+    config = load_postprocessing_config(_write_config(tmp_path, _configuration(tmp_path)))
+    arrays, _ = load_array_trajectories(config)
+    path = tmp_path / "movies" / "trajectories.mp4"
+    path.parent.mkdir()
+    path.write_bytes(b"previous movie")
+    encoded_paths = []
+
+    class FailingWriter:
+        def __init__(self, **kwargs):
+            pass
+
+        @contextmanager
+        def saving(self, figure, filename, *, dpi):
+            encoded = Path(filename)
+            encoded_paths.append(encoded)
+            encoded.write_bytes(b"incomplete movie")
+            yield
+
+        def grab_frame(self):
+            raise RuntimeError("encoding failed")
+
+    monkeypatch.setattr(array_trajectories.animation.writers, "is_available", lambda _: True)
+    monkeypatch.setattr(array_trajectories.animation, "FFMpegWriter", FailingWriter)
+
+    with pytest.raises(RuntimeError, match="encoding failed"):
+        array_trajectories.render_array_trajectory_movie(
+            arrays[0], config.trajectory_plotting, path,
+        )
+
+    assert path.read_bytes() == b"previous movie"
+    assert encoded_paths and all(not item.exists() for item in encoded_paths)
+    assert list(path.parent.iterdir()) == [path]
 
 
 def test_identifier_auto_color_is_categorical():

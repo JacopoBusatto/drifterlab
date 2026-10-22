@@ -1,0 +1,51 @@
+﻿# v2 step 00: campaign-wide drogue detection and review.
+# Run: drifterlab-drogue configs/examples/v2/00_drogue_detection.yml --automatic
+# Then review with the same command using --semiautomatic (or --manual).
+# Relative paths resolve beside this YAML; ../../../data is repository data/.
+# Values follow v2 MicroSVP configs; they are examples, not universal thresholds.
+
+input: # Raw observations; this stage does not select arrays or platforms.
+  reader: microsvp_mat # Registered raw-MAT adapter, also used for compatible SVP files.
+  directory: ../../../data/raw/MicroSVP # Replace with your raw MAT directory.
+  pattern: "*.mat" # Relative glob inside directory; quote wildcards.
+output: # Feed these same two paths into step 01.
+  automatic: ../../../data/examples/v2/00_drogue/auto_drogue_loss.parquet # Detector evidence/results.
+  review: ../../../data/examples/v2/00_drogue/drogue_review.csv # Persistent human decisions.
+processing: # Source decoding and conservative analysis endpoint.
+  missing_value: -999 # Numeric sentinel interpreted as missing sensor data.
+  analysis_cutoff_margin_hours: 24 # Hours removed before physical loss for analysis_cutoff.
+detection: # Independent TTFF and strain detectors, followed by combination.
+  ttff: # Persistent cessation of TTFF events in several value bands.
+    binning: # TTFF value bins and temporal counting grid.
+      scale: log # log | linear; linear needs factor: null and positive width.
+      first_edge: 10 # First TTFF edge in source TTFF units.
+      factor: 2 # Multiplicative spacing >1 for log bins; null for linear.
+      width: null # Positive additive spacing for linear bins; null for log.
+      last_edge: 1000 # Upper value edge; must exceed first_edge.
+      time_bin_hours: 24 # Temporal counting cadence in hours.
+      include_lower_than_first_bin: true # Include an extra band below first_edge.
+    comparison: # Rolling/pre-event/persistence durations must align to time_bin_hours.
+      rolling_count_window_hours: 48 # Quiet-state event-count window duration.
+      pre_activity_window_hours: 168 # Earlier baseline used to establish activity.
+      min_pre_events: 12 # Minimum baseline events.
+      min_pre_occupied_time_bins: 3 # Minimum baseline time bins containing events.
+      min_coverage_fraction: 0.75 # Required observation coverage fraction in (0,1].
+      quiet_fraction_of_pre_rate: 0.10 # Quiet event rate relative to baseline.
+      max_events_in_quiet_window: 1 # Absolute event-count ceiling for quiet windows.
+      persistence_hours: 120 # How long quiet conditions must persist.
+      reactivation_window_hours: 48 # Window used to detect subsequent activity.
+      agreement_tolerance_hours: 48 # Allowed difference between TTFF-band dates.
+      min_agreeing_bins: 2 # Number of TTFF value bands required to agree.
+  strain: # Robust two-regime change-point model on raw strain.
+    aggregation_hours: 3 # Width of aggregation blocks in hours.
+    min_samples_per_block: 3 # Minimum observations in a usable block.
+    minimum_side_duration_hours: 72 # Minimum duration on each side of a split.
+    minimum_drop_absolute: 2.0 # Required drop in source strain units.
+    minimum_drop_relative: 0.08 # Required fractional drop relative to pre-loss level.
+    minimum_fit_improvement: 0.10 # Required fractional improvement over a one-regime fit.
+    relative_floor: 1.0 # Floor in source units for relative-drop normalization.
+    ambiguity: # Recognize alternative splits with comparable fit quality.
+      comparable_cost_fraction: 0.005 # Allowed relative cost difference from best split.
+      minimum_separation_hours: 48 # Minimum separation for a distinct alternative split.
+  combination: # Reconcile the two independent detectors.
+    agreement_tolerance_hours: 48 # Maximum TTFF-versus-strain date difference for agreement.

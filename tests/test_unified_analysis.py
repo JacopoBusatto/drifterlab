@@ -239,6 +239,54 @@ def _sha256(path: Path) -> str:
     return sha256(path.read_bytes()).hexdigest()
 
 
+def test_fsle_only_uses_positions_and_publishes_hashed_v2_outputs(tmp_path: Path) -> None:
+    store = _write_v2_store(tmp_path / "trajectories.zarr")
+    root = zarr.open_group(str(store), mode="a")
+    # Split one platform into another cluster so both populations are exercised.
+    root["cluster_id"][2] = "array_003__cluster_002"
+    root["cluster_size"][:] = [2, 2, 1]
+    zarr.consolidate_metadata(str(store))
+    before = _sha256(store / ".zmetadata")
+    output = tmp_path / "analysis"
+    values = _config(store, output)
+    values["selection"]["clusters"] = "all"
+    values["input"]["trajectory_product"] = "qc_30min"
+    # This centered velocity span is incompatible with qc_30min. FSLE must
+    # nevertheless run because it uses no velocities or velocity stencils.
+    values["kinematics"]["total_span_minutes"] = 10
+    values["analyses"] = {"fsle": {
+        "enabled": True, "minimum_scale_km": 0.03125, "maximum_scale_km": 4,
+        "minimum_reached_pairs_per_scale": 1, "plotting": {"dpi": 30},
+        "fits": [{"id": "small", "power": -2 / 3, "scale_min_km": 0.03125, "scale_max_km": 1}],
+    }}
+    path = _write_config(tmp_path / "fsle.yml", values)
+    resolved = load_analysis_config(path)
+    assert resolved.fsle["passage_policy"] == "strict_observed"
+    assert resolved.fsle["maximum_source_gap_minutes"] is None
+    result = run_analysis(path)
+    manifest = json.loads(result.manifest_path.read_text())
+    assert manifest["modules"]["fsle"]["selected_pair_counts"] == {
+        "within_cluster": 1, "cross_cluster": 2,
+    }
+    assert manifest["modules"]["epsilon"]["enabled"] is False
+    assert manifest["modules"]["fsle"]["figure_count"] == 8
+    assert not (output / "03_epsilon").exists()
+    assert not list(output.rglob("*.zarr"))
+    for relative, record in manifest["products"].items():
+        assert record["sha256"] == _sha256(output / relative)
+    assert _sha256(store / ".zmetadata") == before
+    config_resolved = yaml.safe_load((output / "config_resolved.yml").read_text())
+    assert config_resolved["analyses"]["fsle"]["passage_policy"] == "strict_observed"
+    # A policy failure during an overwrite must leave the previous output intact.
+    values["analyses"]["fsle"]["time"] = {"start": "2030-01-01"}
+    original_manifest = result.manifest_path.read_bytes()
+    _write_config(path, values)
+    with pytest.raises(ValueError, match="no trajectory samples"):
+        run_analysis(path, overwrite=True)
+    assert result.manifest_path.read_bytes() == original_manifest
+    assert not list(tmp_path.glob(".analysis.*.tmp"))
+
+
 def test_grouped_product_reader_and_unified_numbered_outputs(tmp_path: Path) -> None:
     store = _write_v2_store(tmp_path / "trajectories.zarr")
     metadata_before = _sha256(store / ".zmetadata")
@@ -281,10 +329,101 @@ def test_grouped_product_reader_and_unified_numbered_outputs(tmp_path: Path) -> 
         "02_trajectory_statistics",
         "03_epsilon",
         "04_epsilon_diagnostics",
+        "05_fsle",
     ]
     assert _sha256(store / ".zmetadata") == metadata_before
     with pytest.raises(FileExistsError, match="already exists"):
         run_analysis(config_path)
+
+
+@pytest.mark.parametrize("method", ["centered_fixed_span", "centered_adjacent", "stored_forward"])
+@pytest.mark.parametrize("banded", [False, True])
+def test_daily_spatial_epsilon_publishes_fixed_geographic_maps(tmp_path: Path, monkeypatch, method: str, banded: bool) -> None:
+    # Coastline data are external to the analysis; keep this test offline.
+    from cartopy.mpl.geoaxes import GeoAxes
+
+    monkeypatch.setattr(GeoAxes, "coastlines", lambda *args, **kwargs: None)
+    store = _write_v2_store(tmp_path / "trajectories.zarr")
+    before = _sha256(store / ".zmetadata")
+    output = tmp_path / "analysis"
+    values = _config(store, output, method=method)
+    for module in ("trajectory_plots", "trajectory_statistics", "epsilon_diagnostics"):
+        values["analyses"][module]["enabled"] = False
+    epsilon = values["analyses"]["epsilon"]
+    for section in ("uncertainty", "q_distribution", "figures"):
+        epsilon[section]["enabled"] = False
+    epsilon["windows"] = [{"id": "period", "start_hour": 0, "end_hour": 2}]
+    # Every synthetic pair is below the epsilon bin range. Daily maps must
+    # retain them, including underflow/overflow of the separate spatial edges.
+    epsilon["separation_bins"] = {"mode": "explicit", "edges_m": [1000, 10000], "axis_scale": "log"}
+    daily = {"window_hours": 1, "manual_cell_size_m": 500}
+    if banded:
+        daily.update({"separation_edges_m": [50, 100], "manual_cell_size_m": [250, 500, 1000]})
+        daily["enforce_support"] = False
+        epsilon["support"] = {"observations": 1000, "unique_pairs": 100, "platforms": 100, "unique_utc": 1000}
+    epsilon["spatial_maps"] = {
+        "enabled": True, "daily_maps": daily, "dpi": 40,
+        "scatter_maps": not banded and method == "centered_fixed_span",
+        "resample_stride": 100,  # Must not thin the statistical estimates.
+        "color": {"maximum_absolute_m2_s3": 1e-10, "linear_threshold_m2_s3": 1e-12},
+    }
+    result = run_analysis(_write_config(tmp_path / "analysis.yml", values))
+    array = output / "03_epsilon/array_003"
+    observations = pd.read_parquet(array / "data/spatial_pair_observations.parquet")
+    cells = pd.read_parquet(array / "data/spatial_epsilon_cells.parquet")
+    contributions = pd.read_parquet(array / "data/spatial_cluster_contributions.parquet")
+    figures = pd.read_csv(array / "tables/spatial_daily_figures.csv")
+    metadata = json.loads((array / "data/spatial_metadata.json").read_text())
+    assert len(observations) > 0
+    assert observations.separation_m.max() < 1000
+    assert cells.observation_count.sum() == len(observations)
+    assert figures.observation_count.sum() == len(observations)
+    assert contributions.observation_weight.sum() == len(observations)
+    assert len(figures) == (6 if banded else 2)
+    assert len(set(figures.figure)) == 2
+    assert len(list((array / "figures/spatial_epsilon").glob("*.png"))) == 2
+    keep_scatter = not banded and method == "centered_fixed_span"
+    assert (array / "figures/spatial_q").exists() == keep_scatter
+    if keep_scatter:
+        assert len(list((array / "figures/spatial_q").rglob("*.png"))) == 2
+        assert (array / "tables/spatial_figures.csv").is_file()
+        assert metadata["mode"] == "daily_spatial_epsilon"
+        assert metadata["scatter_maps"]["cluster_maps"] == "within_cluster_pairs_only"
+    assert figures.displayed_cell_count.sum() > 0
+    if banded:
+        assert figures.supported_cell_count.sum() == 0
+        assert not cells.support_ok.any()
+        assert cells.display_ok.all()
+        assert metadata["support_enforced"] is False
+    else:
+        assert figures.supported_cell_count.sum() > 0
+    assert set(figures.reference_time_utc) == {"2025-02-06T00:00:00+00:00"}
+    for identity, group in cells.groupby(["window_id", "separation_bin_index", "cell_x_index", "cell_y_index"]):
+        day, band_index, x_index, y_index = identity
+        row = group.iloc[0]
+        band = metadata["bands"][band_index]
+        window = next(item for item in metadata["daily_windows"] if item["id"] == day)
+        selected = observations[
+            (observations.array_age_hours >= window["start_hour"])
+            & (observations.array_age_hours < window["end_hour"])
+            & (observations.separation_m >= band["lower_m"])
+        ]
+        if band["upper_m"] is not None:
+            selected = selected[selected.separation_m < band["upper_m"]]
+        selected = selected[
+            (np.floor(selected.midpoint_x_m / row.cell_size_m) == x_index)
+            & (np.floor(selected.midpoint_y_m / row.cell_size_m) == y_index)
+        ]
+        assert row.epsilon_eff_m2_s3 == pytest.approx(-1.25 * selected.delta_u_l_cube_m3_s3.sum() / selected.separation_m.sum())
+    assert metadata["grid_origin_projected_m"] == [0, 0]
+    assert metadata["interpolation"] == metadata["smoothing"] == "none"
+    assert metadata["contours"] is False
+    assert len(metadata["fixed_geographic_extent"]) == 4
+    assert len(metadata["bands"]) == (3 if banded else 1)
+    manifest = json.loads(result.manifest_path.read_text())
+    assert manifest["modules"]["epsilon"]["spatial_maps"]["figure_count"] == (4 if keep_scatter else 2)
+    assert "spatial_epsilon_cells.parquet" in str(manifest["products"])
+    assert _sha256(store / ".zmetadata") == before
 
 
 def test_provisional_input_requires_explicit_opt_in(tmp_path: Path) -> None:

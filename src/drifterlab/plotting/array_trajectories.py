@@ -6,6 +6,8 @@ from dataclasses import dataclass
 import math
 from pathlib import Path
 import re
+import shutil
+from tempfile import TemporaryDirectory
 from typing import Any, Callable
 from uuid import uuid4
 
@@ -439,21 +441,27 @@ def render_array_trajectory_movie(
         extra_args=["-pix_fmt", "yuv420p", "-movflags", "+faststart"],
     )
     try:
-        with writer.saving(figure, str(temporary), dpi=config.movie.dpi):
-            for output_index, frame_index in enumerate(indices):
-                _draw_movie_frame(
-                    figure, data, config, encoding, extent, int(frame_index),
-                )
-                writer.grab_frame()
-                if (
-                    output_index == 0
-                    or output_index + 1 == len(indices)
-                    or (output_index + 1) % max(1, len(indices) // 10) == 0
-                ):
-                    report(
-                        f"Array {data.array_id}: rendered movie frame "
-                        f"{output_index + 1}/{len(indices)}"
+        # FFmpeg may reject long Windows paths even when Python can create them.
+        # Encode outside the nested analysis tree, then stage beside the final
+        # output so publication remains atomic even across different volumes.
+        with TemporaryDirectory(prefix="drifterlab-movie-") as staging:
+            encoded = Path(staging) / "movie.mp4"
+            with writer.saving(figure, str(encoded), dpi=config.movie.dpi):
+                for output_index, frame_index in enumerate(indices):
+                    _draw_movie_frame(
+                        figure, data, config, encoding, extent, int(frame_index),
                     )
+                    writer.grab_frame()
+                    if (
+                        output_index == 0
+                        or output_index + 1 == len(indices)
+                        or (output_index + 1) % max(1, len(indices) // 10) == 0
+                    ):
+                        report(
+                            f"Array {data.array_id}: rendered movie frame "
+                            f"{output_index + 1}/{len(indices)}"
+                        )
+            shutil.copyfile(encoded, temporary)
         temporary.replace(path)
     except Exception:
         if temporary.exists():

@@ -1,0 +1,64 @@
+schema_version: 1
+
+input:
+  # Copy to an ignored *.local.yml and point at the grouped v2 trajectory store.
+  trajectory_zarr: ../../../data/trajectory_products.zarr
+  trajectory_product: qc_5min
+  dataset_label: ARCTERX MicroSVP
+  allow_provisional: false
+
+output:
+  root: ../../../data/v2_fsle/qc_5min
+
+selection:
+  arrays: all
+  clusters: all
+
+# FSLE does not use kinematics or require epsilon to be enabled.
+analyses:
+  fsle:
+    enabled: true
+    # Both policies require a witnessed outward entry into a shell.
+    # strict_observed rejects interrupted passages, then permits fresh entries
+    # into later shells. bridge_missing can close an active clock across NaNs.
+    passage_policy: strict_observed
+    maximum_source_gap_minutes: null
+
+    # Both populations are always calculated separately within each array:
+    # all within-cluster pairs, and cross-cluster chance pairs whose closest
+    # approach is <= this threshold. Chance pairs start at that closest approach.
+    chance_pair_threshold_km: 10
+
+    minimum_scale_km: 0.0625
+    maximum_scale_km: 128
+    rho: 1.4142135623730951
+    anchor_scale_km: 1
+    minimum_reached_pairs_per_scale: 3
+    time:
+      start: null  # UTC, inclusive; bounds also define the chance search interval
+      end: null    # UTC, exclusive
+
+    # Fit only A in lambda = A * delta^power, with equal weight per supported
+    # shell fully inside the chosen range. Coefficients use metres and seconds.
+    # YAML does not evaluate -2/3: use its numeric value as below.
+    fits:
+      - id: small_richardson
+        power: -0.6666666666666666
+        scale_min_km: 0.1
+        scale_max_km: 1
+      - id: small_shear
+        power: -1
+        scale_min_km: 0.1
+        scale_max_km: 1
+      - id: large_richardson
+        power: -0.6666666666666666
+        scale_min_km: 10
+        scale_max_km: 128
+
+    plotting:
+      enabled: true
+      dpi: 150
+      standard_error_bars: true
+      # Automatic limits are shared across every selected cluster and array.
+      x_range_km: null
+      y_range_day_inverse: null

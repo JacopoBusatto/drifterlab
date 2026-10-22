@@ -16,6 +16,9 @@ The independent desktop manual-QC application additionally requires
 `pip install -e ".[manual-qc]"`; its controls, persistence, and output contract
 are documented in [independent manual position QC](docs/manual_position_qc.md).
 
+Fully commented YAML templates for each v2 stage are listed in
+[v2 configuration examples](configs/examples/v2/README.md).
+
 ## Production commands
 
 For the complete operational sequence, review checkpoints, command-line flags,
@@ -71,9 +74,11 @@ The raw-MAT drogue and position readers remain the upstream source adapters. See
 The manual-QC Zarr is analyzed directly with `drifterlab-analyze`; it does not
 pass through the spline reconstruction workflow. One configuration selects a
 group such as `qc_5min`, one shared velocity definition, optional array/cluster
-subsets, and all four analysis modules. Results are published as
+subsets, and the enabled analysis modules. Results are published as
 `01_trajectory_plots`, `02_trajectory_statistics`, `03_epsilon`, and
-`04_epsilon_diagnostics` with one root manifest. See
+`04_epsilon_diagnostics`, and `05_fsle` with one root manifest. FSLE reads
+positions directly, with separate cluster/array spectra, chance pairs, and
+prescribed-power fits and compensated plots; it needs no pair Zarr. See
 [unified grouped-product analysis](docs/unified_analysis.md).
 
 ## Position-QC input contract

@@ -1,0 +1,72 @@
+﻿# v2 step 01: independent manual position/SST review and grouped trajectory build.
+# Run: drifterlab-manual-position-qc configs/examples/v2/01_manual_qc.yml
+# Complete drogue review first. Relative paths resolve beside this YAML.
+
+schema_version: 2 # Manual-QC config schema; unified analysis uses schema 1.
+input: # Same raw files used by step 00.
+  reader: microsvp_mat # Registered raw-MAT position reader.
+  directory: ../../../data/raw/MicroSVP # Replace with your source directory.
+  pattern: "*.mat" # Relative source-file glob.
+  options: # Reader-specific settings.
+    missing_value: -999 # Missing-value sentinel for optional sensor series.
+selection: # Limits GUI, finalization readiness, and grouped build together.
+  platforms: all # all | nonempty list of quoted IDs, e.g. ["300534061905670"].
+drogue: # Reuse the automatic results and human decisions from 00.
+  automatic: ../../../data/examples/v2/00_drogue/auto_drogue_loss.parquet # Detector output.
+  review: ../../../data/examples/v2/00_drogue/drogue_review.csv # Reviewed drogue decisions.
+  stop_at: physical_loss # physical_loss | analysis_cutoff (includes the step-00 margin).
+output: # Persistent review state and audit products.
+  state: ../../../data/examples/v2/01_manual_position/manual_position_qc.sqlite # Autosaved decisions/history.
+  directory: ../../../data/examples/v2/01_manual_position # Finalized per-platform audit Parquets.
+review: # GUI scope and display; warnings never reject observations.
+  chunk_hours: 12 # Duration of each review chunk, in hours.
+  maximum_accepted_span_days: 30 # Days from first accepted fix; null removes this cap.
+  resample_frequency_seconds: 900 # GUI preview cadence only, independent of final products.
+  warnings: # Advisory markers derived from accepted adjacent positions.
+    high_speed_m_s: 2.0 # Mark speeds strictly above this value; null disables.
+    zero_speed_tolerance_m_s: 0.0 # Mark speeds <= tolerance; 0 means exact zero; null disables.
+  cache_size: 2 # Positive maximum number of platform models cached in memory.
+final_zarr: # Grouped v2 input consumed directly by steps 02-05.
+  enabled: true # Enable final/provisional grouped-store publication.
+  build_when_all_platforms_reviewed: true # Auto-build after last current finalization.
+  output: # Separate from audit output.
+    directory: ../../../data/examples/v2/02_trajectory_products/trajectories.zarr # Shared analysis input.
+    chunks: # Storage chunk lengths; these do not change scientific cadence.
+      platform: 1 # Platforms per chunk.
+      time: 2016 # Time samples per chunk.
+  grid: # Global alignment of regular products; no extrapolation.
+    anchor_time: "2025-01-12T00:00:00Z" # Set UTC grid origin at/before first accepted fix.
+  # Current builder requires exactly these four entries IN THIS ORDER,
+  # including the cadences/gap limits: this is the fixed v2 product contract.
+  products: # Linear resampling with source-gap masking.
+    - name: raw_5min # /products/raw_5min, inside each accepted trajectory lifespan.
+      source: raw # raw uses all valid native fixes; qc uses manually accepted fixes.
+      cadence_minutes: 5 # Regular output interval in minutes.
+      maximum_gap_minutes: 30 # Largest source gap allowed for interpolation.
+    - name: qc_5min # /products/qc_5min.
+      source: qc # Manually accepted positions.
+      cadence_minutes: 5 # Output interval in minutes.
+      maximum_gap_minutes: 30 # Maximum source gap in minutes.
+    - name: qc_15min # /products/qc_15min.
+      source: qc # Manually accepted positions.
+      cadence_minutes: 15 # Output interval in minutes.
+      maximum_gap_minutes: 60 # Maximum source gap in minutes.
+    - name: qc_30min # /products/qc_30min; used by analysis examples.
+      source: qc # Manually accepted positions.
+      cadence_minutes: 30 # Output interval in minutes.
+      maximum_gap_minutes: 120 # Maximum source gap in minutes.
+  arrays: # Infer chronological deployment arrays from accepted starts.
+    maximum_adjacent_start_gap_hours: 24 # Larger adjacent start gaps create a new array.
+  initial_clustering: # Infer clusters separately inside each local array.
+    distance_reference: observed_starts # observed_starts | first_common_grid.
+    defaults: # Rules inherited by arrays unless overridden.
+      assignment: infer # infer | single_cluster (force all array members into one cluster).
+      maximum_start_time_difference_seconds: 21600 # Allowed deployment-start difference.
+      maximum_pair_distance_m: 500 # Pair proximity threshold in metres.
+      maximum_cluster_diameter_m: 1000 # Maximum inferred diameter in metres.
+      maximum_members: 5 # Positive member cap; null means no cap.
+    array_overrides: {} # Per-local-array rules; empty uses defaults.
+    # Replace {} with this structure to override an array:
+    #   array_001: # Local ID; cohort subsets can renumber campaign arrays.
+    #     assignment: single_cluster # Force all members into one cluster.
+    #     maximum_members: null # No cap; other rule keys inherit defaults.

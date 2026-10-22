@@ -91,7 +91,11 @@ def run_analysis(
         raise ValueError("The configured array and cluster selection contains no platforms")
 
     effective_span = _effective_span_minutes(config, product_info.cadence_minutes)
-    _validate_velocity_grid(config, product_info.cadence_minutes, effective_span)
+    if any(block.get("enabled", False) for block in (
+        config.trajectory_plots, config.trajectory_statistics,
+        config.epsilon, config.epsilon_diagnostics,
+    )):
+        _validate_velocity_grid(config, product_info.cadence_minutes, effective_span)
     metadata_sha256 = _file_sha256(config.trajectory_zarr / ".zmetadata")
     run_id = _run_id(config, metadata_sha256, product_info.product_attributes)
     target = config.output_root
@@ -159,7 +163,11 @@ def run_analysis(
             if config.epsilon.get("spatial_maps", {}).get("enabled", False):
                 from .spatial import run_spatial_maps
 
-                report("Rendering spatial pairwise-q maps on a common UTC clock")
+                spatial_label = (
+                    "daily spatial epsilon" if config.epsilon["spatial_maps"].get("daily_maps")
+                    else "spatial pairwise-q"
+                )
+                report(f"Rendering {spatial_label} maps on a common UTC clock")
                 spatial_summary = run_spatial_maps(
                     dataset,
                     load_epsilon_config(epsilon_config),
@@ -204,6 +212,18 @@ def run_analysis(
 
         if epsilon_result is not None:
             _publish_epsilon_module(epsilon_result.run_directory, temporary)
+
+        if config.fsle["enabled"]:
+            from .fsle import run_fsle_analysis
+
+            report("Running FSLE directly from selected trajectory positions")
+            module_summary["fsle"] = run_fsle_analysis(
+                dataset.isel(platform=np.flatnonzero(selected_platform)),
+                config.fsle, temporary / "05_fsle",
+                cadence_minutes=product_info.cadence_minutes, progress=report,
+            )
+        else:
+            module_summary["fsle"] = {"enabled": False}
 
         resolved = config.effective()
         resolved["run_id"] = run_id
@@ -279,6 +299,7 @@ def run_analysis(
                 "02_trajectory_statistics",
                 "03_epsilon",
                 "04_epsilon_diagnostics",
+                "05_fsle",
             ],
             "products": product_records,
         }

@@ -42,6 +42,7 @@ class AnalysisConfig:
     trajectory_statistics: dict[str, Any]
     epsilon: dict[str, Any]
     epsilon_diagnostics: dict[str, Any]
+    fsle: dict[str, Any]
     output_root: Path
 
     def effective(self) -> dict[str, Any]:
@@ -75,6 +76,7 @@ class AnalysisConfig:
                 "trajectory_statistics": self.trajectory_statistics,
                 "epsilon": self.epsilon,
                 "epsilon_diagnostics": self.epsilon_diagnostics,
+                "fsle": self.fsle,
             },
             "output": {"root": str(self.output_root)},
         }
@@ -120,6 +122,7 @@ def load_analysis_config(path: str | Path) -> AnalysisConfig:
         {
             "trajectory_plots", "trajectory_statistics", "epsilon",
             "epsilon_diagnostics",
+            "fsle",
         },
         "analyses",
     )
@@ -180,11 +183,14 @@ def load_analysis_config(path: str | Path) -> AnalysisConfig:
         analyses.get("epsilon_diagnostics", {}),
         "analyses.epsilon_diagnostics",
     )
+    from .fsle import resolve_fsle
+
+    fsle = resolve_fsle(analyses.get("fsle", {}))
     if diagnostics.get("enabled", False) and not epsilon.get("enabled", False):
         raise ValueError("epsilon_diagnostics requires epsilon.enabled: true")
     if not any(
         block.get("enabled", False)
-        for block in (trajectory_plots, trajectory_statistics, epsilon, diagnostics)
+        for block in (trajectory_plots, trajectory_statistics, epsilon, diagnostics, fsle)
     ):
         raise ValueError("At least one analysis block must be enabled")
 
@@ -218,6 +224,7 @@ def load_analysis_config(path: str | Path) -> AnalysisConfig:
         trajectory_statistics=trajectory_statistics,
         epsilon=epsilon,
         epsilon_diagnostics=diagnostics,
+        fsle=fsle,
         output_root=output_root,
     )
 

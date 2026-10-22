@@ -1,4 +1,4 @@
-"""Unified trajectory, cluster, epsilon, and diagnostic analysis workflow."""
+"""Unified trajectory, cluster, epsilon, FSLE, and diagnostic analysis workflow."""
 
 from .config import AnalysisConfig, load_analysis_config
 from .workflow import AnalysisResult, run_analysis
