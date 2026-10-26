@@ -1,6 +1,6 @@
 ﻿# Commented v2 configuration examples
 
-These six self-contained YAML files follow the workflow in
+These self-contained YAML files follow the workflow in
 `configs/arcterx/v2/microSVP/array_03/`. Every active option has a comment;
 comments also show supported alternatives and settings that must change together.
 The examples use portable paths and generic selections rather than campaign IDs
@@ -14,6 +14,8 @@ or personal absolute paths.
 | 03 | [03_epsilon.yml](03_epsilon.yml) | Epsilon, bootstrap intervals, signed-q distributions, diagnostics | `drifterlab-analyze` |
 | 04 | [04_spatial_epsilon.yml](04_spatial_epsilon.yml) | Daily geographic epsilon and signed-q scatter maps | `drifterlab-analyze` |
 | 05 | [05_fsle.yml](05_fsle.yml) | Direct FSLE, chance pairs, prescribed-power fits and compensated spectra | `drifterlab-analyze` |
+| 06 | [06_affine_deformation.yml](06_affine_deformation.yml) | Original-cluster endpoint affine fits and daily principal-axis maps, without SST | `drifterlab-analyze` |
+| 06 | [06_affine_deformation_l3s.yml](06_affine_deformation_l3s.yml) | Same estimator with a prepared daily or hourly SST file | `drifterlab-analyze` |
 
 ## Prepare and run
 
@@ -32,8 +34,8 @@ All relative paths resolve **beside the YAML**, regardless of the shell's curren
 working directory. Here, `../../../data` points to the repository's `data/` folder.
 Set `input.directory` in 00 and 01 to your raw MAT directory, and set
 `final_zarr.grid.anchor_time` in 01 to a UTC grid origin at or before your first
-accepted position. Output paths already connect all six examples. If you change
-the Zarr path in 01, update `input.trajectory_zarr` in 02-05 together.
+accepted position. Output paths already connect the examples. If you change
+the Zarr path in 01, update `input.trajectory_zarr` in 02-06 together.
 
 Run these commands from the repository root after editing your local copies:
 
@@ -46,9 +48,11 @@ drifterlab-analyze configs/examples/v2/02_trajectories.local.yml
 drifterlab-analyze configs/examples/v2/03_epsilon.local.yml
 drifterlab-analyze configs/examples/v2/04_spatial_epsilon.local.yml
 drifterlab-analyze configs/examples/v2/05_fsle.local.yml
+drifterlab-analyze configs/examples/v2/06_affine_deformation.local.yml
+# Or use 06_affine_deformation_l3s.local.yml after setting the prepared SST file.
 ```
 
-Steps 02-05 each read the store from 01 independently. Their numbers organize the
+Steps 02-06 each read the store from 01 independently. Their numbers organize the
 examples; running epsilon first is unnecessary for the spatial or FSLE example.
 Each analysis has its own output root. Existing analysis output requires an
 explicit `--overwrite` when you intend to replace it.
@@ -97,3 +101,9 @@ reviewed products for an actual scientific run. See
 [manual QC](../../../docs/manual_position_qc.md),
 [unified analysis](../../../docs/unified_analysis.md), and
 [direct v2 FSLE](../../../docs/fsle_v2.md) for methodology and output details.
+
+The position-only affine examples use reviewed `qc_5min` positions, inherit the
+product's source-gap limit, and need no kinematics settings. Both use daily UTC
+maps and 6-hour endpoint fits. See [affine methodology](../../../docs/affine_deformation_methodology.md)
+for the lifecycle, provisional quality flags, prepared-file interface and optional NetCDF4 reader, and
+replotting saved results without recomputing fits.

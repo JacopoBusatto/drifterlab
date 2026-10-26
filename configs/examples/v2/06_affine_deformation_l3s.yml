@@ -1,0 +1,34 @@
+# Same endpoint estimator, with optional prepared SST backgrounds.
+# Run: drifterlab-analyze configs/examples/v2/06_affine_deformation_l3s.yml
+schema_version: 1
+input:
+  trajectory_zarr: ../../../data/examples/v2/02_trajectory_products/trajectories.zarr
+  trajectory_product: qc_5min # Reviewed linear positions, independent of velocities.
+  dataset_label: Reviewed positions and NOAA L3S Daily SST
+  allow_provisional: false
+selection:
+  arrays: all
+  clusters: all
+output:
+  root: ../../../data/examples/v2/06_affine_deformation/l3s_6h
+analyses:
+  affine_deformation:
+    enabled: true
+    map_window_hours: 24
+    deformation_window_hours: 6
+    maximum_elapsed_hours: null
+    reference_time_utc: null
+    maximum_source_gap_minutes: null # Inherit selected position-product support limit.
+    plotting:
+      fixed_extent: true # false fits each daily frame to its initial cluster centroids.
+      longitude_bounds: null # Optional [west, east] in degrees; requires fixed_extent: true.
+      latitude_bounds: null # Optional [south, north] in degrees; null keeps automatic bounds.
+      maximum_absolute_rate_h_inverse: 0.1
+    sst:
+      enabled: true
+      file: ../../../data/examples/v2/sst/L3S_daily_20250201_20250331.nc
+      # Or select a prepared hourly SST file with the same core variables.
+      # Inputs: sea_surface_temperature(time, lat, lon) in Celsius, CF time_bounds.
+      # Daily composites are retained; hourly bins receive equal hour weights.
+      minimum_celsius: -2 # Fixed SST colour limits, independent of rate colours.
+      maximum_celsius: 35

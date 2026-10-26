@@ -43,6 +43,7 @@ class AnalysisConfig:
     epsilon: dict[str, Any]
     epsilon_diagnostics: dict[str, Any]
     fsle: dict[str, Any]
+    affine_deformation: dict[str, Any]
     output_root: Path
 
     def effective(self) -> dict[str, Any]:
@@ -77,6 +78,7 @@ class AnalysisConfig:
                 "epsilon": self.epsilon,
                 "epsilon_diagnostics": self.epsilon_diagnostics,
                 "fsle": self.fsle,
+                "affine_deformation": self.affine_deformation,
             },
             "output": {"root": str(self.output_root)},
         }
@@ -123,6 +125,7 @@ def load_analysis_config(path: str | Path) -> AnalysisConfig:
             "trajectory_plots", "trajectory_statistics", "epsilon",
             "epsilon_diagnostics",
             "fsle",
+            "affine_deformation",
         },
         "analyses",
     )
@@ -186,11 +189,14 @@ def load_analysis_config(path: str | Path) -> AnalysisConfig:
     from .fsle import resolve_fsle
 
     fsle = resolve_fsle(analyses.get("fsle", {}))
+    from .affine import resolve_affine
+
+    affine = resolve_affine(analyses.get("affine_deformation", {}), source_path.parent)
     if diagnostics.get("enabled", False) and not epsilon.get("enabled", False):
         raise ValueError("epsilon_diagnostics requires epsilon.enabled: true")
     if not any(
         block.get("enabled", False)
-        for block in (trajectory_plots, trajectory_statistics, epsilon, diagnostics, fsle)
+        for block in (trajectory_plots, trajectory_statistics, epsilon, diagnostics, fsle, affine)
     ):
         raise ValueError("At least one analysis block must be enabled")
 
@@ -225,6 +231,7 @@ def load_analysis_config(path: str | Path) -> AnalysisConfig:
         epsilon=epsilon,
         epsilon_diagnostics=diagnostics,
         fsle=fsle,
+        affine_deformation=affine,
         output_root=output_root,
     )
 

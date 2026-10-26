@@ -317,6 +317,13 @@ local velocity gradients.
 
 ### 7.1 Local affine velocity-gradient fit
 
+The independent finite-interval endpoint transformation is now available in
+the unified analyzer. It estimates `F` and the right Cauchy–Green tensor from
+original cluster members, without fitting velocities. See the dedicated
+[endpoint affine deformation methodology](affine_deformation_methodology.md)
+for its equations, lifecycle, QC, optional daily SST and examples. It is distinct
+from the instantaneous velocity-gradient analysis proposed below.
+
 For a suitable local subset of drifters, fit
 
 $

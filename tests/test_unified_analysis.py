@@ -330,7 +330,9 @@ def test_grouped_product_reader_and_unified_numbered_outputs(tmp_path: Path) -> 
         "03_epsilon",
         "04_epsilon_diagnostics",
         "05_fsle",
+        "06_affine_deformation",
     ]
+    assert not (output / "06_affine_deformation").exists()
     assert _sha256(store / ".zmetadata") == metadata_before
     with pytest.raises(FileExistsError, match="already exists"):
         run_analysis(config_path)

@@ -25,6 +25,10 @@ For the complete operational sequence, review checkpoints, command-line flags,
 and important YAML choices, see [running the complete workflow](docs/running_the_workflow.md).
 The implemented within-array metrics and their equations are documented in
 [cluster-statistics methodology](docs/cluster_statistics_methodology.md).
+
+Original-cluster endpoint affine deformation, rotation-independent right
+Cauchy–Green stretches, and optional NOAA L3S Daily maps are documented in
+[affine deformation methodology](docs/affine_deformation_methodology.md).
 The pair-conditioned separation-scale analysis is documented in
 [overshoot-aware FSLE](docs/fsle.md).
 The trajectory-only Poje-method reproduction is documented in
@@ -76,7 +80,7 @@ pass through the spline reconstruction workflow. One configuration selects a
 group such as `qc_5min`, one shared velocity definition, optional array/cluster
 subsets, and the enabled analysis modules. Results are published as
 `01_trajectory_plots`, `02_trajectory_statistics`, `03_epsilon`, and
-`04_epsilon_diagnostics`, and `05_fsle` with one root manifest. FSLE reads
+`04_epsilon_diagnostics`, `05_fsle`, and optional `06_affine_deformation` with one root manifest. FSLE reads
 positions directly, with separate cluster/array spectra, chance pairs, and
 prescribed-power fits and compensated plots; it needs no pair Zarr. See
 [unified grouped-product analysis](docs/unified_analysis.md).

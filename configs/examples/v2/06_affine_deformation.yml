@@ -1,0 +1,41 @@
+# Position-only cluster affine fits; no SST, epsilon, or velocity settings needed.
+# Run: drifterlab-analyze configs/examples/v2/06_affine_deformation.yml
+schema_version: 1
+input:
+  trajectory_zarr: ../../../data/examples/v2/02_trajectory_products/trajectories.zarr
+  trajectory_product: qc_5min # Reviewed linear-position baseline.
+  dataset_label: Reviewed positions, endpoint affine deformation
+  allow_provisional: false # Explicitly set true for preliminary partial QC.
+selection:
+  arrays: all # Or local array IDs, e.g. [1].
+  clusters: all # Original identities are never replaced or reduced.
+output:
+  root: ../../../data/examples/v2/06_affine_deformation/no_sst_6h
+analyses:
+  affine_deformation:
+    enabled: true
+    map_window_hours: 24 # Daily UTC maps in this version.
+    deformation_window_hours: 6 # Also supports 12 and 24; must divide 24 exactly.
+    maximum_elapsed_hours: null # Counts from analysis_start, not midnight.
+    reference_time_utc: null # Earliest complete >=3-member cluster per array.
+    maximum_source_gap_minutes: null # Inherit product limit; a value can tighten it.
+    quality:
+      minimum_aspect_ratio: 0.1 # Provisional flag, not numerical rejection.
+      rank_relative_tolerance: 1.0e-12 # SVD rank tolerance relative to largest singular value.
+      near_isotropy_relative_tolerance: 0.001 # (lambda1-lambda2)/lambda1.
+      near_collapse_stretch: 1.0e-12 # Absolute dimensionless stretch threshold.
+      minimum_rms_radius_m: null # No assumed GPS uncertainty or minimum scale.
+      maximum_normalized_residual: null # No assumed scientific residual limit.
+    plotting:
+      fixed_extent: true # false fits each daily frame to its initial cluster centroids.
+      longitude_bounds: null # Optional [west, east] in degrees; requires fixed_extent: true.
+      latitude_bounds: null # Optional [south, north] in degrees; null keeps automatic bounds.
+      enabled: true
+      dpi: 140
+      maximum_absolute_rate_h_inverse: 0.1 # Fixed shared divergent colour limits.
+      axis_length_km: null # Fixed per-array length, 2.5% of map width/height.
+      connect_centroids: false
+      label_clusters: true
+      show_poor_geometry: false # Explicit display override; raw diagnostics retained.
+    sst:
+      enabled: false

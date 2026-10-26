@@ -18,6 +18,7 @@ dependencies = [
 test = ["pytest>=8", "cartopy>=0.22"]
 diagnostics = ["matplotlib>=3.8"]
 plotting = ["cartopy>=0.22"]
+sst = ["h5netcdf>=1.3", "h5py>=3.10"]
 manual-qc = ["PySide6>=6.8,<6.9", "pyqtgraph>=0.14,<0.15"]
 gui-test = ["pytest-qt>=4.4,<5"]
 
@@ -32,6 +33,8 @@ drifterlab-postprocess = "drifterlab.cli.postprocess:main"
 drifterlab-epsilon = "drifterlab.cli.epsilon:main"
 drifterlab-epsilon-diagnostics = "drifterlab.cli.epsilon_diagnostics:main"
 drifterlab-analyze = "drifterlab.cli.analyze:main"
+
+drifterlab-prepare-mur-sst = "drifterlab.cli.prepare_mur_sst:main"
 drifterlab-import-supplied-qc = "drifterlab.cli.import_supplied_qc:main"
 drifterlab-compare-qc = "drifterlab.cli.compare_qc:main"
 drifterlab-poje = "drifterlab.cli.poje:main"

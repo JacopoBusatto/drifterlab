@@ -8,6 +8,7 @@ dist/
 data/
 docs/prompts/
 docs/references/
+docs/manuscript/
 *.local.yml
 *.local.csv
 *.mat

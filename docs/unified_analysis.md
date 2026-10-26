@@ -344,6 +344,15 @@ See [v2 FSLE methods and passage policies](fsle_v2.md) and the runnable template
 `strict_observed` passage policy and alternative `bridge_missing` remain explicit
 while their scientific interpretation is reviewed.
 
+## Endpoint affine deformation
+
+`analyses.affine_deformation.enabled: true` independently adds original-member
+endpoint fits and daily principal-axis maps under `06_affine_deformation`.
+It uses positions only, supports allowed off-grid endpoint interpolation, and
+does not inherit statistics' permanent stop at a temporary observation gap.
+Optional prepared daily or hourly SST backgrounds never affect the numerical results.
+See [methodology, QC, time references and runnable examples](affine_deformation_methodology.md).
+
 ## Output
 
 Enabled modules are published under:
@@ -355,6 +364,7 @@ v2_analysis/
 |-- 03_epsilon/
 |-- 04_epsilon_diagnostics/
 |-- 05_fsle/
+|-- 06_affine_deformation/
 |-- config_resolved.yml
 `-- manifest.json
 ```

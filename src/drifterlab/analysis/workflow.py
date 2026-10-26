@@ -225,6 +225,22 @@ def run_analysis(
         else:
             module_summary["fsle"] = {"enabled": False}
 
+        if config.affine_deformation["enabled"]:
+            from .affine import run_affine_analysis
+
+            if product_info.product_attributes.get("interpolation") != "linear":
+                raise ValueError("Endpoint affine deformation requires a linear-position trajectory product")
+            report("Fitting endpoint affine deformation of original clusters")
+            module_summary["affine_deformation"] = run_affine_analysis(
+                dataset.isel(platform=np.flatnonzero(np.isin(dataset.array_id.values, arrays))),
+                config.affine_deformation, temporary / "06_affine_deformation",
+                selected_clusters=clusters,
+                product_maximum_gap_minutes=product_info.maximum_source_gap_minutes,
+                progress=report,
+            )
+        else:
+            module_summary["affine_deformation"] = {"enabled": False}
+
         resolved = config.effective()
         resolved["run_id"] = run_id
         resolved["resolved_input"] = {
@@ -300,6 +316,7 @@ def run_analysis(
                 "03_epsilon",
                 "04_epsilon_diagnostics",
                 "05_fsle",
+                "06_affine_deformation",
             ],
             "products": product_records,
         }
